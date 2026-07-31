@@ -1,0 +1,5 @@
+elasticsearch<10,>=9
+fastapi<1,>=0.115
+pandas<4,>=3
+pydantic<3,>=2.8
+uvicorn[standard]<1,>=0.30

@@ -1,0 +1,76 @@
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.4.4
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "true"
+      xpack.security.http.ssl.enabled: "false"
+      ELASTIC_PASSWORD: "elastic123"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl --noproxy "*" -fsS -u "elastic:$${ELASTIC_PASSWORD}" http://localhost:9200/_cluster/health >/dev/null || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.4.4
+    environment:
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      ELASTIC_PASSWORD: "elastic123"
+      KIBANA_PASSWORD: "kibana123"
+      ADMIN_USERNAME: "admin"
+      ADMIN_PASSWORD: "admin123"
+      NO_PROXY: "elasticsearch,localhost,127.0.0.1"
+    volumes:
+      - ./scripts/setup-elasticsearch.sh:/usr/local/bin/setup-elasticsearch.sh:ro
+    command: ["/bin/bash", "/usr/local/bin/setup-elasticsearch.sh"]
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: "no"
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:9.4.4
+    environment:
+      ELASTICSEARCH_HOSTS: '["http://elasticsearch:9200"]'
+      ELASTICSEARCH_USERNAME: kibana_system
+      ELASTICSEARCH_PASSWORD: "kibana123"
+      XPACK_SECURITY_ENCRYPTIONKEY: "local-demo-kibana-security-key-32-chars"
+      XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY: "local-demo-encrypted-saved-objects-key-32"
+      XPACK_REPORTING_ENCRYPTIONKEY: "local-demo-reporting-encryption-key-32"
+      SERVER_HOST: "0.0.0.0"
+    ports:
+      - "5601:5601"
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+
+  api:
+    build: .
+    environment:
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      ELASTICSEARCH_USERNAME: "admin"
+      ELASTICSEARCH_PASSWORD: "admin123"
+      ELASTICSEARCH_INDEX: ner_entity_occurrences-v1
+      ELASTICSEARCH_ALIAS: ner_entity_occurrences
+      AUTO_SEED: "true"
+      SEED_COUNT: "10000"
+      SEED_CSV_ROOT: /project
+    volumes:
+      # CSV files added to the project are available without rebuilding the API.
+      - ./:/project:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+
+volumes:
+  esdata:
