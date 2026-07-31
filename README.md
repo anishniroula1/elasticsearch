@@ -47,6 +47,7 @@ ner-similarities-elasticsearch-demo/
 ├── .python-version
 ├── Dockerfile
 ├── docker-compose.yml
+├── decode_project.py
 ├── generate_project.py
 ├── Makefile
 ├── pyproject.toml
@@ -475,3 +476,21 @@ python generate_project.py
 
 It creates a new `ner-similarities-elasticsearch-demo` folder with the same
 application files, Docker setup, documentation, and CSV seed data.
+
+To copy the complete current project folder, run:
+
+```bash
+python decode_project.py
+```
+
+This uses the folder containing `decode_project.py` as the source and creates a
+sibling folder ending in `-decoded`. It copies everything, including nested and
+hidden files. It stops if the output folder already exists.
+
+You can also pass both the source project path and exact output path:
+
+```bash
+python decode_project.py "/path/to/project" "/path/to/project-copy"
+```
+
+The output must be outside the source folder so the copy cannot include itself.
