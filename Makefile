@@ -4,18 +4,18 @@ CSV ?= seed.csv
 RESET ?= false
 LIMIT ?=
 
-.PHONY: help setup lock dev dev-es build run stop clean logs status seed seed-csv seed100k seed1m reset smoke
+.PHONY: help setup lock dev dev-os dev-es build run stop clean logs status seed seed-csv seed100k seed1m reset smoke
 
 help:
 	@echo "make setup       Create/update the local .venv with uv"
 	@echo "make lock        Refresh uv.lock"
-	@echo "make dev-es      Start only Elasticsearch for local API development"
+	@echo "make dev-os      Start only OpenSearch for local API development"
 	@echo "make dev         Run FastAPI locally with uv and reload"
 	@echo "make build       Build the API image"
-	@echo "make run         Start Elasticsearch, Kibana, and API in Docker"
+	@echo "make run         Start OpenSearch, Dashboards, and API in Docker"
 	@echo "make stop        Stop containers"
-	@echo "make clean       Stop containers and delete local Elasticsearch data"
-	@echo "make logs        Follow API and Elasticsearch logs"
+	@echo "make clean       Stop containers and delete local OpenSearch data"
+	@echo "make logs        Follow API and OpenSearch logs"
 	@echo "make status      Show container status"
 	@echo "make seed        Seed COUNT fake records (default: 10000)"
 	@echo "make seed-csv    Seed a CSV file (CSV=seed.csv RESET=false)"
@@ -30,23 +30,28 @@ setup:
 lock:
 	uv lock
 
-dev-es:
-	docker compose up -d setup
+dev-os:
+	docker compose up -d opensearch
+
+# Keep the old command working for anyone who already uses it.
+dev-es: dev-os
 
 dev: setup
-	ELASTICSEARCH_URL=http://localhost:9200 \
-	ELASTICSEARCH_USERNAME=admin \
-	ELASTICSEARCH_PASSWORD=admin123 \
+	OPENSEARCH_HOST=localhost \
+	OPENSEARCH_PORT=9200 \
+	OPENSEARCH_USE_SSL=false \
+	OPENSEARCH_VERIFY_CERTS=false \
+	OPENSEARCH_AUTH_MODE=none \
 	uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 build:
 	docker compose build
 
 run:
-	docker compose up -d --build
+	docker compose up -d --build --remove-orphans
 	@echo "Swagger: http://localhost:8000/docs"
-	@echo "Kibana: http://localhost:5601 (admin / admin123)"
-	@echo "Elasticsearch: http://localhost:9200"
+	@echo "OpenSearch Dashboards: http://localhost:5601"
+	@echo "OpenSearch: http://localhost:9200"
 
 stop:
 	docker compose down

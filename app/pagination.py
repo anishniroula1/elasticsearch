@@ -6,7 +6,7 @@ from fastapi import HTTPException
 
 
 def encode_page_token(value):
-    """Convert Elasticsearch page key into a token for next request."""
+    """Convert OpenSearch page key into a token for next request."""
 
     if not value:
         return None

@@ -1,23 +1,11 @@
 import time
 from typing import Any
 
-from elasticsearch import Elasticsearch
-
 from app.config import config
+from app.open_search_client import OpenSearchClient
 
 
-client_options: dict[str, Any] = {
-    "request_timeout": 60,
-    "max_retries": 5,
-    "retry_on_timeout": True,
-}
-if config.elasticsearch_username and config.elasticsearch_password:
-    client_options["basic_auth"] = (
-        config.elasticsearch_username,
-        config.elasticsearch_password,
-    )
-
-client = Elasticsearch(config.elasticsearch_url, **client_options)
+client = OpenSearchClient(config).create_client()
 
 
 INDEX_DEFINITION: dict[str, Any] = {
@@ -64,7 +52,7 @@ INDEX_DEFINITION: dict[str, Any] = {
 
 
 def wait_until_ready(max_attempts: int = 60, delay_seconds: int = 2):
-    """Wait until Elasticsearch is ready before starting API."""
+    """Wait until OpenSearch is ready before starting API."""
 
     for _ in range(max_attempts):
         try:
@@ -75,32 +63,44 @@ def wait_until_ready(max_attempts: int = 60, delay_seconds: int = 2):
             pass
         time.sleep(delay_seconds)
 
-    raise RuntimeError("Elasticsearch did not become ready")
+    raise RuntimeError("OpenSearch did not become ready")
 
 
 def ensure_index():
     """Create the index and alias if they do not exist."""
 
     if not client.indices.exists(index=config.physical_index):
+        index_body = {
+            **INDEX_DEFINITION,
+            "aliases": {config.index_alias: {"is_write_index": True}},
+        }
         client.indices.create(
             index=config.physical_index,
-            aliases={config.index_alias: {"is_write_index": True}},
-            **INDEX_DEFINITION,
+            body=index_body,
         )
         return
 
     if not client.indices.exists_alias(name=config.index_alias):
         client.indices.update_aliases(
-            actions=[
-                {
-                    "add": {
-                        "index": config.physical_index,
-                        "alias": config.index_alias,
-                        "is_write_index": True,
+            body={
+                "actions": [
+                    {
+                        "add": {
+                            "index": config.physical_index,
+                            "alias": config.index_alias,
+                            "is_write_index": True,
+                        }
                     }
-                }
-            ]
+                ]
+            }
         )
+
+
+def search_index(**body):
+    """Run a search against the alias used by every API."""
+
+    # OpenSearch expects the query, aggregations and size inside one body.
+    return client.search(index=config.index_alias, body=body)
 
 
 def recreate_index():

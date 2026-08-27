@@ -10,7 +10,7 @@ from app.seed import seed_documents
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    """Connect with Elasticsearch and seed data when app starts."""
+    """Connect with OpenSearch and seed data when app starts."""
 
     wait_until_ready()
     ensure_index()
@@ -22,7 +22,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(
-    title="NER Similarities with Elasticsearch",
+    title="NER Similarities with OpenSearch",
     version="1.0.0",
     description=(
         "Local demo for NER entity occurrences, entity counts, matching cases, "

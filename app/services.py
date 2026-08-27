@@ -1,16 +1,10 @@
-"""Elasticsearch methods used by the API routes."""
+"""OpenSearch methods used by the API routes."""
 
-
-
-from datetime import datetime, timezone
 from typing import Any
 
-from elasticsearch import NotFoundError
-
 from app.config import config
-from app.models import EntityEvent
 from app.pagination import decode_page_token, encode_page_token
-from app.search_client import client, ensure_index
+from app.search_client import client, ensure_index, search_index
 
 
 ENTITY_SOURCE_FIELDS = [
@@ -30,18 +24,18 @@ ENTITY_SOURCE_FIELDS = [
 
 
 def health_status():
-    """Check Elasticsearch and return the current status."""
+    """Check OpenSearch and return the current status."""
 
     return {
         "status": "ok" if client.ping() else "down",
-        "elasticsearch": config.elasticsearch_url,
+        "opensearch": f"{config.host}:{config.port}",
         "index": config.physical_index,
         "alias": config.index_alias,
     }
 
 
 def index_stats():
-    """Get document count and Elasticsearch cluster status."""
+    """Get document count and OpenSearch cluster status."""
 
     ensure_index()
     return {
@@ -49,40 +43,6 @@ def index_stats():
         "alias": config.index_alias,
         "documents": client.count(index=config.index_alias)["count"],
         "clusterHealth": client.cluster.health()["status"],
-    }
-
-
-def apply_entity_event(event: EntityEvent):
-    """Create, update or delete one entity occurrence."""
-
-    ensure_index()
-
-    if event.eventType == "SENTENCE_ENTITY_DELETED":
-        try:
-            # Remove the occurrence by its sentence entity ID.
-            client.delete(
-                index=config.index_alias,
-                id=str(event.sentenceEntityId),
-                refresh="wait_for",
-            )
-            action = "deleted"
-        except NotFoundError:
-            action = "already_deleted"
-        return {
-            "action": action,
-            "sentenceEntityId": event.sentenceEntityId,
-        }
-
-    # Same ID will create a new document or replace the old one.
-    client.index(
-        index=config.index_alias,
-        id=str(event.sentenceEntityId),
-        document=_event_document(event),
-        refresh="wait_for",
-    )
-    return {
-        "action": "upserted",
-        "sentenceEntityId": event.sentenceEntityId,
     }
 
 
@@ -94,8 +54,7 @@ def get_application_entities(
 
     # Get unique entities and few source records for each one.
     # size=0 means we only need the aggregation result.
-    response = client.search(
-        index=config.index_alias,
+    response = search_index(
         size=0,
         query={"term": {"applicationId": application_id}},
         aggs={
@@ -120,8 +79,7 @@ def get_application_entities(
         sample = sample_hits[0]["_source"]
 
         # Run one more query for each entity to count other applications.
-        count_response = client.search(
-            index=config.index_alias,
+        count_response = search_index(
             size=0,
             query={
                 "bool": {
@@ -178,8 +136,7 @@ def find_similar_entity_cases(application_id: str):
 
     # Search all other applications using the current application entities.
     # Aggregation groups matches by application and counts occurrences.
-    response = client.search(
-        index=config.index_alias,
+    response = search_index(
         size=0,
         query=_other_applications_query(application_id, entity_ids),
         aggs={
@@ -258,8 +215,7 @@ def find_matching_entities(
         composite["after"] = after_key
 
     # Get one page of applications and entities shared with each one.
-    response = client.search(
-        index=config.index_alias,
+    response = search_index(
         size=0,
         query=_other_applications_query(application_id, entity_ids),
         aggs={
@@ -325,8 +281,7 @@ def find_entity_matching_cases(
         composite["after"] = after_key
 
     # Find other applications with this entity and group by application ID.
-    response = client.search(
-        index=config.index_alias,
+    response = search_index(
         size=0,
         query={
             "bool": {
@@ -374,8 +329,7 @@ def find_similar_cases(
         }
 
     # Group other applications and count unique shared entities.
-    response = client.search(
-        index=config.index_alias,
+    response = search_index(
         size=0,
         query=_other_applications_query(application_id, entity_ids),
         aggs={
@@ -431,8 +385,7 @@ def find_shared_entities(
     """Get all entities shared by two applications."""
 
     # Load both applications and group their records by entity ID.
-    response = client.search(
-        index=config.index_alias,
+    response = search_index(
         size=0,
         query={
             "terms": {
@@ -517,8 +470,7 @@ def search_fuzzy_entities(text: str, result_size: int):
     """Find entities with name close to the searched text."""
 
     # Fuzzy match the text and collapse duplicates by entity ID.
-    response = client.search(
-        index=config.index_alias,
+    response = search_index(
         size=result_size,
         query={
             "match": {
@@ -530,7 +482,7 @@ def search_fuzzy_entities(text: str, result_size: int):
             }
         },
         collapse={"field": "entityId"},
-        source=[
+        _source=[
             "entityId",
             "rawEntity",
             "normalizedText",
@@ -551,38 +503,11 @@ def search_fuzzy_entities(text: str, result_size: int):
     }
 
 
-def _event_document(event: EntityEvent):
-    """Convert event data into document we store in Elasticsearch."""
-
-    created_at = event.createdAt or datetime.now(timezone.utc)
-    updated_at = event.updatedAt or datetime.now(timezone.utc)
-    return {
-        "sentenceEntityId": event.sentenceEntityId,
-        "applicationId": event.applicationId,
-        "tspId": event.tspId,
-        "globalId": event.globalId,
-        "entityId": event.entityId,
-        "rawEntity": event.rawEntity,
-        "normalizedText": event.normalizedText,
-        "entitySearchText": event.normalizedText,
-        "entityType": event.entityType,
-        "possibleSanction": event.possibleSanction,
-        "beginOffset": event.beginOffset,
-        "endOffset": event.endOffset,
-        "score": event.score,
-        "source": event.source,
-        "documentType": event.documentType,
-        "createdAt": created_at.isoformat(),
-        "updatedAt": updated_at.isoformat(),
-    }
-
-
 def _get_application_entity_ids(application_id: str):
     """Get unique entity IDs for one application."""
 
     # We only need entity buckets here, no full documents.
-    response = client.search(
-        index=config.index_alias,
+    response = search_index(
         size=0,
         query={"term": {"applicationId": application_id}},
         aggs={"entities": {"terms": {"field": "entityId", "size": 200}}},

@@ -4,10 +4,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
-from elasticsearch import helpers
+from opensearchpy import helpers
 
 from app.config import config
-from app.search_client import client, ensure_index, recreate_index
+from app.search_client import client, ensure_index, recreate_index, search_index
 
 
 ENTITY_CATALOG = [
@@ -100,7 +100,7 @@ def seed_documents(count=None, csv_path=None, reset=False):
         actions = _fake_actions(fake_count, start_id, timestamp)
         source = "fake"
 
-    # Send generated documents to Elasticsearch in batches of 1,000.
+    # Send generated documents to OpenSearch in batches of 1,000.
     success_count, _ = helpers.bulk(
         client,
         actions,
@@ -118,9 +118,8 @@ def seed_documents(count=None, csv_path=None, reset=False):
 def _next_sentence_entity_id():
     """Find the next ID so new fake data does not replace old data."""
 
-    # Elasticsearch calculates only the highest ID and does not return documents.
-    response = client.search(
-        index=config.index_alias,
+    # OpenSearch calculates only the highest ID and does not return documents.
+    response = search_index(
         size=0,
         aggs={
             "highestId": {
@@ -180,7 +179,7 @@ def _check_csv_columns(csv_file):
 
 
 def _csv_actions(csv_file, count, start_id, timestamp):
-    """Read CSV rows and change them into Elasticsearch documents."""
+    """Read CSV rows and change them into OpenSearch documents."""
 
     # Pandas reads part of the file at a time, so large CSV files stay manageable.
     chunks = pd.read_csv(

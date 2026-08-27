@@ -1,30 +1,26 @@
-# NER Similarities with Elasticsearch — Local Demo
+# NER Similarities with OpenSearch
 
 A small local project for testing NER entity matching and the proposed case UI flow.
 
-The separate `aws-opensearch-lambda` folder contains the AWS Lambda version for
-syncing database create, update, and delete events into Amazon OpenSearch Service.
-See its own README for deployment and IAM setup.
-
 The project uses:
 
-- Elasticsearch
+- OpenSearch
 - FastAPI with Swagger/OpenAPI
 - Pandas for chunked CSV reading
 - uv for Python versions, dependencies, and the local virtual environment
 - Docker Compose for the complete local stack
-- Elasticsearch security with an automatically configured local administrator
+- OpenSearch Dashboards for looking at local data
 - A versioned physical index: `ner_entity_occurrences-v1`
 - A stable read/write alias: `ner_entity_occurrences`
 - Automatic startup seed from the included CSV file
 - Batch generation of thousands or millions of fake records
 
-This is a local development demo. It uses simple default credentials that must not be copied to a production environment.
+The local Docker setup disables the security plugin to keep the demo easy to
+run. AWS uses IAM role authentication instead.
 
 ## What the demo supports
 
-- One Elasticsearch document per `sentence_entities` occurrence
-- Create, update, and delete event simulation
+- One OpenSearch document per `sentence_entities` occurrence
 - Case entity list with occurrence count beside each entity
 - Matching cases for a selected entity
 - Similar cases ranked by overlapping entities
@@ -36,19 +32,16 @@ This is a local development demo. It uses simple default credentials that must n
 ## Project structure
 
 ```text
-ner-similarities-elasticsearch-demo/
-├── aws-opensearch-lambda/   # AWS OpenSearch write Lambda
+ner-similarities-opensearch-demo/
 ├── app/
 │   ├── main.py
-│   ├── models.py
+│   ├── open_search_client.py
 │   ├── pagination.py
 │   ├── routes.py
 │   ├── search_client.py
 │   ├── seed.py
 │   ├── services.py
 │   └── config.py
-├── scripts/
-│   └── setup-elasticsearch.sh
 ├── .python-version
 ├── Dockerfile
 ├── docker-compose.yml
@@ -61,7 +54,7 @@ ner-similarities-elasticsearch-demo/
 ```
 
 `main.py` only starts the application. `routes.py` lists the HTTP endpoints,
-and `services.py` contains the Elasticsearch queries. The remaining files have
+and `services.py` contains the OpenSearch queries. The remaining files have
 one small responsibility each.
 
 ## Requirements
@@ -75,9 +68,9 @@ one small responsibility each.
 ### Local Python workflow
 
 - uv
-- Docker for the local Elasticsearch service
+- Docker for the local OpenSearch service
 
-Elasticsearch needs enough Docker memory. Allocate at least 2 GB to Docker Desktop.
+OpenSearch needs enough Docker memory. Allocate at least 2 GB to Docker Desktop.
 
 ## Fastest start: run everything in Docker
 
@@ -88,52 +81,43 @@ make run
 Wait until the services are healthy, then open:
 
 - Swagger: http://localhost:8000/docs
-- Kibana: http://localhost:5601
+- OpenSearch Dashboards: http://localhost:5601
 - API health: http://localhost:8000/health
-- Elasticsearch: http://localhost:9200
+- OpenSearch: http://localhost:9200
 
 On the first startup, the API creates the physical index, adds the alias, applies the mapping, and seeds 10,000 documents.
 
-Log in to Kibana with:
-
-```text
-Username: admin
-Password: admin123
-```
-
-Direct Elasticsearch requests also require credentials:
+The local OpenSearch container does not require a username or password:
 
 ```bash
-curl -u admin:admin123 http://localhost:9200
+curl http://localhost:9200
 ```
 
-If setup stops with HTTP 401 or 403, the Elasticsearch Docker volume probably
-has a password from an older run. Reset the local demo data and start again:
+If an older search container or volume gets in the way, reset the local
+demo data and start again:
 
 ```bash
 make clean
 make run
 ```
 
-`make clean` deletes the local Elasticsearch data. The API loads it again from
+`make clean` deletes the local OpenSearch data. The API loads it again from
 `seed.csv` when the project starts.
 
-The local usernames and passwords are written directly in
-`docker-compose.yml` to keep this demo easy to run. They are not production
-credentials and must not be reused outside local development.
+Disabling the security plugin is only for local development. Do not use this
+Docker setting for an AWS or production domain.
 
 The Docker image also uses uv. It resolves the dependencies from `pyproject.toml` and creates the project environment inside the image.
 
 ## Local development with uv
 
-Start Elasticsearch only:
+Start OpenSearch only:
 
 ```bash
-make dev-es
+make dev-os
 ```
 
-This also runs the one-time security setup container and then leaves
-Elasticsearch running.
+This leaves the OpenSearch container running while FastAPI runs on your machine.
 
 Create the local `.venv`, install locked dependencies, and start FastAPI with reload:
 
@@ -145,14 +129,47 @@ You can also run the commands directly:
 
 ```bash
 uv sync
-docker compose up -d setup
-ELASTICSEARCH_URL=http://localhost:9200 \
-ELASTICSEARCH_USERNAME=admin \
-ELASTICSEARCH_PASSWORD=admin123 \
+docker compose up -d opensearch
+OPENSEARCH_HOST=localhost \
+OPENSEARCH_PORT=9200 \
+OPENSEARCH_USE_SSL=false \
+OPENSEARCH_VERIFY_CERTS=false \
+OPENSEARCH_AUTH_MODE=none \
 uv run uvicorn app.main:app --reload
 ```
 
 `uv sync` automatically creates `.venv` and `uv.lock` when they do not exist. `uv run` uses that environment and keeps it synchronized with the project configuration.
+
+## Connect the API to AWS OpenSearch
+
+Set the API container or process to IAM mode:
+
+```bash
+OPENSEARCH_HOST=search-your-domain.us-east-1.es.amazonaws.com
+OPENSEARCH_PORT=443
+OPENSEARCH_USE_SSL=true
+OPENSEARCH_VERIFY_CERTS=true
+OPENSEARCH_AUTH_MODE=iam
+OPENSEARCH_SERVICE=es
+OPENSEARCH_INDEX=ner_entity_occurrences-v1
+OPENSEARCH_ALIAS=ner_entity_occurrences
+AWS_REGION=us-east-1
+IAM_ACCESS_ROLE=arn:aws:iam::123456789012:role/ner-opensearch-access
+AUTO_SEED=false
+```
+
+These variables are also passed into the API container by
+`docker-compose.yml`. You can put them in a local `.env` file before running
+`make run`. Local Docker uses `OPENSEARCH_AUTH_MODE=none` when they are not set.
+
+`OPENSEARCH_HOST` can also contain `https://`; the app removes the scheme. The
+AWS identity running the API needs permission to call `sts:AssumeRole` for
+`IAM_ACCESS_ROLE`. That assumed role also needs access to the OpenSearch domain
+and index. Do not pass AWS access keys into the app.
+
+The API creates a boto3 session by assuming the configured role, then passes
+its credentials to `AWSV4SignerAuth`. For OpenSearch Serverless, set
+`OPENSEARCH_SERVICE=aoss`.
 
 ## Dependency management
 
@@ -187,7 +204,7 @@ Do not add a `requirements.txt`; dependencies belong in `pyproject.toml`. The fi
 ```bash
 make help
 make setup
-make dev-es
+make dev-os
 make dev
 make run
 make status
@@ -213,8 +230,8 @@ Manual seed API calls choose the source from the request:
 - Use `reset=false` to keep the current index data.
 
 There is no fixed maximum for `count`. The records are generated and sent to
-Elasticsearch in batches, so a request can generate millions of records. The
-time needed still depends on Docker memory, CPU, disk speed, and Elasticsearch.
+OpenSearch in batches, so a request can generate millions of records. The
+time needed still depends on Docker memory, CPU, disk speed, and OpenSearch.
 
 Generate one million fake records and recreate the index first:
 
@@ -272,9 +289,9 @@ When Docker is used, pass a relative project path such as
 `data/my-entities.csv`, not an absolute path from the host computer.
 
 Pandas reads large CSV files in chunks of 10,000 rows. It does not load the
-whole file into memory before sending the rows to Elasticsearch.
+whole file into memory before sending the rows to OpenSearch.
 
-The CSV has the same fields as the fake Elasticsearch documents:
+The CSV has the same fields as the fake OpenSearch documents:
 
 ```text
 sentenceEntityId,applicationId,tspId,globalId,entityId,rawEntity,
@@ -312,43 +329,6 @@ GET  /stats
 POST /admin/init
 POST /admin/seed?count=10000&reset=false
 POST /admin/seed?csvPath=seed.csv&reset=true
-```
-
-### Simulate DB-trigger/Lambda events
-
-```text
-POST /events
-```
-
-Create example:
-
-```json
-{
-  "eventType": "SENTENCE_ENTITY_CREATED",
-  "sentenceEntityId": 200001,
-  "applicationId": "A000000001",
-  "tspId": "TSP-A000000001-01",
-  "globalId": "G-TSP-A000000001-01-0001",
-  "entityId": "E012",
-  "rawEntity": "Mohammed",
-  "normalizedText": "mohammed",
-  "entityType": "PERSON",
-  "possibleSanction": false,
-  "beginOffset": 10,
-  "endOffset": 18,
-  "score": 0.98,
-  "source": "aws_comprehend",
-  "documentType": "Written Statement"
-}
-```
-
-Use the same payload with `SENTENCE_ENTITY_UPDATED` to replace the document. Use this delete payload:
-
-```json
-{
-  "eventType": "SENTENCE_ENTITY_DELETED",
-  "sentenceEntityId": 200001
-}
 ```
 
 ### Case Entities section
@@ -440,7 +420,7 @@ This returns the shared entities, type, occurrence counts in both cases, sanctio
 GET /entities/fuzzy?text=mohamad
 ```
 
-This can return close candidates such as `mohammed`, `mohammad`, or `muhammad`, with an Elasticsearch relevance score.
+This can return close candidates such as `mohammed`, `mohammad`, or `muhammad`, with an OpenSearch relevance score.
 
 ## Suggested demo flow
 
@@ -452,11 +432,10 @@ This can return close candidates such as `mohammed`, `mohammad`, or `muhammad`, 
 6. Call the similar-cases endpoint.
 7. Copy another application ID and call shared-entities.
 8. Try `/entities/fuzzy?text=mohamad`.
-9. Use `/events` to create, update, and delete one occurrence.
 
 ## Notes about counts
 
-No pre-calculated `countInCase` is stored in each Elasticsearch document.
+No pre-calculated `countInCase` is stored in each OpenSearch document.
 
 - The case entity count is calculated from occurrence documents.
 - The number of other matching cases is calculated from distinct `applicationId` values.
@@ -469,7 +448,7 @@ make clean
 make run
 ```
 
-`make clean` removes the Elasticsearch Docker volume, so the index and sample data are recreated on the next run.
+`make clean` removes the OpenSearch Docker volume, so the index and sample data are recreated on the next run.
 
 ## Recreate this project
 
@@ -479,7 +458,7 @@ Run the generator from any directory:
 python generate_project.py
 ```
 
-It creates a new `ner-similarities-elasticsearch-demo` folder with the same
+It creates a new `ner-similarities-opensearch-demo` folder with the same
 application files, Docker setup, documentation, and CSV seed data.
 
 To copy the complete current project folder, run:

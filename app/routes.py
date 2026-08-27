@@ -1,11 +1,9 @@
 from fastapi import APIRouter, HTTPException, Query
 
 from app.config import config
-from app.models import EntityEvent
 from app.search_client import client, ensure_index
 from app.seed import seed_documents
 from app.services import (
-    apply_entity_event,
     find_entity_matching_cases,
     find_matching_entities,
     find_shared_entities,
@@ -23,7 +21,7 @@ router = APIRouter()
 
 @router.get("/health", tags=["System"])
 def health():
-    """Check if API is able to connect with Elasticsearch."""
+    """Check if API is able to connect with OpenSearch."""
 
     return health_status()
 
@@ -77,13 +75,6 @@ def seed(
         "totalDocuments": client.count(index=config.index_alias)["count"],
         "reset": reset,
     }
-
-
-@router.post("/events", tags=["Lambda event simulation"])
-def handle_event(event: EntityEvent):
-    """Handle one create, update or delete event."""
-
-    return apply_entity_event(event)
 
 
 @router.get(
