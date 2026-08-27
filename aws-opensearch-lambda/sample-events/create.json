@@ -1,0 +1,20 @@
+{
+  "eventType": "SENTENCE_ENTITY_CREATED",
+  "sentenceEntityId": 200001,
+  "applicationId": "A000000001",
+  "tspId": "TSP-A000000001-01",
+  "globalId": "G-TSP-A000000001-01-0001",
+  "entityId": "E012",
+  "rawEntity": "Mohammed",
+  "normalizedText": "mohammed",
+  "entityType": "PERSON",
+  "possibleSanction": false,
+  "beginOffset": 10,
+  "endOffset": 18,
+  "score": 0.98,
+  "source": "aws_comprehend",
+  "documentType": "Written Statement",
+  "createdAt": "2026-08-22T10:00:00Z",
+  "updatedAt": "2026-08-22T10:00:00Z"
+}
+

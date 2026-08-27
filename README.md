@@ -2,6 +2,10 @@
 
 A small local project for testing NER entity matching and the proposed case UI flow.
 
+The separate `aws-opensearch-lambda` folder contains the AWS Lambda version for
+syncing database create, update, and delete events into Amazon OpenSearch Service.
+See its own README for deployment and IAM setup.
+
 The project uses:
 
 - Elasticsearch
@@ -33,6 +37,7 @@ This is a local development demo. It uses simple default credentials that must n
 
 ```text
 ner-similarities-elasticsearch-demo/
+├── aws-opensearch-lambda/   # AWS OpenSearch write Lambda
 ├── app/
 │   ├── main.py
 │   ├── models.py

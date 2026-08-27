@@ -1,0 +1,45 @@
+{
+  "settings": {
+    "number_of_shards": 4,
+    "number_of_replicas": 2,
+    "analysis": {
+      "normalizer": {
+        "lowercase_ascii": {
+          "type": "custom",
+          "filter": ["lowercase", "asciifolding"]
+        }
+      }
+    }
+  },
+  "mappings": {
+    "dynamic": "strict",
+    "properties": {
+      "sentenceEntityId": {"type": "long"},
+      "applicationId": {"type": "keyword"},
+      "tspId": {"type": "keyword"},
+      "globalId": {"type": "keyword"},
+      "entityId": {"type": "keyword"},
+      "rawEntity": {"type": "text"},
+      "normalizedText": {
+        "type": "keyword",
+        "normalizer": "lowercase_ascii"
+      },
+      "entitySearchText": {"type": "text"},
+      "entityType": {"type": "keyword"},
+      "possibleSanction": {"type": "boolean"},
+      "beginOffset": {"type": "integer"},
+      "endOffset": {"type": "integer"},
+      "score": {"type": "float"},
+      "source": {"type": "keyword"},
+      "documentType": {"type": "keyword"},
+      "createdAt": {"type": "date"},
+      "updatedAt": {"type": "date"}
+    }
+  },
+  "aliases": {
+    "ner_entity_occurrences": {
+      "is_write_index": true
+    }
+  }
+}
+
