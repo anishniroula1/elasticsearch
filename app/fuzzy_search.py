@@ -1,12 +1,14 @@
 """Find fuzzy entity text matches for one application."""
 
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 
 from app.search_client import search_index
 from app.services import get_application_entities
 
 
 FUZZINESS = "AUTO:5,8"
+MAX_WORKERS = 8
 
 OCCURRENCE_FIELDS = [
     "sentenceEntityId",
@@ -94,17 +96,10 @@ def find_fuzzy_matches_by_text(application_id, text, threshold):
         match["matchedEntityId"]: match
         for match in entity_matches
     }
-    occurrences = _search_occurrences_by_entity_ids(
+    locations_by_entity_id = _search_occurrences_by_entity_ids(
         application_id,
         list(match_by_entity_id),
     )
-
-    locations_by_entity_id = {
-        entity_id: []
-        for entity_id in match_by_entity_id
-    }
-    for occurrence in occurrences:
-        locations_by_entity_id[occurrence["entityId"]].append(occurrence)
 
     # Keep one match per entity and put every location under it.
     matches = []
@@ -132,7 +127,10 @@ def find_fuzzy_matches_by_text(application_id, text, threshold):
         "searchedText": text,
         "thresholdPercentage": threshold,
         "totalMatches": len(matches),
-        "totalSourceLocations": len(occurrences),
+        "totalSourceLocations": sum(
+            len(locations)
+            for locations in locations_by_entity_id.values()
+        ),
         "matches": matches,
     }
 
@@ -140,13 +138,74 @@ def find_fuzzy_matches_by_text(application_id, text, threshold):
 def _find_matches(application_id, source_entities, threshold):
     """Get fuzzy candidates and keep the ones above the threshold."""
 
-    candidates = _search_candidates(application_id, source_entities)
+    if not source_entities:
+        return []
+
+    if len(source_entities) == 1:
+        return _find_matches_for_entity(
+            application_id,
+            source_entities[0],
+            threshold,
+        )
+
+    # Each application entity can be searched separately, so run a few at the
+    # same time instead of waiting for every AWS request one by one.
+    with ThreadPoolExecutor(
+        max_workers=min(MAX_WORKERS, len(source_entities))
+    ) as executor:
+        jobs = [
+            executor.submit(
+                _find_matches_for_entity,
+                application_id,
+                source_entity,
+                threshold,
+            )
+            for source_entity in source_entities
+        ]
+        matches = [
+            match
+            for job in jobs
+            for match in job.result()
+        ]
+
+    matches.sort(
+        key=lambda item: (
+            item["sourceEntityId"],
+            -item["matchPercentage"],
+            item["matchedEntityId"],
+        )
+    )
+    return matches
+
+
+def _find_matches_for_entity(application_id, source_entity, threshold):
+    """Find matches for one entity text."""
+
+    candidates = _search_candidates(
+        application_id,
+        source_entity["entitySearchText"],
+    )
     matches = []
     # OpenSearch finds possible matches. We check the complete text here.
     for candidate in candidates:
-        match = _best_text_match(candidate, source_entities)
-        if match["matchPercentage"] >= threshold:
-            matches.append(match)
+        percentage = _similarity_percentage(
+            source_entity["entitySearchText"],
+            _entity_text(candidate),
+        )
+        if percentage < threshold:
+            continue
+
+        matches.append(
+            {
+                "sourceEntityId": source_entity["entityId"],
+                "matchedEntityId": candidate["entityId"],
+                "matchPercentage": percentage,
+                "matchType": (
+                    "verbatim" if percentage == 100 else "similar"
+                ),
+                "occurrenceCount": candidate["occurrenceCount"],
+            }
+        )
 
     matches.sort(
         key=lambda item: (
@@ -157,32 +216,24 @@ def _find_matches(application_id, source_entities, threshold):
     return matches
 
 
-def _search_candidates(application_id, source_entities):
-    """Run one fuzzy search using all unique entity text."""
+def _search_candidates(application_id, search_text):
+    """Ask OpenSearch for fuzzy candidates for one text."""
 
-    search_texts = {
-        entity["entitySearchText"]
-        for entity in source_entities
-    }
-    should_queries = [
-        {
-            "match": {
-                "entitySearchText": {
-                    "query": text,
-                    "fuzziness": FUZZINESS,
-                    "prefix_length": 1,
-                    "max_expansions": 25,
-                    "operator": "and",
-                }
+    fuzzy_query = {
+        "match": {
+            "entitySearchText": {
+                "query": search_text,
+                "fuzziness": FUZZINESS,
+                "prefix_length": 1,
+                "max_expansions": 25,
+                "operator": "and",
             }
         }
-        for text in search_texts
-    ]
+    }
 
     query = {
         "bool": {
-            "should": should_queries,
-            "minimum_should_match": 1,
+            "must": [fuzzy_query],
             "must_not": [{"term": {"applicationId": application_id}}],
         }
     }
@@ -234,22 +285,50 @@ def _search_candidates(application_id, source_entities):
 
 
 def _search_occurrences_by_entity_ids(application_id, entity_ids):
-    """Get every occurrence for the matched entity IDs."""
+    """Get each matched entity's locations at the same time."""
 
     if not entity_ids:
-        return []
+        return {}
+
+    if len(entity_ids) == 1:
+        entity_id = entity_ids[0]
+        return {
+            entity_id: _search_entity_occurrences(
+                application_id,
+                entity_id,
+            )
+        }
+
+    with ThreadPoolExecutor(
+        max_workers=min(MAX_WORKERS, len(entity_ids))
+    ) as executor:
+        jobs = {
+            entity_id: executor.submit(
+                _search_entity_occurrences,
+                application_id,
+                entity_id,
+            )
+            for entity_id in entity_ids
+        }
+        return {
+            entity_id: job.result()
+            for entity_id, job in jobs.items()
+        }
+
+
+def _search_entity_occurrences(application_id, entity_id):
+    """Get every location for one entity outside the passed application."""
 
     query = {
         "bool": {
-            "filter": [{"terms": {"entityId": entity_ids}}],
+            "filter": [{"term": {"entityId": entity_id}}],
             "must_not": [{"term": {"applicationId": application_id}}],
         }
     }
     occurrences = []
     after_key = None
 
-    # Fuzzy matching is already done. This reads documents only for the small
-    # list of accepted entity IDs.
+    # Fuzzy matching is already done. Read every location for this entity.
     while True:
         composite = {
             "size": 1_000,
@@ -290,33 +369,6 @@ def _search_occurrences_by_entity_ids(application_id, entity_ids):
         after_key = result.get("after_key")
         if not after_key:
             return occurrences
-
-
-def _best_text_match(candidate, source_entities):
-    """Find which source entity text is closest to one candidate."""
-
-    candidate_text = _entity_text(candidate)
-    source_entity = source_entities[0]
-    percentage = _similarity_percentage(
-        source_entity["entitySearchText"],
-        candidate_text,
-    )
-    for entity in source_entities[1:]:
-        current_percentage = _similarity_percentage(
-            entity["entitySearchText"],
-            candidate_text,
-        )
-        if current_percentage > percentage:
-            source_entity = entity
-            percentage = current_percentage
-
-    return {
-        "sourceEntityId": source_entity["entityId"],
-        "matchedEntityId": candidate["entityId"],
-        "matchPercentage": percentage,
-        "matchType": "verbatim" if percentage == 100 else "similar",
-        "occurrenceCount": candidate["occurrenceCount"],
-    }
 
 
 def _application_entity_text(entity):

@@ -128,7 +128,7 @@ def fuzzy_entity_text_search(
     text: str = Query(min_length=2),
     threshold: int = Query(default=90, ge=1, le=100),
 ):
-    """Find all entity text matches above the threshold."""
+    """Find text matches and exclude the passed application."""
 
     return find_fuzzy_matches_by_text(application_id, text, threshold)
 

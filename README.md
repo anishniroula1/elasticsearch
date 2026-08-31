@@ -451,6 +451,8 @@ the verbatim and similar occurrence counts added to each one:
 
 These two fuzzy counts are occurrence documents from other applications.
 `matchingOtherCaseCount` remains the number of distinct matching applications.
+The fuzzy searches for the application's entities run with up to eight worker
+threads so AWS requests do not have to finish one at a time.
 
 ### Fuzzy search one entity text for an application
 
@@ -458,9 +460,10 @@ These two fuzzy counts are occurrence documents from other applications.
 GET /applications/{applicationId}/entities/fuzzy-search?text=andrew%20smith&threshold=90
 ```
 
-The application ID is excluded from the search. The API first finds the unique
-matching entities and checks their percentage. It then searches once using the
-accepted entity IDs. Each matching entity contains all its source locations:
+The application ID is only used as an exclusion. It does not need to exist in
+OpenSearch. The API excludes that ID while finding fuzzy candidates and while
+loading source locations. Accepted entity locations are loaded concurrently,
+and each matching entity contains all its source locations:
 
 ```json
 {
