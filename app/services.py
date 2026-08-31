@@ -4,7 +4,11 @@ from typing import Any
 
 from app.config import config
 from app.pagination import decode_page_token, encode_page_token
-from app.search_client import client, ensure_index, search_index
+from app.search_client import (
+    client,
+    ensure_index,
+    search_index,
+)
 
 
 ENTITY_SOURCE_FIELDS = [
@@ -14,6 +18,7 @@ ENTITY_SOURCE_FIELDS = [
     "entityId",
     "rawEntity",
     "normalizedText",
+    "entitySearchText",
     "entityType",
     "possibleSanction",
     "beginOffset",
@@ -21,7 +26,6 @@ ENTITY_SOURCE_FIELDS = [
     "score",
     "documentType",
 ]
-
 
 def health_status():
     """Check OpenSearch and return the current status."""
@@ -72,30 +76,48 @@ def get_application_entities(
         },
     )
 
-    entities: list[dict[str, Any]] = []
-    # Each bucket is one unique entity in this application.
-    for bucket in response["aggregations"]["entities"]["buckets"]:
-        sample_hits = bucket["sample"]["hits"]["hits"]
-        sample = sample_hits[0]["_source"]
+    buckets = response["aggregations"]["entities"]["buckets"]
+    entity_ids = [bucket["key"] for bucket in buckets]
+    outside_case_counts = {}
 
-        # Run one more query for each entity to count other applications.
+    if entity_ids:
+        # Count other applications for the whole entity list in one search.
         count_response = search_index(
             size=0,
             query={
                 "bool": {
-                    "filter": [{"term": {"entityId": bucket["key"]}}],
-                    "must_not": [{"term": {"applicationId": application_id}}],
+                    "filter": [{"terms": {"entityId": entity_ids}}],
+                    "must_not": [
+                        {"term": {"applicationId": application_id}}
+                    ],
                 }
             },
             aggs={
-                "cases": {
-                    "cardinality": {
-                        "field": "applicationId",
-                        "precision_threshold": 40_000,
-                    }
+                "entities": {
+                    "terms": {"field": "entityId", "size": 200},
+                    "aggs": {
+                        "cases": {
+                            "cardinality": {
+                                "field": "applicationId",
+                                "precision_threshold": 40_000,
+                            }
+                        }
+                    },
                 }
             },
         )
+        outside_case_counts = {
+            bucket["key"]: bucket["cases"]["value"]
+            for bucket in count_response["aggregations"]["entities"][
+                "buckets"
+            ]
+        }
+
+    entities: list[dict[str, Any]] = []
+    # Each bucket is one unique entity in this application.
+    for bucket in buckets:
+        sample_hits = bucket["sample"]["hits"]["hits"]
+        sample = sample_hits[0]["_source"]
         entities.append(
             {
                 "entityId": bucket["key"],
@@ -104,8 +126,9 @@ def get_application_entities(
                 "entityType": sample["entityType"],
                 "possibleSanction": sample["possibleSanction"],
                 "countInCurrentCase": bucket["doc_count"],
-                "matchingOtherCaseCount": (
-                    count_response["aggregations"]["cases"]["value"]
+                "matchingOtherCaseCount": outside_case_counts.get(
+                    bucket["key"],
+                    0,
                 ),
                 "sourceLocations": [
                     hit["_source"]

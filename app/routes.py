@@ -1,6 +1,10 @@
 from fastapi import APIRouter, HTTPException, Query
 
 from app.config import config
+from app.fuzzy_search import (
+    find_fuzzy_matches_by_text,
+    get_application_fuzzy_summary,
+)
 from app.search_client import client, ensure_index
 from app.seed import seed_documents
 from app.services import (
@@ -100,6 +104,33 @@ def similar_entity_cases(application_id: str):
     """Get other cases ordered by how many entity matches they have."""
 
     return find_similar_entity_cases(application_id)
+
+
+@router.get(
+    "/applications/{application_id}/entities/fuzzy-summary",
+    tags=["Fuzzy search"],
+)
+def fuzzy_entity_summary(
+    application_id: str,
+    threshold: int = Query(default=90, ge=1, le=100),
+):
+    """Get each application entity with fuzzy match counts."""
+
+    return get_application_fuzzy_summary(application_id, threshold)
+
+
+@router.get(
+    "/applications/{application_id}/entities/fuzzy-search",
+    tags=["Fuzzy search"],
+)
+def fuzzy_entity_text_search(
+    application_id: str,
+    text: str = Query(min_length=2),
+    threshold: int = Query(default=90, ge=1, le=100),
+):
+    """Find all entity text matches above the threshold."""
+
+    return find_fuzzy_matches_by_text(application_id, text, threshold)
 
 
 @router.get(

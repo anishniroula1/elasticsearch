@@ -21,12 +21,13 @@ def copy_project(source_path, output_path=None):
     if output == source or output.is_relative_to(source):
         raise ValueError("Output folder must be outside the source project")
 
-    # copytree stops when output already exists, so user files are not replaced.
+    # Reuse the output folder when this script is run again.
     shutil.copytree(
         source,
         output,
         copy_function=shutil.copy2,
         symlinks=True,
+        dirs_exist_ok=True,
     )
     return output
 
@@ -38,7 +39,7 @@ if __name__ == "__main__":
 
     try:
         copied_project = copy_project(source_folder, output_folder)
-    except (FileExistsError, ValueError) as error:
+    except ValueError as error:
         raise SystemExit(str(error)) from error
 
     file_count = sum(

@@ -422,6 +422,83 @@ GET /entities/fuzzy?text=mohamad
 
 This can return close candidates such as `mohammed`, `mohammad`, or `muhammad`, with an OpenSearch relevance score.
 
+### Fuzzy counts for each application entity
+
+```text
+GET /applications/{applicationId}/entities/fuzzy-summary?threshold=90
+```
+
+This returns the application entities like the normal entity endpoint, with
+the verbatim and similar occurrence counts added to each one:
+
+```json
+{
+  "applicationId": "A000000001",
+  "totalUniqueEntities": 2,
+  "entities": [
+    {
+      "entityId": "E020",
+      "entitySearchText": "andrew m smith",
+      "countInCurrentCase": 2,
+      "matchingOtherCaseCount": 44939,
+      "verbatimMatchCount": 3000,
+      "similarMatchCount": 200,
+      "sourceLocations": []
+    }
+  ]
+}
+```
+
+These two fuzzy counts are occurrence documents from other applications.
+`matchingOtherCaseCount` remains the number of distinct matching applications.
+
+### Fuzzy search one entity text for an application
+
+```text
+GET /applications/{applicationId}/entities/fuzzy-search?text=andrew%20smith&threshold=90
+```
+
+The application ID is excluded from the search. The API first finds the unique
+matching entities and checks their percentage. It then searches once using the
+accepted entity IDs. Each matching entity contains all its source locations:
+
+```json
+{
+  "applicationId": "A000000001",
+  "searchedText": "andrew smith",
+  "thresholdPercentage": 90,
+  "totalMatches": 1,
+  "totalSourceLocations": 1,
+  "matches": [
+    {
+      "entityId": "E020",
+      "matchPercentage": 100.0,
+      "matchType": "verbatim",
+      "uniqueApplicationIdCount": 1,
+      "totalCount": 1,
+      "sourceLocations": [
+        {
+          "applicationId": "A000000010",
+          "sentenceEntityId": 609436,
+          "tspId": "TSP-A000000010-04",
+          "globalId": "G-TSP-A000000010-04-0075",
+          "entityId": "E020",
+          "rawEntity": "Andrew Smith",
+          "normalizedText": "andrew smith",
+          "entitySearchText": "andrew smith",
+          "entityType": "PERSON",
+          "possibleSanction": false,
+          "beginOffset": 125,
+          "endOffset": 137,
+          "score": 0.981,
+          "documentType": "Interview"
+        }
+      ]
+    }
+  ]
+}
+```
+
 ## Suggested demo flow
 
 1. Start the project with `make run`.
@@ -432,6 +509,8 @@ This can return close candidates such as `mohammed`, `mohammad`, or `muhammad`, 
 6. Call the similar-cases endpoint.
 7. Copy another application ID and call shared-entities.
 8. Try `/entities/fuzzy?text=mohamad`.
+9. Try `/applications/A000000001/entities/fuzzy-summary`.
+10. Try the application entity fuzzy-search endpoint with one entity text.
 
 ## Notes about counts
 
@@ -469,7 +548,7 @@ python decode_project.py
 
 This uses the folder containing `decode_project.py` as the source and creates a
 sibling folder ending in `-decoded`. It copies everything, including nested and
-hidden files. It stops if the output folder already exists.
+hidden files. Running it again updates the existing decoded folder.
 
 You can also pass both the source project path and exact output path:
 
