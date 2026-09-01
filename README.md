@@ -431,13 +431,13 @@ GET /applications/{applicationId}/entities/fuzzy-summary?threshold=90
 This returns the application entities like the normal entity endpoint, with
 the verbatim and similar occurrence counts added to each one:
 
-The first OpenSearch query gets every item for the application ID. Before the
-fuzzy search, `entitySearchText` values are normalized and put in a set to
-remove duplicates. The values are sent in small `bool.should` batches using
-`AUTO:5,8`, which avoids OpenSearch's nested-clause limit. Candidate
-aggregations use small pages and a lower-memory distinct count so large AWS
-indexes do not trip the parent circuit breaker. Percentages and counts are
-calculated after the fuzzy responses are returned.
+The first OpenSearch query groups the application rows by `entityId` and keeps
+the rows needed for `sourceLocations`. Before the second query,
+`entitySearchText` values are cleaned and put in a set to remove duplicates.
+One `query_string` search then checks those values using `AUTO:5,8`, a two
+character prefix, and only 10 fuzzy expansions. OpenSearch returns candidates
+grouped by `entityId`, and the API checks the final edit-distance percentage
+before adding the counts to the response.
 
 ```json
 {
@@ -467,8 +467,8 @@ GET /applications/{applicationId}/entities/fuzzy-search?text=andrew%20smith&thre
 
 The application ID is only used as an exclusion. It does not need to exist in
 OpenSearch. The API excludes that ID while finding fuzzy candidates and while
-loading source locations. Accepted entity locations are loaded concurrently,
-and each matching entity contains all its source locations:
+loading source locations. All accepted entity IDs are sent in one OpenSearch
+query, and each matching entity contains its source locations:
 
 ```json
 {

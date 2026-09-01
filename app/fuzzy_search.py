@@ -1,16 +1,15 @@
 """Fuzzy entity searches used by the application APIs."""
 
+import re
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor
 
 from app.search_client import search_index
 
 
 FUZZINESS = "AUTO:5,8"
-FUZZY_QUERY_BATCH_SIZE = 5
-CANDIDATE_BUCKET_PAGE_SIZE = 100
+ENTITY_BUCKET_SIZE = 200
+SOURCE_LOCATION_SIZE = 100
 APPLICATION_COUNT_PRECISION = 1_000
-MAX_WORKERS = 8
 
 OCCURRENCE_FIELDS = [
     "sentenceEntityId",
@@ -31,11 +30,12 @@ OCCURRENCE_FIELDS = [
 
 
 def get_application_fuzzy_summary(application_id, threshold):
-    """Get application items, fuzzy matches, and then calculate the counts."""
+    """Find fuzzy matches for every entity in one application."""
 
-    # First query gets every entity occurrence for this application.
-    application_items = _search_application_items(application_id)
-    application_entities = _group_application_items(application_items)
+    # First query groups this application's rows by entity ID. top_hits keeps
+    # the actual rows because they are returned as sourceLocations.
+    buckets = _search_application_entities(application_id)
+    application_entities = [_application_entity(bucket) for bucket in buckets]
     if not application_entities:
         return {
             "applicationId": application_id,
@@ -43,42 +43,48 @@ def get_application_fuzzy_summary(application_id, threshold):
             "entities": [],
         }
 
+    # An entity can appear more than once. A set in _build_query_string removes
+    # repeated spellings before the second OpenSearch request is made.
     source_entities = [
         {
             "entityId": entity["entityId"],
-            "entitySearchText": _entity_text(entity["sourceLocations"][0]),
+            "entitySearchText": _entity_text(location),
         }
         for entity in application_entities
+        for location in entity["sourceLocations"]
+        if _entity_text(location)
     ]
 
-    # Second query sends every entitySearchText in one fuzzy bool query.
+    # Second query searches all unique entity text together and excludes the
+    # application that supplied the search values.
     candidates = _search_candidates(application_id, source_entities)
-
-    # OpenSearch returns possible candidates. Calculate the final percentage
-    # and counts after the complete second response is available.
     matches = _calculate_matches(source_entities, candidates, threshold)
+
     counts = {
-        entity["entityId"]: {"verbatim": 0, "similar": 0}
-        for entity in source_entities
+        entity["entityId"]: {
+            "applications": 0,
+            "verbatim": 0,
+            "similar": 0,
+        }
+        for entity in application_entities
     }
     for match in matches:
-        counts[match["sourceEntityId"]][match["matchType"]] += match[
-            "occurrenceCount"
-        ]
+        entity_counts = counts[match["sourceEntityId"]]
+        entity_counts["applications"] += match["uniqueApplicationIdCount"]
+        entity_counts[match["matchType"]] += match["occurrenceCount"]
 
-    application_counts = {
-        candidate["entityId"]: candidate["uniqueApplicationIdCount"]
-        for candidate in candidates
-    }
     for entity in application_entities:
         entity_counts = counts[entity["entityId"]]
-        entity["matchingOtherCaseCount"] = application_counts.get(
-            entity["entityId"],
-            0,
-        )
+        entity["matchingOtherCaseCount"] = entity_counts["applications"]
         entity["verbatimMatchCount"] = entity_counts["verbatim"]
         entity["similarMatchCount"] = entity_counts["similar"]
 
+    application_entities.sort(
+        key=lambda entity: (
+            -entity["countInCurrentCase"],
+            entity["normalizedText"],
+        )
+    )
     return {
         "applicationId": application_id,
         "totalUniqueEntities": len(application_entities),
@@ -87,7 +93,7 @@ def get_application_fuzzy_summary(application_id, threshold):
 
 
 def find_fuzzy_matches_by_text(application_id, text, threshold):
-    """Search one text and exclude the passed application from the result."""
+    """Find one text outside the application ID passed in the URL."""
 
     source_entities = [
         {
@@ -96,11 +102,10 @@ def find_fuzzy_matches_by_text(application_id, text, threshold):
         }
     ]
     candidates = _search_candidates(application_id, source_entities)
-    entity_matches = _calculate_matches(
-        source_entities,
-        candidates,
-        threshold,
-    )
+    entity_matches = _calculate_matches(source_entities, candidates, threshold)
+
+    # Get all locations for the accepted IDs in one query. This avoids running
+    # one OpenSearch request per match and does not need a thread pool.
     locations_by_entity_id = _search_occurrences_by_entity_ids(
         application_id,
         [match["matchedEntityId"] for match in entity_matches],
@@ -109,7 +114,7 @@ def find_fuzzy_matches_by_text(application_id, text, threshold):
     matches = []
     for entity_match in entity_matches:
         entity_id = entity_match["matchedEntityId"]
-        source_locations = locations_by_entity_id[entity_id]
+        source_locations = locations_by_entity_id.get(entity_id, [])
         matches.append(
             {
                 "entityId": entity_id,
@@ -139,139 +144,113 @@ def find_fuzzy_matches_by_text(application_id, text, threshold):
     }
 
 
-def _search_application_items(application_id):
-    """First query gets every item for the application ID."""
+def _search_application_entities(application_id):
+    """Get one bucket per entity ID for the current application."""
 
-    buckets = _read_all_buckets(
+    response = search_index(
+        size=0,
+        track_total_hits=False,
         query={"term": {"applicationId": application_id}},
-        aggregation_name="applicationItems",
-        group_field="sentenceEntityId",
-        source_fields=OCCURRENCE_FIELDS,
-    )
-    return [_bucket_source(bucket) for bucket in buckets]
-
-
-def _group_application_items(application_items):
-    """Group the application items by entity ID."""
-
-    entities = {}
-    for item in application_items:
-        entity_id = item["entityId"]
-        if entity_id not in entities:
-            entities[entity_id] = {
-                "entityId": entity_id,
-                "normalizedText": item.get("normalizedText", ""),
-                "rawEntity": item.get("rawEntity", ""),
-                "entityType": item.get("entityType", ""),
-                "possibleSanction": item.get("possibleSanction", False),
-                "countInCurrentCase": 0,
-                "sourceLocations": [],
+        aggs={
+            "entities": {
+                "terms": {
+                    "field": "entityId",
+                    "size": ENTITY_BUCKET_SIZE,
+                },
+                "aggs": {
+                    "sample": {
+                        "top_hits": {
+                            "size": SOURCE_LOCATION_SIZE,
+                            "_source": OCCURRENCE_FIELDS,
+                        }
+                    }
+                },
             }
-
-        entities[entity_id]["countInCurrentCase"] += 1
-        entities[entity_id]["sourceLocations"].append(item)
-
-    result = list(entities.values())
-    result.sort(
-        key=lambda entity: (
-            -entity["countInCurrentCase"],
-            entity["normalizedText"],
-        )
+        },
     )
-    return result
+    return response["aggregations"]["entities"]["buckets"]
+
+
+def _application_entity(bucket):
+    """Turn one application bucket into the API response shape."""
+
+    source_locations = _bucket_sources(bucket)
+    sample = source_locations[0]
+    return {
+        "entityId": sample["entityId"],
+        "normalizedText": sample.get("normalizedText", ""),
+        "rawEntity": sample.get("rawEntity", ""),
+        "entityType": sample.get("entityType", ""),
+        "possibleSanction": sample.get("possibleSanction", False),
+        "countInCurrentCase": bucket["doc_count"],
+        "sourceLocations": source_locations,
+    }
 
 
 def _search_candidates(application_id, source_entities):
-    """Second query searches all entity text with AUTO fuzziness."""
+    """Search every unique entity text in one OpenSearch request."""
 
-    # Normalize first so values with different case, accents, punctuation, or
-    # extra spaces become one value in the set.
-    search_texts = sorted(
-        {
-            _normalize_text(entity["entitySearchText"])
-            for entity in source_entities
-            if entity["entitySearchText"]
-        }
+    query_string = _build_query_string(
+        entity["entitySearchText"] for entity in source_entities
     )
-    if not search_texts:
+    if not query_string:
         return []
 
-    candidates_by_id = {}
-    for start in range(0, len(search_texts), FUZZY_QUERY_BATCH_SIZE):
-        text_batch = search_texts[
-            start : start + FUZZY_QUERY_BATCH_SIZE
-        ]
-        for candidate in _search_candidate_batch(
-            application_id,
-            text_batch,
-        ):
-            entity_id = candidate["entityId"]
-            saved_candidate = candidates_by_id.get(entity_id)
-            if not saved_candidate:
-                candidates_by_id[entity_id] = candidate
-                continue
-
-            # A candidate can be found by more than one batch. Keep it once.
-            saved_candidate["occurrenceCount"] = max(
-                saved_candidate["occurrenceCount"],
-                candidate["occurrenceCount"],
-            )
-            saved_candidate["uniqueApplicationIdCount"] = max(
-                saved_candidate["uniqueApplicationIdCount"],
-                candidate["uniqueApplicationIdCount"],
-            )
-
-    return list(candidates_by_id.values())
-
-
-def _search_candidate_batch(application_id, search_texts):
-    """Run one small fuzzy query to stay under the clause limit."""
-
-    fuzzy_queries = [
-        {
-            "match": {
-                "entitySearchText": {
-                    "query": text,
-                    "fuzziness": FUZZINESS,
-                    "prefix_length": 1,
-                    "max_expansions": 25,
-                    "operator": "and",
-                }
-            }
-        }
-        for text in search_texts
-    ]
-    query = {
-        "bool": {
-            "should": fuzzy_queries,
-            "minimum_should_match": 1,
-            "must_not": [{"term": {"applicationId": application_id}}],
-        }
-    }
-    buckets = _read_all_buckets(
-        query=query,
-        aggregation_name="candidates",
-        group_field="entityId",
-        source_fields=[
-            "entityId",
-            "entitySearchText",
-            "normalizedText",
-            "rawEntity",
-        ],
-        extra_aggs={
-            "applications": {
-                "cardinality": {
-                    "field": "applicationId",
-                    "precision_threshold": APPLICATION_COUNT_PRECISION,
-                }
+    response = search_index(
+        size=0,
+        track_total_hits=False,
+        query={
+            "bool": {
+                "must": [
+                    {
+                        "query_string": {
+                            "query": query_string,
+                            "default_field": "entitySearchText",
+                            "fuzziness": FUZZINESS,
+                            "fuzzy_max_expansions": 10,
+                            "fuzzy_prefix_length": 2,
+                        }
+                    }
+                ],
+                "must_not": [
+                    {"term": {"applicationId": application_id}}
+                ],
             }
         },
-        page_size=CANDIDATE_BUCKET_PAGE_SIZE,
+        aggs={
+            "entities": {
+                "terms": {
+                    "field": "entityId",
+                    "size": ENTITY_BUCKET_SIZE,
+                },
+                "aggs": {
+                    "sample": {
+                        "top_hits": {
+                            "size": 1,
+                            "_source": [
+                                "entityId",
+                                "entitySearchText",
+                                "normalizedText",
+                                "rawEntity",
+                            ],
+                        }
+                    },
+                    "applications": {
+                        "cardinality": {
+                            "field": "applicationId",
+                            "precision_threshold": (
+                                APPLICATION_COUNT_PRECISION
+                            ),
+                        }
+                    },
+                },
+            }
+        },
     )
 
     candidates = []
-    for bucket in buckets:
-        candidate = _bucket_source(bucket)
+    for bucket in response["aggregations"]["entities"]["buckets"]:
+        candidate = _bucket_sources(bucket)[0]
         candidate["occurrenceCount"] = bucket["doc_count"]
         candidate["uniqueApplicationIdCount"] = bucket["applications"][
             "value"
@@ -280,8 +259,59 @@ def _search_candidate_batch(application_id, search_texts):
     return candidates
 
 
+def _build_query_string(search_texts):
+    """Clean duplicate text and build one safe query string."""
+
+    clean_texts = {
+        _clean_search_text(text)
+        for text in search_texts
+        if text
+    }
+    formatted_terms = []
+    for text in sorted(clean_texts):
+        if not text:
+            continue
+
+        words = text.split()
+        if len(words) == 1:
+            formatted_terms.append(f"{_escape_query_word(words[0])}~")
+            continue
+
+        # Quoted text is an exact phrase in query_string. Fuzz each word and
+        # keep the words together with AND so spelling mistakes still match.
+        fuzzy_words = " AND ".join(
+            f"{_escape_query_word(word)}~" for word in words
+        )
+        formatted_terms.append(f"({fuzzy_words})")
+
+    return " OR ".join(formatted_terms)
+
+
+def _clean_search_text(value):
+    """Remove artifacts and make repeated spellings look the same."""
+
+    normalized = unicodedata.normalize("NFKD", str(value).casefold())
+    plain_text = "".join(
+        character
+        for character in normalized
+        if not unicodedata.combining(character)
+    )
+    clean_text = re.sub(r"[^\w\s.,'-]", " ", plain_text)
+    clean_text = " ".join(clean_text.split())
+    return clean_text.strip(" -,.()[]{}")
+
+
+def _escape_query_word(value):
+    """Escape characters that have meaning in a query string."""
+
+    return re.sub(r'([+\-=&|><!(){}\[\]^"~*?:\\/])', r"\\\1", value)
+
+
 def _calculate_matches(source_entities, candidates, threshold):
-    """Calculate which application entity is closest to each candidate."""
+    """Keep candidates that pass the real edit-distance percentage."""
+
+    if not source_entities:
+        return []
 
     matches = []
     for candidate in candidates:
@@ -311,6 +341,9 @@ def _calculate_matches(source_entities, candidates, threshold):
                         "verbatim" if percentage == 100 else "similar"
                     ),
                     "occurrenceCount": candidate["occurrenceCount"],
+                    "uniqueApplicationIdCount": candidate[
+                        "uniqueApplicationIdCount"
+                    ],
                 }
             )
 
@@ -324,44 +357,16 @@ def _calculate_matches(source_entities, candidates, threshold):
 
 
 def _search_occurrences_by_entity_ids(application_id, entity_ids):
-    """Get each matched entity's locations at the same time."""
+    """Get every location for all accepted entity IDs with one query."""
 
-    if not entity_ids:
+    unique_ids = sorted(set(entity_ids))
+    if not unique_ids:
         return {}
-
-    if len(entity_ids) == 1:
-        entity_id = entity_ids[0]
-        return {
-            entity_id: _search_entity_occurrences(
-                application_id,
-                entity_id,
-            )
-        }
-
-    with ThreadPoolExecutor(
-        max_workers=min(MAX_WORKERS, len(entity_ids))
-    ) as executor:
-        jobs = {
-            entity_id: executor.submit(
-                _search_entity_occurrences,
-                application_id,
-                entity_id,
-            )
-            for entity_id in entity_ids
-        }
-        return {
-            entity_id: job.result()
-            for entity_id, job in jobs.items()
-        }
-
-
-def _search_entity_occurrences(application_id, entity_id):
-    """Get every location outside the passed application ID."""
 
     buckets = _read_all_buckets(
         query={
             "bool": {
-                "filter": [{"term": {"entityId": entity_id}}],
+                "filter": [{"terms": {"entityId": unique_ids}}],
                 "must_not": [
                     {"term": {"applicationId": application_id}}
                 ],
@@ -371,7 +376,12 @@ def _search_entity_occurrences(application_id, entity_id):
         group_field="sentenceEntityId",
         source_fields=OCCURRENCE_FIELDS,
     )
-    return [_bucket_source(bucket) for bucket in buckets]
+
+    locations = {entity_id: [] for entity_id in unique_ids}
+    for bucket in buckets:
+        source = _bucket_sources(bucket)[0]
+        locations[source["entityId"]].append(source)
+    return locations
 
 
 def _read_all_buckets(
@@ -379,7 +389,6 @@ def _read_all_buckets(
     aggregation_name,
     group_field,
     source_fields,
-    extra_aggs=None,
     page_size=1_000,
 ):
     """Read all composite pages so the API needs no pagination."""
@@ -396,25 +405,21 @@ def _read_all_buckets(
         if after_key:
             composite["after"] = after_key
 
-        inner_aggs = {
-            "sample": {
-                "top_hits": {
-                    "size": 1,
-                    "_source": source_fields,
-                }
-            }
-        }
-        if extra_aggs:
-            inner_aggs.update(extra_aggs)
-
         response = search_index(
             size=0,
-            query=query,
             track_total_hits=False,
+            query=query,
             aggs={
                 aggregation_name: {
                     "composite": composite,
-                    "aggs": inner_aggs,
+                    "aggs": {
+                        "sample": {
+                            "top_hits": {
+                                "size": 1,
+                                "_source": source_fields,
+                            }
+                        }
+                    },
                 }
             },
         )
@@ -425,10 +430,10 @@ def _read_all_buckets(
             return buckets
 
 
-def _bucket_source(bucket):
-    """Get the source item kept in an aggregation bucket."""
+def _bucket_sources(bucket):
+    """Get source items stored inside an aggregation bucket."""
 
-    return bucket["sample"]["hits"]["hits"][0]["_source"]
+    return [hit["_source"] for hit in bucket["sample"]["hits"]["hits"]]
 
 
 def _similarity_percentage(left, right):
@@ -450,7 +455,7 @@ def _normalize_text(value):
 
     plain_text = "".join(
         character
-        for character in unicodedata.normalize("NFKD", value.casefold())
+        for character in unicodedata.normalize("NFKD", str(value).casefold())
         if not unicodedata.combining(character)
     )
     return " ".join(
