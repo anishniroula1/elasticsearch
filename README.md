@@ -434,10 +434,11 @@ the verbatim and similar occurrence counts added to each one:
 The first OpenSearch query groups the application rows by `entityId` and keeps
 the rows needed for `sourceLocations`. Before the second query,
 `entitySearchText` values are cleaned and put in a set to remove duplicates.
-One `query_string` search then checks those values using `AUTO:5,8`, a two
-character prefix, and only 10 fuzzy expansions. OpenSearch returns candidates
-grouped by `entityId`, and the API checks the final edit-distance percentage
-before adding the counts to the response.
+The unique values are split into batches of 100. Each batch gets one worker
+and runs a `query_string` search using `AUTO:5,8`, a two character prefix, and
+only 10 fuzzy expansions. OpenSearch returns candidates grouped by `entityId`,
+duplicate candidates from different batches are merged, and the API checks the
+final edit-distance percentage before adding the counts to the response.
 
 ```json
 {

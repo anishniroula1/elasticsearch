@@ -2,11 +2,13 @@
 
 import re
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 
 from app.search_client import search_index
 
 
 FUZZINESS = "AUTO:5,8"
+SEARCH_TEXT_BATCH_SIZE = 100
 ENTITY_BUCKET_SIZE = 200
 SOURCE_LOCATION_SIZE = 100
 APPLICATION_COUNT_PRECISION = 1_000
@@ -188,14 +190,68 @@ def _application_entity(bucket):
 
 
 def _search_candidates(application_id, source_entities):
-    """Search every unique entity text in one OpenSearch request."""
+    """Split unique search text into batches and run them together."""
 
-    query_string = _build_query_string(
-        entity["entitySearchText"] for entity in source_entities
+    search_texts = sorted(
+        {
+            _clean_search_text(entity["entitySearchText"])
+            for entity in source_entities
+            if entity["entitySearchText"]
+        }
+        - {""}
     )
-    if not query_string:
+    if not search_texts:
         return []
 
+    # Every 100 unique values becomes one query and one worker. Smaller query
+    # strings avoid OpenSearch's too-many-nested-clauses error.
+    batches = [
+        search_texts[start : start + SEARCH_TEXT_BATCH_SIZE]
+        for start in range(0, len(search_texts), SEARCH_TEXT_BATCH_SIZE)
+    ]
+    if len(batches) == 1:
+        candidate_groups = [
+            _search_candidate_batch(application_id, batches[0])
+        ]
+    else:
+        with ThreadPoolExecutor(max_workers=len(batches)) as executor:
+            jobs = [
+                executor.submit(
+                    _search_candidate_batch,
+                    application_id,
+                    batch,
+                )
+                for batch in batches
+            ]
+            candidate_groups = [job.result() for job in jobs]
+
+    # The same candidate can be found by more than one batch. Keep it once so
+    # its occurrence and application counts are not added more than once.
+    candidates_by_id = {}
+    for candidates in candidate_groups:
+        for candidate in candidates:
+            entity_id = candidate["entityId"]
+            saved = candidates_by_id.get(entity_id)
+            if not saved:
+                candidates_by_id[entity_id] = candidate
+                continue
+
+            saved["occurrenceCount"] = max(
+                saved["occurrenceCount"],
+                candidate["occurrenceCount"],
+            )
+            saved["uniqueApplicationIdCount"] = max(
+                saved["uniqueApplicationIdCount"],
+                candidate["uniqueApplicationIdCount"],
+            )
+
+    return list(candidates_by_id.values())
+
+
+def _search_candidate_batch(application_id, search_texts):
+    """Run one fuzzy query for up to 100 search values."""
+
+    query_string = _build_query_string(search_texts)
     response = search_index(
         size=0,
         track_total_hits=False,
@@ -209,6 +265,7 @@ def _search_candidates(application_id, source_entities):
                             "fuzziness": FUZZINESS,
                             "fuzzy_max_expansions": 10,
                             "fuzzy_prefix_length": 2,
+                            "fuzzy_rewrite": "constant_score",
                         }
                     }
                 ],
