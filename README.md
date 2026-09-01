@@ -431,10 +431,11 @@ GET /applications/{applicationId}/entities/fuzzy-summary?threshold=90
 This returns the application entities like the normal entity endpoint, with
 the verbatim and similar occurrence counts added to each one:
 
-The first OpenSearch query gets every item for the application ID. The second
-query puts the unique `entitySearchText` values into one fuzzy `bool.should`
-query using `AUTO:5,8`. Percentages and counts are calculated after the second
-response is returned.
+The first OpenSearch query gets every item for the application ID. Before the
+fuzzy search, `entitySearchText` values are normalized and put in a set to
+remove duplicates. The values are sent in small `bool.should` batches using
+`AUTO:5,8`, which avoids OpenSearch's nested-clause limit. Percentages and
+counts are calculated after the fuzzy responses are returned.
 
 ```json
 {

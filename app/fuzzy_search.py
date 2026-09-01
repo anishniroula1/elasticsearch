@@ -7,6 +7,7 @@ from app.search_client import search_index
 
 
 FUZZINESS = "AUTO:5,8"
+FUZZY_QUERY_BATCH_SIZE = 10
 MAX_WORKERS = 8
 
 OCCURRENCE_FIELDS = [
@@ -181,15 +182,48 @@ def _group_application_items(application_items):
 def _search_candidates(application_id, source_entities):
     """Second query searches all entity text with AUTO fuzziness."""
 
-    search_texts = list(
-        dict.fromkeys(
-            entity["entitySearchText"]
+    # Normalize first so values with different case, accents, punctuation, or
+    # extra spaces become one value in the set.
+    search_texts = sorted(
+        {
+            _normalize_text(entity["entitySearchText"])
             for entity in source_entities
             if entity["entitySearchText"]
-        )
+        }
     )
     if not search_texts:
         return []
+
+    candidates_by_id = {}
+    for start in range(0, len(search_texts), FUZZY_QUERY_BATCH_SIZE):
+        text_batch = search_texts[
+            start : start + FUZZY_QUERY_BATCH_SIZE
+        ]
+        for candidate in _search_candidate_batch(
+            application_id,
+            text_batch,
+        ):
+            entity_id = candidate["entityId"]
+            saved_candidate = candidates_by_id.get(entity_id)
+            if not saved_candidate:
+                candidates_by_id[entity_id] = candidate
+                continue
+
+            # A candidate can be found by more than one batch. Keep it once.
+            saved_candidate["occurrenceCount"] = max(
+                saved_candidate["occurrenceCount"],
+                candidate["occurrenceCount"],
+            )
+            saved_candidate["uniqueApplicationIdCount"] = max(
+                saved_candidate["uniqueApplicationIdCount"],
+                candidate["uniqueApplicationIdCount"],
+            )
+
+    return list(candidates_by_id.values())
+
+
+def _search_candidate_batch(application_id, search_texts):
+    """Run one small fuzzy query to stay under the clause limit."""
 
     fuzzy_queries = [
         {
