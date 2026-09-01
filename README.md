@@ -434,8 +434,10 @@ the verbatim and similar occurrence counts added to each one:
 The first OpenSearch query gets every item for the application ID. Before the
 fuzzy search, `entitySearchText` values are normalized and put in a set to
 remove duplicates. The values are sent in small `bool.should` batches using
-`AUTO:5,8`, which avoids OpenSearch's nested-clause limit. Percentages and
-counts are calculated after the fuzzy responses are returned.
+`AUTO:5,8`, which avoids OpenSearch's nested-clause limit. Candidate
+aggregations use small pages and a lower-memory distinct count so large AWS
+indexes do not trip the parent circuit breaker. Percentages and counts are
+calculated after the fuzzy responses are returned.
 
 ```json
 {

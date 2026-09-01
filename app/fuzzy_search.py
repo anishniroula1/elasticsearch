@@ -7,7 +7,9 @@ from app.search_client import search_index
 
 
 FUZZINESS = "AUTO:5,8"
-FUZZY_QUERY_BATCH_SIZE = 10
+FUZZY_QUERY_BATCH_SIZE = 5
+CANDIDATE_BUCKET_PAGE_SIZE = 100
+APPLICATION_COUNT_PRECISION = 1_000
 MAX_WORKERS = 8
 
 OCCURRENCE_FIELDS = [
@@ -260,10 +262,11 @@ def _search_candidate_batch(application_id, search_texts):
             "applications": {
                 "cardinality": {
                     "field": "applicationId",
-                    "precision_threshold": 40_000,
+                    "precision_threshold": APPLICATION_COUNT_PRECISION,
                 }
             }
         },
+        page_size=CANDIDATE_BUCKET_PAGE_SIZE,
     )
 
     candidates = []
@@ -377,6 +380,7 @@ def _read_all_buckets(
     group_field,
     source_fields,
     extra_aggs=None,
+    page_size=1_000,
 ):
     """Read all composite pages so the API needs no pagination."""
 
@@ -384,7 +388,7 @@ def _read_all_buckets(
     after_key = None
     while True:
         composite = {
-            "size": 1_000,
+            "size": page_size,
             "sources": [
                 {group_field: {"terms": {"field": group_field}}}
             ],
