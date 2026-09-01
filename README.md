@@ -431,6 +431,11 @@ GET /applications/{applicationId}/entities/fuzzy-summary?threshold=90
 This returns the application entities like the normal entity endpoint, with
 the verbatim and similar occurrence counts added to each one:
 
+The first OpenSearch query gets every item for the application ID. The second
+query puts the unique `entitySearchText` values into one fuzzy `bool.should`
+query using `AUTO:5,8`. Percentages and counts are calculated after the second
+response is returned.
+
 ```json
 {
   "applicationId": "A000000001",
@@ -438,7 +443,6 @@ the verbatim and similar occurrence counts added to each one:
   "entities": [
     {
       "entityId": "E020",
-      "entitySearchText": "andrew m smith",
       "countInCurrentCase": 2,
       "matchingOtherCaseCount": 44939,
       "verbatimMatchCount": 3000,
@@ -451,8 +455,6 @@ the verbatim and similar occurrence counts added to each one:
 
 These two fuzzy counts are occurrence documents from other applications.
 `matchingOtherCaseCount` remains the number of distinct matching applications.
-The fuzzy searches for the application's entities run with up to eight worker
-threads so AWS requests do not have to finish one at a time.
 
 ### Fuzzy search one entity text for an application
 
