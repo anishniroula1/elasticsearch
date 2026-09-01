@@ -431,14 +431,13 @@ GET /applications/{applicationId}/entities/fuzzy-summary?threshold=90
 This returns the application entities like the normal entity endpoint, with
 the verbatim and similar occurrence counts added to each one:
 
-The first OpenSearch query groups the application rows by `entityId` and keeps
-the rows needed for `sourceLocations`. Before the second query,
-`entitySearchText` values are cleaned and put in a set to remove duplicates.
-The unique values are split into batches of 100. Each batch gets one worker
-and runs a `query_string` search using `AUTO:5,8`, a two character prefix, and
-only 10 fuzzy expansions. OpenSearch returns candidates grouped by `entityId`,
-duplicate candidates from different batches are merged, and the API checks the
-final edit-distance percentage before adding the counts to the response.
+The fuzzy summary makes two HTTP calls to OpenSearch. The first search groups
+the current application rows by `entityId` and keeps the rows needed for
+`sourceLocations`. The second call uses `_msearch`: one search gets the outside
+case counts, and each application entity gets its own small `AUTO:5,8` fuzzy
+search. Keeping the fuzzy searches separate avoids the nested-clause error,
+while `_msearch` sends all of them to OpenSearch in one HTTP request. The API
+checks the final edit-distance percentage before adding the counts.
 
 ```json
 {

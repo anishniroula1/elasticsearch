@@ -103,6 +103,15 @@ def search_index(**body):
     return client.search(index=config.index_alias, body=body)
 
 
+def multi_search(searches):
+    """Run several independent searches in one OpenSearch request."""
+
+    body = []
+    for search in searches:
+        body.extend([{}, search])
+    return client.msearch(index=config.index_alias, body=body)
+
+
 def recreate_index():
     """Delete the current index and create it again."""
 
