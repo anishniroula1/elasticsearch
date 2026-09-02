@@ -2,6 +2,9 @@
 
 A small local project for testing NER entity matching and the proposed case UI flow.
 
+See [Entity Matching: Exact, Fuzzy, and Vector Search](SEARCH_MATCHING_DESIGN.md)
+for the current matching design and a detailed vector-search proposal.
+
 The project uses:
 
 - OpenSearch
@@ -50,6 +53,7 @@ ner-similarities-opensearch-demo/
 ├── Makefile
 ├── pyproject.toml
 ├── seed.csv                 # optional
+├── SEARCH_MATCHING_DESIGN.md
 └── README.md
 ```
 
@@ -431,13 +435,22 @@ GET /applications/{applicationId}/entities/fuzzy-summary?threshold=90
 This returns the application entities like the normal entity endpoint, with
 the verbatim and similar occurrence counts added to each one:
 
-The fuzzy summary makes two HTTP calls to OpenSearch. The first search groups
-the current application rows by `entityId` and keeps the rows needed for
-`sourceLocations`. The second call uses `_msearch`: one search gets the outside
-case counts, and each application entity gets its own small `AUTO:5,8` fuzzy
-search. Keeping the fuzzy searches separate avoids the nested-clause error,
-while `_msearch` sends all of them to OpenSearch in one HTTP request. The API
-uses RapidFuzz's normalized Levenshtein similarity to check the final
+The fuzzy summary normally makes two HTTP calls to OpenSearch. The first search
+gets every unique entity from the current application. It uses composite
+aggregation pages internally, so there is no 200-entity result cap. The second
+call uses `_msearch`: one search gets the outside-case counts, and the remaining
+searches fuzzy-match batches of up to 50 cleaned, unique `entitySearchText`
+values. A token limit can make a batch smaller when it contains long names.
+
+Each multiword value keeps its words together. For example, `alexander
+hamilten` becomes `(alexander~ AND hamilten~)`. The batches are joined with
+`OR`, use `AUTO:5,8`, a two-character prefix, and at most 10 fuzzy expansions.
+This keeps the query below the nested-clause limit while reducing the amount of
+work compared with one fuzzy subsearch per entity. Candidate IDs also use
+internal composite pages, so 1,000 is a page size and not a total result limit.
+Extra `_msearch` calls happen only when a candidate batch has another page.
+
+The API uses RapidFuzz's normalized Levenshtein similarity to check the final
 percentage before adding the counts.
 
 ```json
