@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.gzip import GZipMiddleware
 
 from app.config import config
 from app.routes import router
@@ -30,4 +31,5 @@ app = FastAPI(
     ),
     lifespan=lifespan,
 )
+app.add_middleware(GZipMiddleware, minimum_size=1_000, compresslevel=5)
 app.include_router(router)

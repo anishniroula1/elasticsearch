@@ -288,35 +288,48 @@ GET /applications/{applicationId}/entities/fuzzy-summary?threshold=90
 
 The endpoint makes two HTTP calls to OpenSearch:
 
-1. A normal search gets the current application's entities and source rows.
+1. A normal search gets the current application's entities without returning
+   source locations.
    Composite aggregation reads additional pages internally if the application
    has more than 1,000 unique entities.
 2. An `_msearch` call contains:
    - One search for exact outside-case counts.
-   - Query-string fuzzy searches containing batches of up to 50 cleaned,
-     unique entity texts.
+   - One fuzzy candidate search for each unique entity search text.
 
-Duplicate search text is removed before batching. Each multiword name uses an
-`AND` group, and the groups use `OR`:
+Duplicate search text is removed before creating the multi-search request. If
+two entity IDs both use `alexander hamilton`, OpenSearch runs that fuzzy search
+once and the service maps its candidates back to both entities.
+
+This reduces duplicate work but does not make a group of different fuzzy
+searches free. OpenSearch still executes every unique fuzzy subsearch. Removing
+source locations mainly reduces the first query response and the final API
+payload.
+
+### 6.4 Source locations endpoint
 
 ```text
-(alexander~ AND hamilten~) OR (united~ AND arab~ AND group~) OR (aqap~)
+POST /applications/{applicationId}/entities/source-locations
 ```
 
-The batch query uses `AUTO:5,8`, `fuzzy_prefix_length: 2`, and
-`fuzzy_max_expansions: 10`. A batch holds no more than 50 names or 80 words.
-The word limit matters because fuzzy expansion happens per word, not per name.
-It prevents long names from recreating the `too_many_nested_clauses` error.
+The request body supplies the selected entity IDs:
 
-Each batch uses a composite candidate aggregation. The 1,000 value is its page
-size, not a result limit. If OpenSearch returns an `after_key`, the service
-sends only unfinished batches in another `_msearch` call. The public API has no
-pagination and still returns counts based on all candidate buckets.
+```json
+{
+  "entityIds": ["E020", "E031"]
+}
+```
 
-`_msearch` reduces network round trips. OpenSearch still executes each batch
-search inside the multi-search request.
+One OpenSearch query filters by the application ID and the complete entity ID
+list. A composite aggregation groups by `entityId` and `sentenceEntityId`.
+The service follows every `after_key` internally and returns all locations
+grouped under their entity ID. This keeps the summary fast while still
+providing a separate way to retrieve 15,000 or more rows when needed.
 
-### 6.4 Fuzzy text endpoint
+The response can still be large because all rows must be read, converted to
+JSON, transferred, and displayed. HTTP gzip reduces transfer size but does not
+remove that work.
+
+### 6.5 Fuzzy text endpoint
 
 ```text
 GET /applications/{applicationId}/entities/fuzzy-search?text=alexander%20hamilten&threshold=90
@@ -361,7 +374,7 @@ Example response shape:
 }
 ```
 
-### 6.5 Strengths and limits of lexical fuzzy matching
+### 6.6 Strengths and limits of lexical fuzzy matching
 
 Strengths:
 

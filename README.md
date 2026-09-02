@@ -436,22 +436,16 @@ This returns the application entities like the normal entity endpoint, with
 the verbatim and similar occurrence counts added to each one:
 
 The fuzzy summary normally makes two HTTP calls to OpenSearch. The first search
-gets every unique entity from the current application. It uses composite
-aggregation pages internally, so there is no 200-entity result cap. The second
-call uses `_msearch`: one search gets the outside-case counts, and the remaining
-searches fuzzy-match batches of up to 50 cleaned, unique `entitySearchText`
-values. A token limit can make a batch smaller when it contains long names.
-
-Each multiword value keeps its words together. For example, `alexander
-hamilten` becomes `(alexander~ AND hamilten~)`. The batches are joined with
-`OR`, use `AUTO:5,8`, a two-character prefix, and at most 10 fuzzy expansions.
-This keeps the query below the nested-clause limit while reducing the amount of
-work compared with one fuzzy subsearch per entity. Candidate IDs also use
-internal composite pages, so 1,000 is a page size and not a total result limit.
-Extra `_msearch` calls happen only when a candidate batch has another page.
+uses composite aggregation pages to get every unique entity, so there is no
+200-entity result cap. It reads only one small sample internally and does not
+return `sourceLocations`. The second call uses `_msearch`: one search gets the
+outside-case counts and one fuzzy subsearch runs for each unique
+`entitySearchText`. Duplicate search text is only searched once.
 
 The API uses RapidFuzz's normalized Levenshtein similarity to check the final
-percentage before adding the counts.
+percentage before adding the counts. Keeping source locations out of this
+response makes the summary smaller, but the fuzzy searches are still the main
+OpenSearch work.
 
 ```json
 {
@@ -463,8 +457,7 @@ percentage before adding the counts.
       "countInCurrentCase": 2,
       "matchingOtherCaseCount": 44939,
       "verbatimMatchCount": 3000,
-      "similarMatchCount": 200,
-      "sourceLocations": []
+      "similarMatchCount": 200
     }
   ]
 }
@@ -472,6 +465,39 @@ percentage before adding the counts.
 
 These two fuzzy counts are occurrence documents from other applications.
 `matchingOtherCaseCount` remains the number of distinct matching applications.
+
+### Get all source locations for selected entities
+
+```text
+POST /applications/{applicationId}/entities/source-locations
+```
+
+Request body:
+
+```json
+{
+  "entityIds": ["E020", "E031"]
+}
+```
+
+This searches the application and all requested IDs together. It uses
+composite aggregation pages internally and returns every source location. For
+example, if the selection has 15,000 locations, all 15,000 are included in the
+response. Large responses are compressed when the client accepts gzip.
+
+```json
+{
+  "applicationId": "A000000001",
+  "totalSourceLocations": 455,
+  "entities": [
+    {
+      "entityId": "E020",
+      "totalSourceLocations": 455,
+      "sourceLocations": []
+    }
+  ]
+}
+```
 
 ### Fuzzy search one entity text for an application
 

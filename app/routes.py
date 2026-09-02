@@ -1,9 +1,10 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Body, HTTPException, Query
 
 from app.config import config
 from app.fuzzy_search import (
     find_fuzzy_matches_by_text,
     get_application_fuzzy_summary,
+    get_application_source_locations,
 )
 from app.search_client import client, ensure_index
 from app.seed import seed_documents
@@ -117,6 +118,19 @@ def fuzzy_entity_summary(
     """Get each application entity with fuzzy match counts."""
 
     return get_application_fuzzy_summary(application_id, threshold)
+
+
+@router.post(
+    "/applications/{application_id}/entities/source-locations",
+    tags=["Case entities"],
+)
+def application_entity_source_locations(
+    application_id: str,
+    entityIds: list[str] = Body(min_length=1, embed=True),
+):
+    """Get all source locations for a list of application entities."""
+
+    return get_application_source_locations(application_id, entityIds)
 
 
 @router.get(
