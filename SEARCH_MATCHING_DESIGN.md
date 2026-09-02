@@ -294,16 +294,26 @@ The endpoint makes two HTTP calls to OpenSearch:
    has more than 1,000 unique entities.
 2. An `_msearch` call contains:
    - One search for exact outside-case counts.
-   - One fuzzy candidate search for each unique entity search text.
+   - Small fuzzy candidate batches containing the unique entity search text.
 
 Duplicate search text is removed before creating the multi-search request. If
 two entity IDs both use `alexander hamilton`, OpenSearch runs that fuzzy search
 once and the service maps its candidates back to both entities.
 
-This reduces duplicate work but does not make a group of different fuzzy
-searches free. OpenSearch still executes every unique fuzzy subsearch. Removing
-source locations mainly reduces the first query response and the final API
-payload.
+Each batch uses normal named `match` queries, not a combined query string. The
+query name tells the service which source text produced each candidate. This
+avoids special-character parsing problems and prevents candidates from being
+assigned to the wrong source entity.
+
+A batch contains no more than 20 entity names and no more than 20 analyzed
+words. The word limit is important because fuzzy expansion happens per word.
+It keeps the request below the nested-clause limit while cutting the number of
+independent subsearches. For example, 1,530 one-word values need about 77 fuzzy
+subsearches instead of 1,530. Values with multiple words make smaller batches.
+
+Batching removes repeated search setup, aggregation, and shard coordination.
+It does not remove the underlying fuzzy term expansion work, so latency still
+depends on the number of names, candidate frequency, shards, and node size.
 
 ### 6.4 Source locations endpoint
 

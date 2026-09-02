@@ -11,6 +11,8 @@ FUZZINESS = "AUTO:5,8"
 OCCURRENCE_PAGE_SIZE = 25_000
 ENTITY_PAGE_SIZE = 1_000
 SUMMARY_CANDIDATE_SIZE = 1_000
+SUMMARY_BATCH_SIZE = 20
+SUMMARY_BATCH_TOKEN_LIMIT = 20
 CASE_COUNT_PRECISION = 40_000
 
 OCCURRENCE_FIELDS = [
@@ -173,6 +175,8 @@ def _search_summary_data(application_id, source_entities):
     """Get outside counts and fuzzy candidates in one msearch call."""
 
     entity_ids = [entity["entityId"] for entity in source_entities]
+    text_groups = _group_source_entities(source_entities)
+    batches = _make_summary_batches(text_groups)
     searches = [
         {
             "size": 0,
@@ -207,18 +211,12 @@ def _search_summary_data(application_id, source_entities):
             },
         }
     ]
-    # Do not run the same fuzzy query twice when entity IDs share search text.
-    unique_search_texts = list(
-        dict.fromkeys(
-            entity["entitySearchText"] for entity in source_entities
-        )
-    )
     searches.extend(
         _summary_candidate_search(
             application_id,
-            search_text,
+            batch,
         )
-        for search_text in unique_search_texts
+        for batch in batches
     )
 
     responses = multi_search(searches)["responses"]
@@ -227,18 +225,57 @@ def _search_summary_data(application_id, source_entities):
         bucket["key"]: bucket["cases"]["value"]
         for bucket in count_response["aggregations"]["entities"]["buckets"]
     }
-    candidates_by_text = {
-        search_text: _candidates_from_summary_response(response)
-        for search_text, response in zip(
-            unique_search_texts,
-            responses[1:],
-        )
+    candidates_by_entity = {
+        entity["entityId"]: [] for entity in source_entities
     }
-    candidate_groups = [
-        candidates_by_text[entity["entitySearchText"]]
+
+    for batch, response in zip(batches, responses[1:]):
+        for candidate, matched_queries in _summary_candidates(response):
+            for query_name in matched_queries:
+                group = batch[int(query_name.removeprefix("source_"))]
+                for entity in group["entities"]:
+                    candidates_by_entity[entity["entityId"]].append(candidate)
+
+    return outside_case_counts, [
+        candidates_by_entity[entity["entityId"]]
         for entity in source_entities
     ]
-    return outside_case_counts, candidate_groups
+
+
+def _group_source_entities(source_entities):
+    """Group entity IDs that use the same search text."""
+
+    groups = {}
+    for entity in source_entities:
+        groups.setdefault(entity["entitySearchText"], []).append(entity)
+    return [
+        {"searchText": search_text, "entities": entities}
+        for search_text, entities in groups.items()
+    ]
+
+
+def _make_summary_batches(text_groups):
+    """Make small batches that stay below the query clause limit."""
+
+    batches = []
+    batch = []
+    token_count = 0
+    for group in text_groups:
+        new_tokens = max(1, len(_normalize_text(group["searchText"]).split()))
+        if batch and (
+            len(batch) >= SUMMARY_BATCH_SIZE
+            or token_count + new_tokens > SUMMARY_BATCH_TOKEN_LIMIT
+        ):
+            batches.append(batch)
+            batch = []
+            token_count = 0
+
+        batch.append(group)
+        token_count += new_tokens
+
+    if batch:
+        batches.append(batch)
+    return batches
 
 
 def get_application_source_locations(application_id, entity_ids):
@@ -329,13 +366,35 @@ def get_application_source_locations(application_id, entity_ids):
     }
 
 
-def _summary_candidate_search(application_id, search_text):
-    """Build one small fuzzy search used inside msearch."""
+def _summary_candidate_search(application_id, batch):
+    """Build one fuzzy search for a small group of entity texts."""
 
     return {
         "size": 0,
         "track_total_hits": False,
-        "query": _fuzzy_query(application_id, search_text),
+        "query": {
+            "bool": {
+                # Filter context skips relevance scoring because RapidFuzz
+                # calculates the final percentage later.
+                "filter": [
+                    {
+                        "bool": {
+                            "should": [
+                                _fuzzy_match(
+                                    group["searchText"],
+                                    f"source_{index}",
+                                )
+                                for index, group in enumerate(batch)
+                            ],
+                            "minimum_should_match": 1,
+                        }
+                    }
+                ],
+                "must_not": [
+                    {"term": {"applicationId": application_id}}
+                ],
+            }
+        },
         "aggs": {
             "candidates": {
                 "terms": {
@@ -360,13 +419,16 @@ def _summary_candidate_search(application_id, search_text):
     }
 
 
-def _candidates_from_summary_response(response):
-    """Read fuzzy candidates returned by one msearch item."""
+def _summary_candidates(response):
+    """Read candidates and the source names that matched them."""
 
-    return [
-        _candidate_from_bucket(bucket)
-        for bucket in response["aggregations"]["candidates"]["buckets"]
-    ]
+    candidates = []
+    for bucket in response["aggregations"]["candidates"]["buckets"]:
+        hit = bucket["sample"]["hits"]["hits"][0]
+        candidate = hit["_source"]
+        candidate["occurrenceCount"] = bucket["doc_count"]
+        candidates.append((candidate, hit.get("matched_queries", [])))
+    return candidates
 
 
 def find_fuzzy_matches_by_text(application_id, text, threshold):
@@ -520,24 +582,27 @@ def _fuzzy_query(application_id, search_text):
 
     return {
         "bool": {
-            "must": [
-                {
-                    "match": {
-                        "entitySearchText": {
-                            "query": search_text,
-                            "fuzziness": FUZZINESS,
-                            "prefix_length": 1,
-                            "max_expansions": 25,
-                            "operator": "and",
-                        }
-                    }
-                }
-            ],
+            "must": [_fuzzy_match(search_text)],
             "must_not": [
                 {"term": {"applicationId": application_id}}
             ],
         }
     }
+
+
+def _fuzzy_match(search_text, query_name=None):
+    """Build the fuzzy text part shared by both search flows."""
+
+    options = {
+        "query": search_text,
+        "fuzziness": FUZZINESS,
+        "prefix_length": 1,
+        "max_expansions": 25,
+        "operator": "and",
+    }
+    if query_name:
+        options["_name"] = query_name
+    return {"match": {"entitySearchText": options}}
 
 
 def _search_occurrences_by_entity_ids(application_id, entity_ids):

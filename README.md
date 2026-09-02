@@ -439,13 +439,21 @@ The fuzzy summary normally makes two HTTP calls to OpenSearch. The first search
 uses composite aggregation pages to get every unique entity, so there is no
 200-entity result cap. It reads only one small sample internally and does not
 return `sourceLocations`. The second call uses `_msearch`: one search gets the
-outside-case counts and one fuzzy subsearch runs for each unique
-`entitySearchText`. Duplicate search text is only searched once.
+outside-case counts and the remaining subsearches contain small batches of
+unique `entitySearchText` values. Duplicate search text is only searched once.
+
+Each batch uses normal `match` queries with `AUTO:5,8`; it does not build a
+Lucene query string. Named queries keep track of which source text found each
+candidate. A batch has at most 20 names and 20 analyzed words. The word limit
+keeps fuzzy expansions safely below the nested-clause limit.
 
 The API uses RapidFuzz's normalized Levenshtein similarity to check the final
 percentage before adding the counts. Keeping source locations out of this
-response makes the summary smaller, but the fuzzy searches are still the main
-OpenSearch work.
+response makes the summary smaller. Batching also removes most of the
+per-search coordination work. For example, 1,530 one-word entity names become
+77 fuzzy subsearches instead of 1,530. OpenSearch still needs to perform the
+underlying fuzzy term work, so the exact improvement depends on the data and
+cluster.
 
 ```json
 {
