@@ -1,7 +1,6 @@
 """Find fuzzy entity text matches for one application."""
 
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor
 
 from rapidfuzz.distance import Levenshtein
 
@@ -9,7 +8,6 @@ from app.search_client import multi_search, search_index
 
 
 FUZZINESS = "AUTO:5,8"
-MAX_WORKERS = 8
 OCCURRENCE_PAGE_SIZE = 25_000
 ENTITY_BUCKET_SIZE = 200
 SUMMARY_CANDIDATE_SIZE = 1_000
@@ -48,7 +46,7 @@ def get_application_fuzzy_summary(application_id, threshold):
     source_entities = [
         {
             "entityId": entity["entityId"],
-            "entitySearchText": _application_entity_text(entity),
+            "entitySearchText": _entity_text(entity["sourceLocations"][0]),
         }
         for entity in application_entities
     ]
@@ -59,46 +57,36 @@ def get_application_fuzzy_summary(application_id, threshold):
         application_id,
         source_entities,
     )
-    matches = [
-        match
-        for source_entity, candidates in zip(
-            source_entities,
-            candidate_groups,
-        )
-        for match in _matches_from_candidates(
-            source_entity,
-            candidates,
-            threshold,
-        )
-    ]
     counts = {
         entity["entityId"]: {"verbatim": 0, "similar": 0}
         for entity in source_entities
     }
-    for match in matches:
-        counts[match["sourceEntityId"]][match["matchType"]] += match[
-            "occurrenceCount"
-        ]
+    for source_entity, candidates in zip(
+        source_entities,
+        candidate_groups,
+    ):
+        for match in _matches_from_candidates(
+            source_entity,
+            candidates,
+            threshold,
+        ):
+            counts[match["sourceEntityId"]][match["matchType"]] += match[
+                "occurrenceCount"
+            ]
 
-    entities = []
     for entity in application_entities:
         entity_counts = counts[entity["entityId"]]
-        entities.append(
-            {
-                **entity,
-                "matchingOtherCaseCount": outside_case_counts.get(
-                    entity["entityId"],
-                    0,
-                ),
-                "verbatimMatchCount": entity_counts["verbatim"],
-                "similarMatchCount": entity_counts["similar"],
-            }
+        entity["matchingOtherCaseCount"] = outside_case_counts.get(
+            entity["entityId"],
+            0,
         )
+        entity["verbatimMatchCount"] = entity_counts["verbatim"]
+        entity["similarMatchCount"] = entity_counts["similar"]
 
     return {
         "applicationId": application_id,
-        "totalUniqueEntities": len(entities),
-        "entities": entities,
+        "totalUniqueEntities": len(application_entities),
+        "entities": application_entities,
     }
 
 
@@ -247,35 +235,27 @@ def _summary_candidate_search(application_id, search_text):
 def _candidates_from_summary_response(response):
     """Read fuzzy candidates returned by one msearch item."""
 
-    candidates = []
-    for bucket in response["aggregations"]["candidates"]["buckets"]:
-        candidate = bucket["sample"]["hits"]["hits"][0]["_source"]
-        candidate["occurrenceCount"] = bucket["doc_count"]
-        candidates.append(candidate)
-    return candidates
+    return [
+        _candidate_from_bucket(bucket)
+        for bucket in response["aggregations"]["candidates"]["buckets"]
+    ]
 
 
 def find_fuzzy_matches_by_text(application_id, text, threshold):
     """Find all fuzzy entity matches for one search text."""
 
-    source_entities = [
-        {
-            "entityId": "searched-text",
-            "entitySearchText": text,
-        }
-    ]
-    entity_matches = _find_matches(
-        application_id,
-        source_entities,
+    source_entity = {
+        "entityId": "searched-text",
+        "entitySearchText": text,
+    }
+    entity_matches = _matches_from_candidates(
+        source_entity,
+        _search_candidates(application_id, text),
         threshold,
     )
-    match_by_entity_id = {
-        match["matchedEntityId"]: match
-        for match in entity_matches
-    }
     locations_by_entity_id = _search_occurrences_by_entity_ids(
         application_id,
-        list(match_by_entity_id),
+        [match["matchedEntityId"] for match in entity_matches],
     )
 
     # Keep one match per entity and put every location under it.
@@ -310,63 +290,6 @@ def find_fuzzy_matches_by_text(application_id, text, threshold):
         ),
         "matches": matches,
     }
-
-
-def _find_matches(application_id, source_entities, threshold):
-    """Get fuzzy candidates and keep the ones above the threshold."""
-
-    if not source_entities:
-        return []
-
-    if len(source_entities) == 1:
-        return _find_matches_for_entity(
-            application_id,
-            source_entities[0],
-            threshold,
-        )
-
-    # Each application entity can be searched separately, so run a few at the
-    # same time instead of waiting for every AWS request one by one.
-    with ThreadPoolExecutor(
-        max_workers=min(MAX_WORKERS, len(source_entities))
-    ) as executor:
-        jobs = [
-            executor.submit(
-                _find_matches_for_entity,
-                application_id,
-                source_entity,
-                threshold,
-            )
-            for source_entity in source_entities
-        ]
-        matches = [
-            match
-            for job in jobs
-            for match in job.result()
-        ]
-
-    matches.sort(
-        key=lambda item: (
-            item["sourceEntityId"],
-            -item["matchPercentage"],
-            item["matchedEntityId"],
-        )
-    )
-    return matches
-
-
-def _find_matches_for_entity(application_id, source_entity, threshold):
-    """Find matches for one entity text."""
-
-    candidates = _search_candidates(
-        application_id,
-        source_entity["entitySearchText"],
-    )
-    return _matches_from_candidates(
-        source_entity,
-        candidates,
-        threshold,
-    )
 
 
 def _matches_from_candidates(source_entity, candidates, threshold):
@@ -444,16 +367,24 @@ def _search_candidates(application_id, search_text):
             },
         )
         candidate_buckets = response["aggregations"]["candidates"]
-        for bucket in candidate_buckets["buckets"]:
-            candidate = bucket["sample"]["hits"]["hits"][0]["_source"]
-            candidate["occurrenceCount"] = bucket["doc_count"]
-            candidate_list.append(candidate)
+        candidate_list.extend(
+            _candidate_from_bucket(bucket)
+            for bucket in candidate_buckets["buckets"]
+        )
         after_key = candidate_buckets.get("after_key")
         if (
             not after_key
             or len(candidate_buckets["buckets"]) < composite["size"]
         ):
             return candidate_list
+
+
+def _candidate_from_bucket(bucket):
+    """Get the candidate text and occurrence count from one bucket."""
+
+    candidate = bucket["sample"]["hits"]["hits"][0]["_source"]
+    candidate["occurrenceCount"] = bucket["doc_count"]
+    return candidate
 
 
 def _fuzzy_query(application_id, search_text):
@@ -544,14 +475,6 @@ def _search_occurrences_by_entity_ids(application_id, entity_ids):
         after_key = result.get("after_key")
         if not after_key or len(result["buckets"]) < composite["size"]:
             return locations
-
-
-def _application_entity_text(entity):
-    """Get search text from the full application entity response."""
-
-    if entity["sourceLocations"]:
-        return _entity_text(entity["sourceLocations"][0])
-    return _entity_text(entity)
 
 
 def _similarity_percentage(left, right):
