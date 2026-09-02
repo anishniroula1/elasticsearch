@@ -437,7 +437,8 @@ the current application rows by `entityId` and keeps the rows needed for
 case counts, and each application entity gets its own small `AUTO:5,8` fuzzy
 search. Keeping the fuzzy searches separate avoids the nested-clause error,
 while `_msearch` sends all of them to OpenSearch in one HTTP request. The API
-checks the final edit-distance percentage before adding the counts.
+uses RapidFuzz's normalized Levenshtein similarity to check the final
+percentage before adding the counts.
 
 ```json
 {

@@ -9,6 +9,7 @@ dependencies = [
   "fastapi>=0.115,<1",
   "opensearch-py>=2.8,<4",
   "pandas>=3,<4",
+  "rapidfuzz>=3,<4",
   "uvicorn[standard]>=0.30,<1",
 ]
 

@@ -3,6 +3,8 @@
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 
+from rapidfuzz.distance import Levenshtein
+
 from app.search_client import multi_search, search_index
 
 
@@ -562,8 +564,8 @@ def _similarity_percentage(left, right):
     if not left or not right:
         return 0.0
 
-    distance = _levenshtein_distance(left, right)
-    return round((1 - distance / max(len(left), len(right))) * 100, 2)
+    similarity = Levenshtein.normalized_similarity(left, right)
+    return round(similarity * 100, 2)
 
 
 def _normalize_text(value):
@@ -580,25 +582,6 @@ def _normalize_text(value):
             for character in plain_text
         ).split()
     )
-
-
-def _levenshtein_distance(left, right):
-    """Count the smallest number of edits between two texts."""
-
-    previous_row = list(range(len(right) + 1))
-    for left_index, left_character in enumerate(left, start=1):
-        current_row = [left_index]
-        for right_index, right_character in enumerate(right, start=1):
-            current_row.append(
-                min(
-                    current_row[-1] + 1,
-                    previous_row[right_index] + 1,
-                    previous_row[right_index - 1]
-                    + (left_character != right_character),
-                )
-            )
-        previous_row = current_row
-    return previous_row[-1]
 
 
 def _entity_text(entity):
