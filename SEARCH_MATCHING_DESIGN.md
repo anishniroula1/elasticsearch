@@ -286,34 +286,29 @@ normalization and expose a separate flag.
 GET /applications/{applicationId}/entities/fuzzy-summary?threshold=90
 ```
 
-The endpoint makes two HTTP calls to OpenSearch:
+The endpoint runs in two stages:
 
 1. A normal search gets the current application's entities without returning
    source locations.
    Composite aggregation reads additional pages internally if the application
    has more than 1,000 unique entities.
-2. An `_msearch` call contains:
+2. Threaded `_msearch` calls contain:
    - One search for exact outside-case counts.
-   - Small fuzzy candidate batches containing the unique entity search text.
+   - One fuzzy candidate search for each unique entity search text.
 
 Duplicate search text is removed before creating the multi-search request. If
 two entity IDs both use `alexander hamilton`, OpenSearch runs that fuzzy search
 once and the service maps its candidates back to both entities.
 
-Each batch uses normal named `match` queries, not a combined query string. The
-query name tells the service which source text produced each candidate. This
-avoids special-character parsing problems and prevents candidates from being
-assigned to the wrong source entity.
+The service splits the search list into `_msearch` requests containing at most
+300 searches. A thread pool sends up to eight requests concurrently, and the
+results remain in the original order so they can be mapped back to the correct
+source entity. For example, 1,530 unique texts create six `_msearch` requests.
 
-A batch contains no more than 20 entity names and no more than 20 analyzed
-words. The word limit is important because fuzzy expansion happens per word.
-It keeps the request below the nested-clause limit while cutting the number of
-independent subsearches. For example, 1,530 one-word values need about 77 fuzzy
-subsearches instead of 1,530. Values with multiple words make smaller batches.
-
-Batching removes repeated search setup, aggregation, and shard coordination.
-It does not remove the underlying fuzzy term expansion work, so latency still
-depends on the number of names, candidate frequency, shards, and node size.
+This keeps one very large multi-search request from becoming a long serial
+bottleneck. It does not remove the underlying 1,530 fuzzy searches. Latency
+still depends on the available search threads in OpenSearch, candidate
+frequency, shards, and node size.
 
 ### 6.4 Source locations endpoint
 

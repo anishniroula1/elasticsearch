@@ -1,6 +1,7 @@
 """Find fuzzy entity text matches for one application."""
 
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 
 from rapidfuzz.distance import Levenshtein
 
@@ -11,8 +12,8 @@ FUZZINESS = "AUTO:5,8"
 OCCURRENCE_PAGE_SIZE = 25_000
 ENTITY_PAGE_SIZE = 1_000
 SUMMARY_CANDIDATE_SIZE = 1_000
-SUMMARY_BATCH_SIZE = 20
-SUMMARY_BATCH_TOKEN_LIMIT = 20
+MSEARCH_BATCH_SIZE = 300
+MSEARCH_MAX_WORKERS = 8
 CASE_COUNT_PRECISION = 40_000
 
 OCCURRENCE_FIELDS = [
@@ -172,11 +173,9 @@ def _search_application_entities(application_id):
 
 
 def _search_summary_data(application_id, source_entities):
-    """Get outside counts and fuzzy candidates in one msearch call."""
+    """Get outside counts and fuzzy candidates with threaded msearch calls."""
 
     entity_ids = [entity["entityId"] for entity in source_entities]
-    text_groups = _group_source_entities(source_entities)
-    batches = _make_summary_batches(text_groups)
     searches = [
         {
             "size": 0,
@@ -211,71 +210,56 @@ def _search_summary_data(application_id, source_entities):
             },
         }
     ]
+    # Do not search the same text twice when entity IDs share a name.
+    unique_search_texts = list(
+        dict.fromkeys(
+            entity["entitySearchText"] for entity in source_entities
+        )
+    )
     searches.extend(
         _summary_candidate_search(
             application_id,
-            batch,
+            search_text,
         )
-        for batch in batches
+        for search_text in unique_search_texts
     )
 
-    responses = multi_search(searches)["responses"]
+    responses = _run_msearch_batches(searches)
     count_response = responses[0]
     outside_case_counts = {
         bucket["key"]: bucket["cases"]["value"]
         for bucket in count_response["aggregations"]["entities"]["buckets"]
     }
-    candidates_by_entity = {
-        entity["entityId"]: [] for entity in source_entities
+    candidates_by_text = {
+        search_text: _candidates_from_summary_response(response)
+        for search_text, response in zip(
+            unique_search_texts,
+            responses[1:],
+        )
     }
-
-    for batch, response in zip(batches, responses[1:]):
-        for candidate, matched_queries in _summary_candidates(response):
-            for query_name in matched_queries:
-                group = batch[int(query_name.removeprefix("source_"))]
-                for entity in group["entities"]:
-                    candidates_by_entity[entity["entityId"]].append(candidate)
-
     return outside_case_counts, [
-        candidates_by_entity[entity["entityId"]]
+        candidates_by_text[entity["entitySearchText"]]
         for entity in source_entities
     ]
 
 
-def _group_source_entities(source_entities):
-    """Group entity IDs that use the same search text."""
+def _run_msearch_batches(searches):
+    """Send 300 searches per request and run the requests in threads."""
 
-    groups = {}
-    for entity in source_entities:
-        groups.setdefault(entity["entitySearchText"], []).append(entity)
-    return [
-        {"searchText": search_text, "entities": entities}
-        for search_text, entities in groups.items()
+    batches = [
+        searches[index : index + MSEARCH_BATCH_SIZE]
+        for index in range(0, len(searches), MSEARCH_BATCH_SIZE)
     ]
+    worker_count = min(MSEARCH_MAX_WORKERS, len(batches))
 
-
-def _make_summary_batches(text_groups):
-    """Make small batches that stay below the query clause limit."""
-
-    batches = []
-    batch = []
-    token_count = 0
-    for group in text_groups:
-        new_tokens = max(1, len(_normalize_text(group["searchText"]).split()))
-        if batch and (
-            len(batch) >= SUMMARY_BATCH_SIZE
-            or token_count + new_tokens > SUMMARY_BATCH_TOKEN_LIMIT
-        ):
-            batches.append(batch)
-            batch = []
-            token_count = 0
-
-        batch.append(group)
-        token_count += new_tokens
-
-    if batch:
-        batches.append(batch)
-    return batches
+    # executor.map keeps results in the same order as the request batches.
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        batch_responses = executor.map(multi_search, batches)
+        return [
+            response
+            for batch_response in batch_responses
+            for response in batch_response["responses"]
+        ]
 
 
 def get_application_source_locations(application_id, entity_ids):
@@ -366,35 +350,13 @@ def get_application_source_locations(application_id, entity_ids):
     }
 
 
-def _summary_candidate_search(application_id, batch):
-    """Build one fuzzy search for a small group of entity texts."""
+def _summary_candidate_search(application_id, search_text):
+    """Build one fuzzy search used inside msearch."""
 
     return {
         "size": 0,
         "track_total_hits": False,
-        "query": {
-            "bool": {
-                # Filter context skips relevance scoring because RapidFuzz
-                # calculates the final percentage later.
-                "filter": [
-                    {
-                        "bool": {
-                            "should": [
-                                _fuzzy_match(
-                                    group["searchText"],
-                                    f"source_{index}",
-                                )
-                                for index, group in enumerate(batch)
-                            ],
-                            "minimum_should_match": 1,
-                        }
-                    }
-                ],
-                "must_not": [
-                    {"term": {"applicationId": application_id}}
-                ],
-            }
-        },
+        "query": _fuzzy_query(application_id, search_text),
         "aggs": {
             "candidates": {
                 "terms": {
@@ -419,16 +381,13 @@ def _summary_candidate_search(application_id, batch):
     }
 
 
-def _summary_candidates(response):
-    """Read candidates and the source names that matched them."""
+def _candidates_from_summary_response(response):
+    """Read fuzzy candidates returned by one msearch item."""
 
-    candidates = []
-    for bucket in response["aggregations"]["candidates"]["buckets"]:
-        hit = bucket["sample"]["hits"]["hits"][0]
-        candidate = hit["_source"]
-        candidate["occurrenceCount"] = bucket["doc_count"]
-        candidates.append((candidate, hit.get("matched_queries", [])))
-    return candidates
+    return [
+        _candidate_from_bucket(bucket)
+        for bucket in response["aggregations"]["candidates"]["buckets"]
+    ]
 
 
 def find_fuzzy_matches_by_text(application_id, text, threshold):
@@ -582,27 +541,24 @@ def _fuzzy_query(application_id, search_text):
 
     return {
         "bool": {
-            "must": [_fuzzy_match(search_text)],
+            "must": [
+                {
+                    "match": {
+                        "entitySearchText": {
+                            "query": search_text,
+                            "fuzziness": FUZZINESS,
+                            "prefix_length": 1,
+                            "max_expansions": 25,
+                            "operator": "and",
+                        }
+                    }
+                }
+            ],
             "must_not": [
                 {"term": {"applicationId": application_id}}
             ],
         }
     }
-
-
-def _fuzzy_match(search_text, query_name=None):
-    """Build the fuzzy text part shared by both search flows."""
-
-    options = {
-        "query": search_text,
-        "fuzziness": FUZZINESS,
-        "prefix_length": 1,
-        "max_expansions": 25,
-        "operator": "and",
-    }
-    if query_name:
-        options["_name"] = query_name
-    return {"match": {"entitySearchText": options}}
 
 
 def _search_occurrences_by_entity_ids(application_id, entity_ids):

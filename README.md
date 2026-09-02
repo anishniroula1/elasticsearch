@@ -435,25 +435,24 @@ GET /applications/{applicationId}/entities/fuzzy-summary?threshold=90
 This returns the application entities like the normal entity endpoint, with
 the verbatim and similar occurrence counts added to each one:
 
-The fuzzy summary normally makes two HTTP calls to OpenSearch. The first search
-uses composite aggregation pages to get every unique entity, so there is no
-200-entity result cap. It reads only one small sample internally and does not
-return `sourceLocations`. The second call uses `_msearch`: one search gets the
-outside-case counts and the remaining subsearches contain small batches of
-unique `entitySearchText` values. Duplicate search text is only searched once.
+The fuzzy summary runs in two stages. The first stage uses composite
+aggregation pages to get every unique entity, so there is no 200-entity result
+cap. It reads only one small sample internally and does not return
+`sourceLocations`. The second stage uses `_msearch`: one search gets the
+outside-case counts and one normal `AUTO:5,8` fuzzy subsearch runs for each
+unique `entitySearchText`. Duplicate search text is only searched once.
 
-Each batch uses normal `match` queries with `AUTO:5,8`; it does not build a
-Lucene query string. Named queries keep track of which source text found each
-candidate. A batch has at most 20 names and 20 analyzed words. The word limit
-keeps fuzzy expansions safely below the nested-clause limit.
+The subsearch list is split into `_msearch` requests containing at most 300
+searches. Up to eight worker threads send those requests at the same time. For
+example, 1,530 unique texts create six parallel `_msearch` requests instead of
+one request containing more than 1,500 searches.
 
 The API uses RapidFuzz's normalized Levenshtein similarity to check the final
 percentage before adding the counts. Keeping source locations out of this
-response makes the summary smaller. Batching also removes most of the
-per-search coordination work. For example, 1,530 one-word entity names become
-77 fuzzy subsearches instead of 1,530. OpenSearch still needs to perform the
-underlying fuzzy term work, so the exact improvement depends on the data and
-cluster.
+response makes the summary smaller. Threading does not reduce the total number
+of fuzzy searches, but it keeps each request bounded and allows multiple
+requests to make progress concurrently. The exact improvement depends on the
+data and available OpenSearch search capacity.
 
 ```json
 {
