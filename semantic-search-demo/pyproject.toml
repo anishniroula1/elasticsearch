@@ -1,0 +1,24 @@
+[project]
+name = "ner-entity-semantic-search-demo"
+version = "0.1.0"
+description = "OpenSearch-managed semantic entity search with Bedrock Titan V2"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "boto3>=1.40,<2",
+  "fastapi>=0.115,<1",
+  "opensearch-py>=2.8,<4",
+  "uvicorn[standard]>=0.30,<1",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8,<10",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
