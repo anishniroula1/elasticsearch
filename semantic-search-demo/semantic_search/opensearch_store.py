@@ -3,26 +3,13 @@
 import time
 from typing import Any
 
-import boto3
 from opensearchpy import (
-    AWSV4SignerAuth,
     NotFoundError,
-    OpenSearch,
-    RequestsHttpConnection,
     helpers,
 )
 
-from semantic_search.config import (
-    CATALOG_ALIAS,
-    CATALOG_INDEX,
-    INDEX_REPLICAS,
-    INDEX_SHARDS,
-    OCCURRENCE_ALIAS,
-    OCCURRENCE_INDEX,
-    OPENSEARCH_PORT,
-    OPENSEARCH_SERVICE,
-    Config,
-)
+from semantic_search.config import Config
+from semantic_search.open_search_client import OpenSearchClient
 
 
 SEMANTIC_FIELD = "entitySearchText"
@@ -30,13 +17,13 @@ SEMANTIC_INFO_FIELD = f"{SEMANTIC_FIELD}_semantic_info"
 CATALOG_VECTOR_FIELD = f"{SEMANTIC_INFO_FIELD}.embedding"
 
 
-def occurrence_index_definition() -> dict[str, Any]:
+def occurrence_index_definition(config: Config) -> dict[str, Any]:
     """Original occurrence fields without duplicated vector storage."""
 
     return {
         "settings": {
-            "number_of_shards": INDEX_SHARDS,
-            "number_of_replicas": INDEX_REPLICAS,
+            "number_of_shards": config.index_shards,
+            "number_of_replicas": config.index_replicas,
             "analysis": {
                 "normalizer": {
                     "lowercase_ascii": {
@@ -87,8 +74,8 @@ def catalog_index_definition(config: Config) -> dict[str, Any]:
     return {
         "settings": {
             "index.knn": True,
-            "number_of_shards": INDEX_SHARDS,
-            "number_of_replicas": INDEX_REPLICAS,
+            "number_of_shards": config.index_shards,
+            "number_of_replicas": config.index_replicas,
         },
         "mappings": {
             "dynamic": "strict",
@@ -107,39 +94,7 @@ def catalog_index_definition(config: Config) -> dict[str, Any]:
 class OpenSearchStore:
     def __init__(self, config: Config, client=None):
         self.config = config
-        self.client = client or self._create_client()
-
-    def _create_client(self):
-        if not self.config.opensearch_host:
-            raise ValueError("OPENSEARCH_HOST is required")
-        credentials = boto3.Session(
-            region_name=self.config.aws_region
-        ).get_credentials()
-        if credentials is None:
-            raise RuntimeError("AWS credentials are required")
-        auth = AWSV4SignerAuth(
-            credentials,
-            self.config.aws_region,
-            OPENSEARCH_SERVICE,
-        )
-        return OpenSearch(
-            hosts=[
-                {
-                    "host": self.config.opensearch_host,
-                    "port": OPENSEARCH_PORT,
-                }
-            ],
-            http_auth=auth,
-            use_ssl=True,
-            verify_certs=True,
-            ssl_assert_hostname=True,
-            ssl_show_warn=False,
-            connection_class=RequestsHttpConnection,
-            pool_maxsize=20,
-            timeout=60,
-            max_retries=5,
-            retry_on_timeout=True,
-        )
+        self.client = client or OpenSearchClient(config).create_client()
 
     def wait_until_ready(
         self,
@@ -158,13 +113,13 @@ class OpenSearchStore:
     def ensure_indices(self) -> None:
         catalog_index_definition(self.config)
         self._ensure_index(
-            OCCURRENCE_INDEX,
-            OCCURRENCE_ALIAS,
-            occurrence_index_definition(),
+            self.config.occurrence_index,
+            self.config.occurrence_alias,
+            occurrence_index_definition(self.config),
         )
         self._ensure_index(
-            CATALOG_INDEX,
-            CATALOG_ALIAS,
+            self.config.catalog_index,
+            self.config.catalog_alias,
             catalog_index_definition(self.config),
         )
         self._validate_catalog_mapping()
@@ -194,8 +149,12 @@ class OpenSearchStore:
             )
 
     def _validate_catalog_mapping(self) -> None:
-        mapping = self.client.indices.get_mapping(index=CATALOG_INDEX)
-        properties = mapping[CATALOG_INDEX]["mappings"]["properties"]
+        mapping = self.client.indices.get_mapping(
+            index=self.config.catalog_index
+        )
+        properties = mapping[self.config.catalog_index]["mappings"][
+            "properties"
+        ]
         semantic_field = properties.get(SEMANTIC_FIELD, {})
         if semantic_field.get("type") != "semantic":
             raise RuntimeError(
@@ -228,8 +187,8 @@ class OpenSearchStore:
     def recreate_indices(self) -> None:
         catalog_index_definition(self.config)
         for index in (
-            CATALOG_INDEX,
-            OCCURRENCE_INDEX,
+            self.config.catalog_index,
+            self.config.occurrence_index,
         ):
             if self.client.indices.exists(index=index):
                 self.client.indices.delete(index=index)
@@ -239,7 +198,7 @@ class OpenSearchStore:
         actions = [
             {
                 "_op_type": "index",
-                "_index": OCCURRENCE_ALIAS,
+                "_index": self.config.occurrence_alias,
                 "_id": str(source["sentenceEntityId"]),
                 "_source": source,
             }
@@ -251,7 +210,7 @@ class OpenSearchStore:
         actions = [
             {
                 "_op_type": "index",
-                "_index": CATALOG_ALIAS,
+                "_index": self.config.catalog_alias,
                 "_id": source["semanticKey"],
                 "_source": source,
             }
@@ -265,16 +224,19 @@ class OpenSearchStore:
         helpers.bulk(
             self.client,
             actions,
-            chunk_size=100,
+            chunk_size=self.config.seed_batch_size,
             request_timeout=120,
             refresh="wait_for",
         )
 
     def search_occurrences(self, body: dict[str, Any]) -> dict[str, Any]:
-        return self.client.search(index=OCCURRENCE_ALIAS, body=body)
+        return self.client.search(
+            index=self.config.occurrence_alias,
+            body=body,
+        )
 
     def search_catalog(self, body: dict[str, Any]) -> dict[str, Any]:
-        return self.client.search(index=CATALOG_ALIAS, body=body)
+        return self.client.search(index=self.config.catalog_alias, body=body)
 
     def multi_search_catalog(
         self,
@@ -282,7 +244,7 @@ class OpenSearchStore:
     ) -> list[dict[str, Any]]:
         request: list[dict[str, Any]] = []
         for body in bodies:
-            request.extend(({"index": CATALOG_ALIAS}, body))
+            request.extend(({"index": self.config.catalog_alias}, body))
         response = self.client.msearch(
             body=request,
             request_timeout=120,
@@ -296,7 +258,7 @@ class OpenSearchStore:
         if not semantic_keys:
             return {}
         response = self.client.mget(
-            index=CATALOG_ALIAS,
+            index=self.config.catalog_alias,
             body={
                 "ids": semantic_keys,
                 "_source": ["semanticKey", CATALOG_VECTOR_FIELD],
@@ -321,7 +283,7 @@ class OpenSearchStore:
     def catalog_vector(self, semantic_key: str) -> list[float] | None:
         try:
             result = self.client.get(
-                index=CATALOG_ALIAS,
+                index=self.config.catalog_alias,
                 id=semantic_key,
                 _source_includes=["semanticKey", CATALOG_VECTOR_FIELD],
             )
@@ -338,10 +300,10 @@ class OpenSearchStore:
     def stats(self) -> dict[str, Any]:
         return {
             "occurrenceDocuments": self.client.count(
-                index=OCCURRENCE_ALIAS
+                index=self.config.occurrence_alias
             )["count"],
             "semanticCatalogDocuments": self.client.count(
-                index=CATALOG_ALIAS
+                index=self.config.catalog_alias
             )["count"],
             "clusterHealth": self.client.cluster.health()["status"],
         }

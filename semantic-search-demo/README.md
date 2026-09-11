@@ -11,7 +11,7 @@ For connector and model setup, see
 
 ## Architecture
 
-The data is split into two hard-coded indexes:
+The data is split into two indexes, using these default names:
 
 | Index | Purpose |
 | --- | --- |
@@ -22,34 +22,44 @@ This avoids putting the same 1,024-dimension vector on every repeated occurrence
 If seven million occurrences contain 100,000 unique entity texts, only 100,000
 catalog embeddings and vector graph entries are created.
 
-The application behavior is intentionally fixed in
-`semantic_search/config.py`:
+The AWS-only client behavior remains fixed:
 
-- HTTPS on port `443` with certificate verification
+- HTTPS with certificate verification
 - IAM SigV4 for Amazon OpenSearch Service (`es`)
-- one primary shard and one replica per data index
-- catalog and occurrence batch size of 100
 - cosine similarity thresholds
+
+Connection, index, shard, replica, and batch values are read from `.env`.
 
 ## Configuration
 
-```bash
-cp .env.example .env
-```
-
-Only three environment-specific values are required:
+The project includes `.env` and `.env.example`. Update `.env` for the target
+AWS environment:
 
 ```dotenv
 AWS_REGION=us-east-1
+IAM_ACCESS_ROLE=
 OPENSEARCH_HOST=search-your-domain.us-east-1.es.amazonaws.com
+OPENSEARCH_PORT=443
+OPENSEARCH_SERVICE=es
 OPENSEARCH_SEMANTIC_MODEL_ID=n17yX5cBsaYnPfyOzmQU
+
+OPENSEARCH_INDEX=ner_entity_occurrences-v1
+OPENSEARCH_ALIAS=ner_entity_occurrences
+OPENSEARCH_CATALOG_INDEX=ner_entity_semantic_catalog-v1
+OPENSEARCH_CATALOG_ALIAS=ner_entity_semantic_catalog
+
+INDEX_SHARDS=1
+INDEX_REPLICAS=1
+SEED_BATCH_SIZE=100
 ```
 
 The model ID is the opaque OpenSearch model ID, not the Bedrock foundation
 model ID `amazon.titan-embed-text-v2:0`.
 
 The standard AWS credential chain is used. An AWS deployment should use its IAM
-role. For an administration command, an existing CLI profile can be selected:
+role. Set `IAM_ACCESS_ROLE` only when the application must assume a separate
+OpenSearch access role. For an administration command, an existing CLI profile
+can be selected:
 
 ```bash
 AWS_PROFILE=my-profile make seed

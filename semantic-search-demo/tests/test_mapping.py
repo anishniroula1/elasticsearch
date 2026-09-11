@@ -2,7 +2,7 @@ from dataclasses import replace
 
 import pytest
 
-from semantic_search.config import CATALOG_INDEX, config
+from semantic_search.config import config
 from semantic_search.opensearch_store import (
     OpenSearchStore,
     catalog_index_definition,
@@ -11,7 +11,7 @@ from semantic_search.opensearch_store import (
 
 
 def test_occurrence_mapping_has_original_fields_but_no_vector():
-    definition = occurrence_index_definition()
+    definition = occurrence_index_definition(config)
     properties = definition["mappings"]["properties"]
 
     assert definition["mappings"]["dynamic"] == "strict"
@@ -57,9 +57,9 @@ def test_store_rejects_non_cosine_catalog_mapping():
     class FakeIndices:
         @staticmethod
         def get_mapping(index):
-            assert index == CATALOG_INDEX
+            assert index == config.catalog_index
             return {
-                index: {
+                config.catalog_index: {
                     "mappings": {
                         "properties": {
                             "entitySearchText": {

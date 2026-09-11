@@ -193,7 +193,8 @@ the 1,024-dimension Titan V2 configuration, the output shape should be 1,024.
 
 ### 6. Configure this project
 
-From `semantic-search-demo`:
+From `semantic-search-demo`, edit the included `.env`. If it is missing, copy
+the template first:
 
 ```bash
 cp .env.example .env

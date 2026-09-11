@@ -5,14 +5,7 @@ from opensearchpy.exceptions import OpenSearchException
 
 from semantic_search.cli import seed_from_csv
 from semantic_search.components import service, store
-from semantic_search.config import (
-    CATALOG_ALIAS,
-    CATALOG_INDEX,
-    OCCURRENCE_ALIAS,
-    OCCURRENCE_INDEX,
-    OPENSEARCH_PORT,
-    config,
-)
+from semantic_search.config import config
 
 
 router = APIRouter()
@@ -26,11 +19,13 @@ def health():
     is_ready = store.client.ping()
     response = {
         "status": "ok" if is_ready else "down",
-        "opensearch": f"{config.opensearch_host}:{OPENSEARCH_PORT}",
-        "occurrenceIndex": OCCURRENCE_INDEX,
-        "occurrenceAlias": OCCURRENCE_ALIAS,
-        "semanticCatalogIndex": CATALOG_INDEX,
-        "semanticCatalogAlias": CATALOG_ALIAS,
+        "opensearch": (
+            f"{config.opensearch_host}:{config.opensearch_port}"
+        ),
+        "occurrenceIndex": config.occurrence_index,
+        "occurrenceAlias": config.occurrence_alias,
+        "semanticCatalogIndex": config.catalog_index,
+        "semanticCatalogAlias": config.catalog_alias,
         "semanticModelId": config.semantic_model_id,
         "semanticField": "entitySearchText",
         "modelInvoked": False,
@@ -53,10 +48,10 @@ def init_indices():
         ) from error
     return {
         "message": "Indexes and aliases are ready",
-        "occurrenceIndex": OCCURRENCE_INDEX,
-        "occurrenceAlias": OCCURRENCE_ALIAS,
-        "semanticCatalogIndex": CATALOG_INDEX,
-        "semanticCatalogAlias": CATALOG_ALIAS,
+        "occurrenceIndex": config.occurrence_index,
+        "occurrenceAlias": config.occurrence_alias,
+        "semanticCatalogIndex": config.catalog_index,
+        "semanticCatalogAlias": config.catalog_alias,
     }
 
 

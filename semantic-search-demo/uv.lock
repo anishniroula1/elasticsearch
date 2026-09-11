@@ -233,6 +233,7 @@ dependencies = [
     { name = "boto3" },
     { name = "fastapi" },
     { name = "opensearch-py" },
+    { name = "python-dotenv" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -246,6 +247,7 @@ requires-dist = [
     { name = "boto3", specifier = ">=1.40,<2" },
     { name = "fastapi", specifier = ">=0.115,<1" },
     { name = "opensearch-py", specifier = ">=2.8,<4" },
+    { name = "python-dotenv", specifier = ">=1.0,<2" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30,<1" },
 ]
 

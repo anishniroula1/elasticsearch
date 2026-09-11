@@ -6,12 +6,7 @@ from pathlib import Path
 from typing import Iterator
 
 from semantic_search.components import store
-from semantic_search.config import (
-    CATALOG_ALIAS,
-    OCCURRENCE_ALIAS,
-    SEED_BATCH_SIZE,
-    config,
-)
+from semantic_search.config import config
 from semantic_search.models import EntityOccurrence
 from semantic_search.text import normalize_text, semantic_key
 
@@ -75,7 +70,7 @@ def _csv_batches(path: Path) -> Iterator[list[EntityOccurrence]]:
         batch: list[EntityOccurrence] = []
         for line_number, row in enumerate(reader, start=2):
             batch.append(_record(row, line_number))
-            if len(batch) == SEED_BATCH_SIZE:
+            if len(batch) == config.seed_batch_size:
                 yield batch
                 batch = []
         if batch:
@@ -109,7 +104,7 @@ def seed_from_csv(path: Path) -> dict:
     # Recreate both indexes. Only unique catalog texts go through the
     # semantic field, so Titan generates one fresh vector per unique text.
     store.recreate_indices()
-    for batch in batched(catalog.values(), SEED_BATCH_SIZE):
+    for batch in batched(catalog.values(), config.seed_batch_size):
         store.bulk_index_catalog(list(batch))
 
     indexed = 0
@@ -130,8 +125,8 @@ def seed_from_csv(path: Path) -> dict:
         "reset": True,
         "semanticField": "entitySearchText",
         "semanticModelId": config.semantic_model_id,
-        "occurrenceIndex": OCCURRENCE_ALIAS,
-        "semanticCatalogIndex": CATALOG_ALIAS,
+        "occurrenceIndex": config.occurrence_alias,
+        "semanticCatalogIndex": config.catalog_alias,
     }
     return totals
 
