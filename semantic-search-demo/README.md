@@ -187,8 +187,12 @@ seeding existing data.
 Start the application in its AWS runtime with:
 
 ```bash
-uv run --locked uvicorn semantic_search.main:app --host 0.0.0.0 --port 8000
+make dev
 ```
+
+Then open Swagger at [http://localhost:8000/docs](http://localhost:8000/docs).
+The development process listens on port `8000` and reloads when Python files
+change.
 
 ## References
 
