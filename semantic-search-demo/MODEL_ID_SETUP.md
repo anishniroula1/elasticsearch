@@ -237,9 +237,11 @@ entitySearchText_semantic_info
 `entitySearchText_semantic_info`, including the underlying embedding and model
 metadata.
 
-Inspect the generated embedding mapping and verify that its `space_type` is
-`cosinesimil`. The API's percentage threshold is a cosine-similarity percentage
-and startup deliberately fails for a different vector space.
+Inspect the generated embedding mapping and note its `space_type`. The project
+supports `cosinesimil` directly and `l2` for normalized Titan V2 embeddings.
+Titan V2 normalization defaults to `true`. The API converts the requested
+cosine-similarity percentage to the correct OpenSearch score for either space.
+Startup fails only for another vector space or a missing `space_type`.
 
 Check the occurrence and semantic-catalog document counts:
 
@@ -377,6 +379,11 @@ POST /_plugins/_ml/models/_register?deploy=true
   }
 }
 ```
+
+`cosinesimil` is recommended for a new manual registration because it directly
+matches the API contract. An existing working Titan V2 registration that
+reports `l2` is also supported and does not need to be recreated, provided its
+embeddings use Titan's default normalization.
 
 Depending on the OpenSearch version, the response contains either `model_id`
 directly or a `task_id`. If it returns a task, retrieve it:

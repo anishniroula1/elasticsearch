@@ -95,6 +95,7 @@ class OpenSearchStore:
     def __init__(self, config: Config, client=None):
         self.config = config
         self.client = client or OpenSearchClient(config).create_client()
+        self.vector_space_type: str | None = None
 
     def wait_until_ready(
         self,
@@ -177,12 +178,13 @@ class OpenSearchStore:
             "method",
             {},
         ).get("space_type")
-        if space_type != "cosinesimil":
+        if space_type not in {"cosinesimil", "l2"}:
             raise RuntimeError(
-                "Semantic threshold percentages require the registered model "
-                "space_type to be cosinesimil; found "
+                "Semantic threshold percentages support registered model "
+                "space_type values cosinesimil and l2; found "
                 f"{space_type or 'no space_type'}."
             )
+        self.vector_space_type = space_type
 
     def recreate_indices(self) -> None:
         catalog_index_definition(self.config)

@@ -16,12 +16,14 @@ class FakeStore:
         msearch_responses=None,
         vectors=None,
         single_vector=None,
+        vector_space_type="cosinesimil",
     ):
         self.occurrence_responses = list(occurrence_responses or [])
         self.catalog_responses = list(catalog_responses or [])
         self.msearch_responses = list(msearch_responses or [])
         self.vectors = vectors or {}
         self.single_vector = single_vector
+        self.vector_space_type = vector_space_type
         self.occurrence_bodies = []
         self.catalog_bodies = []
         self.msearch_bodies = []
@@ -134,6 +136,13 @@ def test_90_percent_cosine_threshold_uses_095_opensearch_score():
     assert _minimum_opensearch_score(90) == 0.95
     assert _cosine_percentage(0.95) == 90.0
     assert _cosine_percentage(0.96) == 92.0
+
+
+def test_90_percent_cosine_threshold_supports_normalized_l2_space():
+    score = _minimum_opensearch_score(90, "l2")
+
+    assert round(score, 6) == 0.833333
+    assert _cosine_percentage(score, "l2") == 90.0
 
 
 def test_summary_reuses_catalog_vector_then_runs_one_count_aggregation():

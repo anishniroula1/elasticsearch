@@ -137,6 +137,7 @@ Example:
   "applicationId": "A000042133",
   "thresholdPercentage": 90,
   "similarityMetric": "cosine",
+  "vectorSpaceType": "l2",
   "queryEmbeddingSource": "semanticCatalog",
   "totalUniqueEntities": 1,
   "entities": [
@@ -173,7 +174,9 @@ The response reports the path used as `queryEmbeddingSource`, either
 
 An `exact` match has the same normalized semantic key. A `similar` match passes
 the cosine threshold. For `threshold=90`, cosine similarity must be at least
-`0.90`, which is OpenSearch `cosinesimil` score `0.95`.
+`0.90`. The OpenSearch minimum score is `0.95` for `cosinesimil`, or
+approximately `0.833333` for normalized Titan vectors using `l2`. Responses
+report the detected mapping as `vectorSpaceType`.
 
 ## API process
 

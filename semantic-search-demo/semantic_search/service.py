@@ -58,6 +58,14 @@ class SemanticSearchService:
     def __init__(self, store: OpenSearchStore):
         self.store = store
 
+    def _vector_space_type(self) -> str:
+        space_type = self.store.vector_space_type
+        if space_type not in {"cosinesimil", "l2"}:
+            raise RuntimeError(
+                "Semantic catalog vector space is not initialized"
+            )
+        return space_type
+
     def application_summary(
         self,
         application_id: str,
@@ -203,6 +211,7 @@ class SemanticSearchService:
             "searchedText": text,
             "thresholdPercentage": threshold,
             "similarityMetric": "cosine",
+            "vectorSpaceType": self._vector_space_type(),
             "queryEmbeddingSource": query_embedding_source,
             "totalMatches": len(matches),
             "totalSourceLocations": sum(
@@ -211,8 +220,8 @@ class SemanticSearchService:
             "matches": matches,
         }
 
-    @staticmethod
     def _summary_response(
+        self,
         application_id: str,
         threshold: int,
         entities: list[dict[str, Any]],
@@ -221,6 +230,7 @@ class SemanticSearchService:
             "applicationId": application_id,
             "thresholdPercentage": threshold,
             "similarityMetric": "cosine",
+            "vectorSpaceType": self._vector_space_type(),
             "queryEmbeddingSource": "semanticCatalog",
             "totalUniqueEntities": len(entities),
             "entities": entities,
@@ -316,6 +326,7 @@ class SemanticSearchService:
                         vector,
                         threshold,
                         after_key,
+                        self._vector_space_type(),
                     )
                     for source_key, _, vector, after_key in batch
                 ]
@@ -333,6 +344,7 @@ class SemanticSearchService:
                             hit["_source"],
                             hit["_score"],
                             threshold,
+                            self._vector_space_type(),
                         )
                         for hit in self._catalog_hits(result)
                     )
@@ -361,6 +373,7 @@ class SemanticSearchService:
                 vector,
                 threshold,
                 after_key,
+                self._vector_space_type(),
             ),
         )
 
@@ -378,6 +391,7 @@ class SemanticSearchService:
                 source_key,
                 threshold,
                 after_key,
+                self._vector_space_type(),
             ),
         )
 
@@ -398,6 +412,7 @@ class SemanticSearchService:
                     hit["_source"],
                     hit["_score"],
                     threshold,
+                    self._vector_space_type(),
                 )
                 for hit in self._catalog_hits(result)
             )
@@ -426,6 +441,7 @@ class SemanticSearchService:
         vector: list[float],
         threshold: int,
         after_key: dict[str, Any] | None,
+        vector_space_type: str,
     ) -> dict[str, Any]:
         return _catalog_search_body(
             source_key,
@@ -433,7 +449,10 @@ class SemanticSearchService:
                 "knn": {
                     CATALOG_VECTOR_FIELD: {
                         "vector": vector,
-                        "min_score": _minimum_opensearch_score(threshold),
+                        "min_score": _minimum_opensearch_score(
+                            threshold,
+                            vector_space_type,
+                        ),
                     }
                 }
             },
@@ -446,6 +465,7 @@ class SemanticSearchService:
         source_key: str,
         threshold: int,
         after_key: dict[str, Any] | None,
+        vector_space_type: str,
     ) -> dict[str, Any]:
         return _catalog_search_body(
             source_key,
@@ -453,7 +473,10 @@ class SemanticSearchService:
                 "neural": {
                     SEMANTIC_FIELD: {
                         "query_text": text,
-                        "min_score": _minimum_opensearch_score(threshold),
+                        "min_score": _minimum_opensearch_score(
+                            threshold,
+                            vector_space_type,
+                        ),
                     }
                 }
             },
@@ -612,13 +635,17 @@ def _catalog_candidate(
     candidate: dict[str, Any],
     opensearch_score: float,
     threshold: int,
+    vector_space_type: str,
 ) -> dict[str, Any]:
     candidate_key = candidate["semanticKey"]
     if source_key == candidate_key:
         percentage = 100.0
         match_type = "exact"
     else:
-        percentage = _cosine_percentage(opensearch_score)
+        percentage = _cosine_percentage(
+            opensearch_score,
+            vector_space_type,
+        )
         if percentage < threshold:
             raise RuntimeError(
                 "OpenSearch returned a semantic result below min_score"
@@ -645,12 +672,31 @@ def _occurrence_filter(
     }
 
 
-def _minimum_opensearch_score(threshold: int) -> float:
-    return (1.0 + (threshold / 100.0)) / 2.0
+def _minimum_opensearch_score(
+    threshold: int,
+    vector_space_type: str = "cosinesimil",
+) -> float:
+    cosine_threshold = threshold / 100.0
+    if vector_space_type == "cosinesimil":
+        return (1.0 + cosine_threshold) / 2.0
+    if vector_space_type == "l2":
+        # Titan V2 is normalized by default. For unit vectors, squared L2
+        # distance is 2 - (2 * cosine_similarity).
+        return 1.0 / (3.0 - (2.0 * cosine_threshold))
+    raise ValueError(f"Unsupported vector space: {vector_space_type}")
 
 
-def _cosine_percentage(opensearch_score: float) -> float:
-    cosine_similarity = max(-1.0, min(1.0, (2.0 * opensearch_score) - 1.0))
+def _cosine_percentage(
+    opensearch_score: float,
+    vector_space_type: str = "cosinesimil",
+) -> float:
+    if vector_space_type == "cosinesimil":
+        cosine_similarity = (2.0 * opensearch_score) - 1.0
+    elif vector_space_type == "l2":
+        cosine_similarity = (3.0 - (1.0 / opensearch_score)) / 2.0
+    else:
+        raise ValueError(f"Unsupported vector space: {vector_space_type}")
+    cosine_similarity = max(-1.0, min(1.0, cosine_similarity))
     return round(max(0.0, cosine_similarity) * 100.0, 2)
 
 

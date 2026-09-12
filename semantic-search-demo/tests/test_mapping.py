@@ -53,31 +53,35 @@ def test_catalog_mapping_requires_an_opensearch_model_id():
         catalog_index_definition(replace(config, semantic_model_id=""))
 
 
-def test_store_rejects_non_cosine_catalog_mapping():
+def _catalog_mapping(space_type):
+    return {
+        config.catalog_index: {
+            "mappings": {
+                "properties": {
+                    "entitySearchText": {
+                        "type": "semantic",
+                        "model_id": "opensearch-model-123",
+                    },
+                    "entitySearchText_semantic_info": {
+                        "properties": {
+                            "embedding": {
+                                "type": "knn_vector",
+                                "method": {"space_type": space_type},
+                            }
+                        }
+                    },
+                }
+            }
+        }
+    }
+
+
+def test_store_accepts_normalized_l2_catalog_mapping():
     class FakeIndices:
         @staticmethod
         def get_mapping(index):
             assert index == config.catalog_index
-            return {
-                config.catalog_index: {
-                    "mappings": {
-                        "properties": {
-                            "entitySearchText": {
-                                "type": "semantic",
-                                "model_id": "opensearch-model-123",
-                            },
-                            "entitySearchText_semantic_info": {
-                                "properties": {
-                                    "embedding": {
-                                        "type": "knn_vector",
-                                        "method": {"space_type": "l2"},
-                                    }
-                                }
-                            },
-                        }
-                    }
-                }
-            }
+            return _catalog_mapping("l2")
 
     class FakeClient:
         indices = FakeIndices()
@@ -87,5 +91,25 @@ def test_store_rejects_non_cosine_catalog_mapping():
         client=FakeClient(),
     )
 
-    with pytest.raises(RuntimeError, match="space_type to be cosinesimil"):
+    store._validate_catalog_mapping()
+
+    assert store.vector_space_type == "l2"
+
+
+def test_store_rejects_unsupported_catalog_mapping():
+    class FakeIndices:
+        @staticmethod
+        def get_mapping(index):
+            assert index == config.catalog_index
+            return _catalog_mapping("innerproduct")
+
+    class FakeClient:
+        indices = FakeIndices()
+
+    store = OpenSearchStore(
+        replace(config, semantic_model_id="opensearch-model-123"),
+        client=FakeClient(),
+    )
+
+    with pytest.raises(RuntimeError, match="cosinesimil and l2"):
         store._validate_catalog_mapping()
