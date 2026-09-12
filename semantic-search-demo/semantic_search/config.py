@@ -15,9 +15,7 @@ def _aws_hostname(value: str) -> str:
         return ""
     parsed = urlparse(value if "://" in value else f"https://{value}")
     if parsed.scheme != "https" or not parsed.hostname:
-        raise ValueError(
-            "OPENSEARCH_HOST must be an HTTPS Amazon OpenSearch hostname"
-        )
+        raise ValueError("OPENSEARCH_HOST must be an HTTPS Amazon OpenSearch hostname")
     return parsed.hostname
 
 
@@ -56,14 +54,13 @@ class Config:
     index_shards: int
     index_replicas: int
     seed_batch_size: int
+    seed_workers: int
 
     @classmethod
     @lru_cache
     def load(cls) -> "Config":
         config = cls(
-            opensearch_host=_aws_hostname(
-                os.getenv("OPENSEARCH_HOST", "").strip()
-            ),
+            opensearch_host=_aws_hostname(os.getenv("OPENSEARCH_HOST", "").strip()),
             opensearch_port=_integer_setting(
                 "OPENSEARCH_PORT",
                 443,
@@ -99,6 +96,7 @@ class Config:
             index_shards=_integer_setting("INDEX_SHARDS", 1, 1),
             index_replicas=_integer_setting("INDEX_REPLICAS", 1, 0),
             seed_batch_size=_integer_setting("SEED_BATCH_SIZE", 100, 1),
+            seed_workers=_integer_setting("SEED_WORKERS", 4, 1, 16),
         )
         config._validate()
         return config

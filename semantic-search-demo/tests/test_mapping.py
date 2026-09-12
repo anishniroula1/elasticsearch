@@ -142,6 +142,50 @@ def test_store_stats_counts_both_indexes():
     }
 
 
+def test_bulk_skips_per_batch_refresh_and_refreshes_both_indexes_once(
+    monkeypatch,
+):
+    bulk_arguments = {}
+
+    def fake_bulk(client, actions, **kwargs):
+        bulk_arguments.update(
+            client=client,
+            actions=actions,
+            **kwargs,
+        )
+
+    class FakeIndices:
+        def __init__(self):
+            self.refreshed_index = None
+
+        def refresh(self, index):
+            self.refreshed_index = index
+
+    class FakeClient:
+        indices = FakeIndices()
+
+    monkeypatch.setattr(
+        "semantic_search.opensearch_store.helpers.bulk",
+        fake_bulk,
+    )
+    client = FakeClient()
+    store = OpenSearchStore(config, client=client)
+    actions = [{"_index": config.catalog_alias, "_source": {"value": 1}}]
+
+    store._bulk(actions)
+    store.refresh_indices()
+
+    assert bulk_arguments == {
+        "client": client,
+        "actions": actions,
+        "chunk_size": config.seed_batch_size,
+        "request_timeout": 120,
+    }
+    assert client.indices.refreshed_index == (
+        f"{config.occurrence_alias},{config.catalog_alias}"
+    )
+
+
 def test_catalog_vectors_uses_mget_source_filter_query_parameter():
     class FakeClient:
         @staticmethod
@@ -158,9 +202,7 @@ def test_catalog_vectors_uses_mget_source_filter_query_parameter():
                         "found": True,
                         "_source": {
                             "semanticKey": "key-1",
-                            "entitySearchText_semantic_info": {
-                                "embedding": [0.1, 0.2]
-                            },
+                            "entitySearchText_semantic_info": {"embedding": [0.1, 0.2]},
                         },
                     }
                 ]
@@ -168,9 +210,7 @@ def test_catalog_vectors_uses_mget_source_filter_query_parameter():
 
     store = OpenSearchStore(config, client=FakeClient())
 
-    assert store.catalog_vectors(["key-1"]) == {
-        "key-1": [0.1, 0.2]
-    }
+    assert store.catalog_vectors(["key-1"]) == {"key-1": [0.1, 0.2]}
 
 
 def test_store_previews_ten_unfiltered_documents_with_total_count():
@@ -225,8 +265,7 @@ def test_store_deletes_both_exact_aliases_and_indices():
 
         def get_alias(self, name):
             return {
-                index: {"aliases": {name: {}}}
-                for index in self.alias_targets[name]
+                index: {"aliases": {name: {}}} for index in self.alias_targets[name]
             }
 
         def delete_alias(self, index, name):

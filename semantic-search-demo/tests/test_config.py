@@ -30,6 +30,7 @@ def test_config_loads_connection_index_and_seed_settings(monkeypatch):
         "INDEX_SHARDS": "3",
         "INDEX_REPLICAS": "2",
         "SEED_BATCH_SIZE": "250",
+        "SEED_WORKERS": "6",
     }
     for name, value in settings.items():
         monkeypatch.setenv(name, value)
@@ -49,4 +50,5 @@ def test_config_loads_connection_index_and_seed_settings(monkeypatch):
     assert loaded.index_shards == 3
     assert loaded.index_replicas == 2
     assert loaded.seed_batch_size == 250
+    assert loaded.seed_workers == 6
     Config.load.cache_clear()

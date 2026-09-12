@@ -51,6 +51,7 @@ OPENSEARCH_CATALOG_ALIAS=ner_entity_semantic_catalog
 INDEX_SHARDS=1
 INDEX_REPLICAS=1
 SEED_BATCH_SIZE=100
+SEED_WORKERS=4
 ```
 
 The model ID is the opaque OpenSearch model ID, not the Bedrock foundation
@@ -72,10 +73,23 @@ CSV
   -> validate all occurrence records
   -> normalize and deduplicate entitySearchText
   -> recreate occurrence and catalog indexes
-  -> index unique texts into the semantic catalog
-  -> OpenSearch creates one Titan embedding per unique text
-  -> index ordinary occurrence records with semanticKey references
+  -> generate catalog embeddings in bounded parallel batches
+  -> after each catalog batch succeeds, index its occurrence batch
+  -> commit occurrence batches in original CSV order
+  -> refresh both indexes once after the seed completes
 ```
+
+`SEED_WORKERS` controls how many catalog batches can generate Titan embeddings
+concurrently. Start with `4`; reduce it if the Bedrock connector is throttled, or
+increase it carefully up to `16` if the domain and Bedrock quota have capacity.
+`SEED_BATCH_SIZE` controls the documents in each batch.
+
+While a seed is running, `GET /stats` shows its durable progress. The
+`occurrenceDocuments` count is the reliable contiguous CSV checkpoint because
+an occurrence batch is written only after its required catalog documents have
+succeeded. The catalog count can be ahead by at most the small worker window.
+OpenSearch's normal refresh interval can make an in-progress count lag briefly;
+both indexes are explicitly refreshed when seeding completes.
 
 The occurrence mapping preserves the original fields and adds only the internal
 `semanticKey` keyword. Its `entitySearchText` is normal text, not a semantic

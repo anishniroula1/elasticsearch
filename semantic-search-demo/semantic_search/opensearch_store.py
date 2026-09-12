@@ -145,12 +145,8 @@ class OpenSearchStore:
             )
 
     def _validate_catalog_mapping(self) -> None:
-        mapping = self.client.indices.get_mapping(
-            index=self.config.catalog_index
-        )
-        properties = mapping[self.config.catalog_index]["mappings"][
-            "properties"
-        ]
+        mapping = self.client.indices.get_mapping(index=self.config.catalog_index)
+        properties = mapping[self.config.catalog_index]["mappings"]["properties"]
         semantic_field = properties.get(SEMANTIC_FIELD, {})
         if semantic_field.get("type") != "semantic":
             raise RuntimeError(
@@ -165,10 +161,14 @@ class OpenSearchStore:
                 f"{self.config.semantic_model_id}). Run `make reset`."
             )
 
-        embedding = properties.get(SEMANTIC_INFO_FIELD, {}).get(
-            "properties",
-            {},
-        ).get("embedding", {})
+        embedding = (
+            properties.get(SEMANTIC_INFO_FIELD, {})
+            .get(
+                "properties",
+                {},
+            )
+            .get("embedding", {})
+        )
         space_type = embedding.get("space_type") or embedding.get(
             "method",
             {},
@@ -223,7 +223,13 @@ class OpenSearchStore:
             actions,
             chunk_size=self.config.seed_batch_size,
             request_timeout=120,
-            refresh="wait_for",
+        )
+
+    def refresh_indices(self) -> None:
+        """Make the completed seed immediately visible to searches and counts."""
+
+        self.client.indices.refresh(
+            index=(f"{self.config.occurrence_alias},{self.config.catalog_alias}")
         )
 
     def search_occurrences(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -294,12 +300,8 @@ class OpenSearchStore:
 
     def stats(self) -> dict[str, Any]:
         return {
-            "occurrenceDocuments": self._document_count(
-                self.config.occurrence_alias
-            ),
-            "semanticCatalogDocuments": self._document_count(
-                self.config.catalog_alias
-            ),
+            "occurrenceDocuments": self._document_count(self.config.occurrence_alias),
+            "semanticCatalogDocuments": self._document_count(self.config.catalog_alias),
             "clusterHealth": self.client.cluster.health()["status"],
         }
 
