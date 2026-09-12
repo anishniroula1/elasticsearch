@@ -1,6 +1,7 @@
 """Fast semantic matching over a deduplicated vector catalog."""
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from semantic_search.opensearch_store import (
     CATALOG_VECTOR_FIELD,
@@ -8,7 +9,6 @@ from semantic_search.opensearch_store import (
     OpenSearchStore,
 )
 from semantic_search.text import semantic_key
-
 
 ENTITY_PAGE_SIZE = 1_000
 CATALOG_PAGE_SIZE = 1_000
@@ -81,13 +81,12 @@ class SemanticSearchService:
                 [],
             )
 
-        source_by_key = {
-            entity["semanticKey"]: entity[SEMANTIC_FIELD]
-            for entity in entities
-        }
-        vectors = self.store.catalog_vectors(list(source_by_key))
+        semantic_keys = list(
+            dict.fromkeys(entity["semanticKey"] for entity in entities)
+        )
+        vectors = self.store.catalog_vectors(semantic_keys)
         matches_by_key = self._stored_vector_matches(
-            source_by_key,
+            semantic_keys,
             vectors,
             threshold,
         )
@@ -306,14 +305,14 @@ class SemanticSearchService:
 
     def _stored_vector_matches(
         self,
-        source_by_key: dict[str, str],
+        semantic_keys: list[str],
         vectors: dict[str, list[float]],
         threshold: int,
     ) -> dict[str, list[dict[str, Any]]]:
-        matches = {key: [] for key in source_by_key}
+        matches = {key: [] for key in semantic_keys}
         pending = [
-            (key, text, vectors[key], None)
-            for key, text in source_by_key.items()
+            (key, vectors[key], None)
+            for key in semantic_keys
         ]
 
         while pending:
@@ -328,7 +327,7 @@ class SemanticSearchService:
                         after_key,
                         self._vector_space_type(),
                     )
-                    for source_key, _, vector, after_key in batch
+                    for source_key, vector, after_key in batch
                 ]
                 responses = self.store.multi_search_catalog(bodies)
                 if len(responses) != len(batch):
@@ -336,7 +335,7 @@ class SemanticSearchService:
                         "OpenSearch returned an invalid msearch response"
                     )
                 for state, response in zip(batch, responses):
-                    source_key, text, vector, _ = state
+                    source_key, vector, _ = state
                     result = self._catalog_result(response)
                     matches[source_key].extend(
                         _catalog_candidate(
@@ -351,7 +350,7 @@ class SemanticSearchService:
                     after_key = result.get("after_key")
                     if after_key and len(result["buckets"]) == CATALOG_PAGE_SIZE:
                         next_pending.append(
-                            (source_key, text, vector, after_key)
+                            (source_key, vector, after_key)
                         )
             pending = next_pending
 

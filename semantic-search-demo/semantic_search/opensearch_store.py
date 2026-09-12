@@ -11,7 +11,6 @@ from opensearchpy import (
 from semantic_search.config import Config
 from semantic_search.open_search_client import OpenSearchClient
 
-
 SEMANTIC_FIELD = "entitySearchText"
 SEMANTIC_INFO_FIELD = f"{SEMANTIC_FIELD}_semantic_info"
 CATALOG_VECTOR_FIELD = f"{SEMANTIC_INFO_FIELD}.embedding"
@@ -103,16 +102,12 @@ class OpenSearchStore:
         delay_seconds: int = 2,
     ) -> None:
         for _ in range(max_attempts):
-            try:
-                if self.client.ping():
-                    return
-            except Exception:
-                pass
+            if self.client.ping():
+                return
             time.sleep(delay_seconds)
         raise RuntimeError("OpenSearch did not become ready")
 
     def ensure_indices(self) -> None:
-        catalog_index_definition(self.config)
         self._ensure_index(
             self.config.occurrence_index,
             self.config.occurrence_alias,
@@ -261,10 +256,8 @@ class OpenSearchStore:
             return {}
         response = self.client.mget(
             index=self.config.catalog_alias,
-            body={
-                "ids": semantic_keys,
-                "_source": ["semanticKey", CATALOG_VECTOR_FIELD],
-            },
+            body={"ids": semantic_keys},
+            _source_includes=["semanticKey", CATALOG_VECTOR_FIELD],
         )
         vectors: dict[str, list[float]] = {}
         for document in response["docs"]:
@@ -301,11 +294,89 @@ class OpenSearchStore:
 
     def stats(self) -> dict[str, Any]:
         return {
-            "occurrenceDocuments": self.client.count(
-                index=self.config.occurrence_alias
-            )["count"],
-            "semanticCatalogDocuments": self.client.count(
-                index=self.config.catalog_alias
-            )["count"],
+            "occurrenceDocuments": self._document_count(
+                self.config.occurrence_alias
+            ),
+            "semanticCatalogDocuments": self._document_count(
+                self.config.catalog_alias
+            ),
             "clusterHealth": self.client.cluster.health()["status"],
+        }
+
+    def _document_count(self, index: str) -> int:
+        try:
+            return self.client.count(index=index)["count"]
+        except NotFoundError:
+            return 0
+
+    def delete_indices_and_aliases(self) -> dict[str, list[str]]:
+        """Delete both configured aliases and physical indexes."""
+
+        aliases = (
+            self.config.occurrence_alias,
+            self.config.catalog_alias,
+        )
+        indices = (
+            self.config.occurrence_index,
+            self.config.catalog_index,
+        )
+        deleted_aliases = []
+        missing_aliases = []
+        for alias in aliases:
+            if not self.client.indices.exists_alias(name=alias):
+                missing_aliases.append(alias)
+                continue
+            try:
+                alias_targets = self.client.indices.get_alias(name=alias)
+            except NotFoundError:
+                missing_aliases.append(alias)
+                continue
+            for target_index in alias_targets:
+                self.client.indices.delete_alias(
+                    index=target_index,
+                    name=alias,
+                )
+            deleted_aliases.append(alias)
+
+        deleted_indices = []
+        missing_indices = []
+        for index in indices:
+            if self.client.indices.exists(index=index):
+                self.client.indices.delete(index=index)
+                deleted_indices.append(index)
+            else:
+                missing_indices.append(index)
+
+        self.vector_space_type = None
+        return {
+            "deletedIndices": deleted_indices,
+            "missingIndices": missing_indices,
+            "deletedAliases": deleted_aliases,
+            "missingAliases": missing_aliases,
+        }
+
+    def preview_documents(
+        self,
+        index: str,
+        size: int = 10,
+    ) -> dict[str, Any]:
+        """Return unfiltered documents and the exact index count."""
+
+        response = self.client.search(
+            index=index,
+            body={
+                "size": size,
+                "track_total_hits": True,
+                "query": {"match_all": {}},
+            },
+        )
+        hits = response["hits"]
+        total = hits["total"]
+        if isinstance(total, dict):
+            total = total["value"]
+        documents = hits["hits"]
+        return {
+            "totalDocuments": total,
+            "returnedDocuments": len(documents),
+            "documents": documents,
         }

@@ -1,6 +1,7 @@
 from dataclasses import replace
 
 import pytest
+from opensearchpy import NotFoundError
 
 from semantic_search.config import config
 from semantic_search.opensearch_store import (
@@ -113,3 +114,181 @@ def test_store_rejects_unsupported_catalog_mapping():
 
     with pytest.raises(RuntimeError, match="cosinesimil and l2"):
         store._validate_catalog_mapping()
+
+
+def test_store_stats_counts_both_indexes():
+    class FakeCluster:
+        @staticmethod
+        def health():
+            return {"status": "green"}
+
+    class FakeClient:
+        cluster = FakeCluster()
+
+        @staticmethod
+        def count(index):
+            counts = {
+                config.occurrence_alias: 26,
+                config.catalog_alias: 4,
+            }
+            return {"count": counts[index]}
+
+    store = OpenSearchStore(config, client=FakeClient())
+
+    assert store.stats() == {
+        "occurrenceDocuments": 26,
+        "semanticCatalogDocuments": 4,
+        "clusterHealth": "green",
+    }
+
+
+def test_catalog_vectors_uses_mget_source_filter_query_parameter():
+    class FakeClient:
+        @staticmethod
+        def mget(index, body, _source_includes):
+            assert index == config.catalog_alias
+            assert body == {"ids": ["key-1"]}
+            assert _source_includes == [
+                "semanticKey",
+                "entitySearchText_semantic_info.embedding",
+            ]
+            return {
+                "docs": [
+                    {
+                        "found": True,
+                        "_source": {
+                            "semanticKey": "key-1",
+                            "entitySearchText_semantic_info": {
+                                "embedding": [0.1, 0.2]
+                            },
+                        },
+                    }
+                ]
+            }
+
+    store = OpenSearchStore(config, client=FakeClient())
+
+    assert store.catalog_vectors(["key-1"]) == {
+        "key-1": [0.1, 0.2]
+    }
+
+
+def test_store_previews_ten_unfiltered_documents_with_total_count():
+    class FakeClient:
+        @staticmethod
+        def search(index, body):
+            assert index == config.catalog_alias
+            assert body == {
+                "size": 10,
+                "track_total_hits": True,
+                "query": {"match_all": {}},
+            }
+            return {
+                "hits": {
+                    "total": {"value": 16, "relation": "eq"},
+                    "hits": [
+                        {
+                            "_index": config.catalog_index,
+                            "_id": str(number),
+                            "_source": {"entitySearchText": f"Entity {number}"},
+                        }
+                        for number in range(10)
+                    ],
+                }
+            }
+
+    store = OpenSearchStore(config, client=FakeClient())
+
+    result = store.preview_documents(config.catalog_alias)
+
+    assert result["totalDocuments"] == 16
+    assert result["returnedDocuments"] == 10
+    assert len(result["documents"]) == 10
+
+
+def test_store_deletes_both_exact_aliases_and_indices():
+    class FakeIndices:
+        def __init__(self):
+            self.indices = {
+                config.occurrence_index,
+                config.catalog_index,
+            }
+            self.alias_targets = {
+                config.occurrence_alias: {config.occurrence_index},
+                config.catalog_alias: {config.catalog_index},
+            }
+            self.deleted_indices = []
+            self.deleted_alias_bindings = []
+
+        def exists_alias(self, name):
+            return bool(self.alias_targets.get(name))
+
+        def get_alias(self, name):
+            return {
+                index: {"aliases": {name: {}}}
+                for index in self.alias_targets[name]
+            }
+
+        def delete_alias(self, index, name):
+            self.deleted_alias_bindings.append((index, name))
+            self.alias_targets[name].remove(index)
+
+        def exists(self, index):
+            return index in self.indices
+
+        def delete(self, index):
+            self.deleted_indices.append(index)
+            self.indices.remove(index)
+
+    class FakeClient:
+        indices = FakeIndices()
+
+    client = FakeClient()
+    store = OpenSearchStore(config, client=client)
+    store.vector_space_type = "cosinesimil"
+
+    result = store.delete_indices_and_aliases()
+
+    assert result == {
+        "deletedIndices": [
+            config.occurrence_index,
+            config.catalog_index,
+        ],
+        "missingIndices": [],
+        "deletedAliases": [
+            config.occurrence_alias,
+            config.catalog_alias,
+        ],
+        "missingAliases": [],
+    }
+    assert client.indices.deleted_alias_bindings == [
+        (config.occurrence_index, config.occurrence_alias),
+        (config.catalog_index, config.catalog_alias),
+    ]
+    assert client.indices.deleted_indices == [
+        config.occurrence_index,
+        config.catalog_index,
+    ]
+    assert store.vector_space_type is None
+
+
+def test_store_stats_reports_zero_when_indexes_are_deleted():
+    class FakeCluster:
+        @staticmethod
+        def health():
+            return {"status": "green"}
+
+    class FakeClient:
+        cluster = FakeCluster()
+
+        @staticmethod
+        def count(index):
+            raise NotFoundError(404, "index_not_found_exception")
+
+    store = OpenSearchStore(config, client=FakeClient())
+
+    assert store.stats() == {
+        "occurrenceDocuments": 0,
+        "semanticCatalogDocuments": 0,
+        "clusterHealth": "green",
+    }

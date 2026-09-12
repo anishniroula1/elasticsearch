@@ -178,14 +178,46 @@ the cosine threshold. For `threshold=90`, cosine similarity must be at least
 approximately `0.833333` for normalized Titan vectors using `l2`. Responses
 report the detected mapping as `vectorSpaceType`.
 
+## Index statistics and previews
+
+Get the exact document count for both indexes:
+
+```text
+GET /stats
+```
+
+Preview unfiltered documents from either index (the default count is 10):
+
+```text
+GET /index-documents?index=ner_entity_occurrences&count=10
+GET /index-documents?index=ner_entity_semantic_catalog&count=10
+```
+
+Swagger displays `index` as a dropdown containing only the configured
+occurrence and semantic-catalog aliases. `count` accepts 1 through 100. The
+preview uses a plain `match_all` query and returns the full OpenSearch hits.
+
 ## API process
 
 The business endpoints are the summary and one-text search. Administrative
-endpoints are available at `POST /admin/init` and `POST /admin/seed`. The system
-health endpoint is available at `GET /health`.
+endpoints are available at `POST /admin/init` and `POST /admin/seed`. System
+endpoints are available at `GET /health`, `GET /stats`, and
+`GET /index-documents`.
 
 `POST /admin/init` creates missing indexes and aliases without deleting or
 seeding existing data.
+
+Delete both configured indexes, all their data, and both aliases:
+
+```text
+DELETE /admin/indexes?confirm=true
+```
+
+The confirmation parameter prevents an accidental deletion from Swagger. The
+endpoint uses only the exact index and alias names from `.env`; it does not use
+wildcards. After deletion, `GET /stats` reports zero documents. Use
+`POST /admin/init` to recreate empty indexes or `POST /admin/seed` to recreate
+and populate them.
 
 Start the application in its AWS runtime with:
 

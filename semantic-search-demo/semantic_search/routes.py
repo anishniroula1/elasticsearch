@@ -1,4 +1,6 @@
+from enum import StrEnum
 from pathlib import Path
+from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query
 from opensearchpy.exceptions import OpenSearchException
@@ -7,9 +9,13 @@ from semantic_search.cli import seed_from_csv
 from semantic_search.components import service, store
 from semantic_search.config import config
 
-
 router = APIRouter()
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+class IndexSelection(StrEnum):
+    occurrences = config.occurrence_alias
+    semantic_catalog = config.catalog_alias
 
 
 @router.get("/health", tags=["System"])
@@ -35,6 +41,61 @@ def health():
     return response
 
 
+@router.get("/stats", tags=["System"])
+def stats():
+    """Get the record counts for both semantic-search indexes."""
+
+    try:
+        return {
+            "occurrenceIndex": config.occurrence_index,
+            "occurrenceAlias": config.occurrence_alias,
+            "semanticCatalogIndex": config.catalog_index,
+            "semanticCatalogAlias": config.catalog_alias,
+            **store.stats(),
+        }
+    except OpenSearchException as error:
+        raise HTTPException(
+            status_code=503,
+            detail=f"OpenSearch stats failed: {error}",
+        ) from error
+
+
+@router.get("/index-documents", tags=["System"])
+def index_documents(
+    index: Annotated[
+        IndexSelection,
+        Query(description="Select one of the two indexes to preview."),
+    ],
+    count: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=100,
+            description="Number of unfiltered documents to return.",
+        ),
+    ] = 10,
+):
+    """Return unfiltered documents from the selected index."""
+
+    physical_index = (
+        config.occurrence_index
+        if index is IndexSelection.occurrences
+        else config.catalog_index
+    )
+    try:
+        preview = store.preview_documents(index.value, size=count)
+    except OpenSearchException as error:
+        raise HTTPException(
+            status_code=503,
+            detail=f"OpenSearch index preview failed: {error}",
+        ) from error
+    return {
+        "selectedIndex": physical_index,
+        "selectedAlias": index.value,
+        **preview,
+    }
+
+
 @router.post("/admin/init", tags=["Admin"])
 def init_indices():
     """Create the two indexes and aliases when they do not exist."""
@@ -52,6 +113,37 @@ def init_indices():
         "occurrenceAlias": config.occurrence_alias,
         "semanticCatalogIndex": config.catalog_index,
         "semanticCatalogAlias": config.catalog_alias,
+    }
+
+
+@router.delete("/admin/indexes", tags=["Admin"])
+def delete_indices(
+    confirm: Annotated[
+        bool,
+        Query(
+            description=(
+                "Must be true to delete both indexes, their data, and aliases."
+            ),
+        ),
+    ] = False,
+):
+    """Permanently delete both semantic-search indexes and aliases."""
+
+    if not confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="Set confirm=true to delete both indexes and aliases.",
+        )
+    try:
+        result = store.delete_indices_and_aliases()
+    except OpenSearchException as error:
+        raise HTTPException(
+            status_code=503,
+            detail=f"OpenSearch index deletion failed: {error}",
+        ) from error
+    return {
+        "message": "Semantic-search indexes and aliases were deleted",
+        **result,
     }
 
 

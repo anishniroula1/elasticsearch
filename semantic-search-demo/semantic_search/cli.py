@@ -1,15 +1,14 @@
 import argparse
 import csv
 import json
+from collections.abc import Iterator
 from itertools import batched
 from pathlib import Path
-from typing import Iterator
 
 from semantic_search.components import store
 from semantic_search.config import config
 from semantic_search.models import EntityOccurrence
 from semantic_search.text import normalize_text, semantic_key
-
 
 CSV_COLUMNS = {
     "sentenceEntityId",

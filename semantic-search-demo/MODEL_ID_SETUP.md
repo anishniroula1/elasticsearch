@@ -177,19 +177,24 @@ OpenSearch 2.13 and later can automatically deploy an externally hosted model
 on its first prediction, but an explicit deployment check makes setup failures
 easier to diagnose.
 
-### 5. Test Titan inference through OpenSearch
+### 5. Test the semantic-field inference contract
 
 ```json
-POST /_plugins/_ml/models/xhR35JQBLopfJ2xsO9pr/_predict
+POST /_plugins/_ml/_predict/text_embedding/xhR35JQBLopfJ2xsO9pr
 {
-  "parameters": {
-    "inputText": "hello world"
-  }
+  "text_docs": ["hello world"],
+  "return_number": true,
+  "target_response": ["sentence_embedding"]
 }
 ```
 
 A successful response contains an inference result with a float embedding. For
 the 1,024-dimension Titan V2 configuration, the output shape should be 1,024.
+This exact test matters: a `semantic` field sends `text_docs`, while Titan
+expects `inputText`. The connector preprocessor must translate between them.
+Testing `/_plugins/_ml/models/<MODEL_ID>/_predict` with an already formed
+`parameters.inputText` body can succeed even when semantic-field ingestion will
+fail.
 
 ### 6. Configure this project
 
@@ -348,7 +353,7 @@ POST /_plugins/_ml/connectors/_create
       },
       "request_body": "{ \"inputText\": \"${parameters.inputText}\", \"dimensions\": ${parameters.dimensions}, \"normalize\": ${parameters.normalize}, \"embeddingTypes\": ${parameters.embeddingTypes} }",
       "pre_process_function": "connector.pre_process.bedrock.embedding",
-      "post_process_function": "connector.post_process.bedrock.embedding"
+      "post_process_function": "connector.post_process.bedrock_v2.embedding.float"
     }
   ]
 }
@@ -401,10 +406,11 @@ Run these checks in order:
 
 ```text
 GET  /_plugins/_ml/models/<MODEL_ID>
-POST /_plugins/_ml/models/<MODEL_ID>/_predict
+POST /_plugins/_ml/_predict/text_embedding/<MODEL_ID>
 ```
 
-Only proceed to `make seed` after model prediction succeeds.
+Use the `text_docs` request body shown in Option A. Only proceed to `make seed`
+after that prediction succeeds.
 
 ## Troubleshooting
 
@@ -429,6 +435,41 @@ Search the model registry again and use the matching hit's `_id`.
 The model was registered manually without `model_config`. Register a new model
 with `embedding_dimension: 1024` and the appropriate `space_type`, or use the
 AWS console integration.
+
+### `Some parameter placeholder not filled in payload: inputText`
+
+The model can reach its connector, but the connector is not compatible with
+the input contract used by neural and `semantic` field operations. OpenSearch
+sends this shape:
+
+```json
+{
+  "text_docs": ["hello world"]
+}
+```
+
+Titan expects `inputText`, so the connector's `predict` action must contain:
+
+```json
+{
+  "request_body": "{ \"inputText\": \"${parameters.inputText}\", \"dimensions\": ${parameters.dimensions}, \"normalize\": ${parameters.normalize}, \"embeddingTypes\": ${parameters.embeddingTypes} }",
+  "pre_process_function": "connector.pre_process.bedrock.embedding",
+  "post_process_function": "connector.post_process.bedrock_v2.embedding.float"
+}
+```
+
+Inspect the model to find its connector, then inspect that connector:
+
+```text
+GET /_plugins/_ml/models/<MODEL_ID>
+GET /_plugins/_ml/connectors/<CONNECTOR_ID>
+```
+
+If `pre_process_function` is absent or different, create a corrected connector
+and register a new model using Option B. Put the new OpenSearch model ID in
+`.env` as `OPENSEARCH_SEMANTIC_MODEL_ID`, restart the app, and seed again. Do
+not work around this by hard-coding `inputText`: each catalog document needs a
+different value supplied through `text_docs`.
 
 ### Model is `REGISTERED` or `UNDEPLOYED`
 
@@ -469,6 +510,7 @@ ingest-pipeline plus `knn_vector` implementation supported by the older version.
 - [AWS remote-inference CloudFormation setup](https://docs.aws.amazon.com/opensearch-service/latest/developerguide/cfn-template.html)
 - [AWS OpenSearch connectors for AWS services](https://docs.aws.amazon.com/opensearch-service/latest/developerguide/ml-amazon-connector.html)
 - [OpenSearch semantic field](https://docs.opensearch.org/latest/mappings/supported-field-types/semantic/)
+- [OpenSearch text-embedding Predict API](https://docs.opensearch.org/latest/ml-commons-plugin/api/train-predict/predict/)
 - [OpenSearch Search Model API](https://docs.opensearch.org/latest/ml-commons-plugin/api/model-apis/search-model/)
 - [OpenSearch Get Model API](https://docs.opensearch.org/latest/ml-commons-plugin/api/model-apis/get-model/)
 - [OpenSearch Register Model API](https://docs.opensearch.org/latest/ml-commons-plugin/api/model-apis/register-model/)
