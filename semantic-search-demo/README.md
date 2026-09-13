@@ -201,6 +201,8 @@ Example:
   "applicationId": "A000042133",
   "thresholdPercentage": 90,
   "similarityMetric": "cosine",
+  "semanticResultMode": "topK",
+  "maxSemanticNeighborsPerEntity": 20,
   "vectorSpaceType": "cosinesimil",
   "queryEmbeddingSource": "semanticCatalog",
   "totalUniqueEntities": 1,
@@ -221,7 +223,9 @@ Example:
 ```
 
 Counts are matching occurrence documents outside the supplied application.
-Source locations are omitted from the summary.
+Source locations are omitted from the summary. Each source entity checks its
+20 nearest catalog neighbors and then discards neighbors below the requested
+cosine threshold. Counts are therefore bounded to those top 20 catalog keys.
 
 ## Paginated application entities with outside match counts
 
@@ -245,6 +249,8 @@ do not repeat the count.
   "applicationId": "A000042133",
   "thresholdPercentage": 90,
   "similarityMetric": "cosine",
+  "semanticResultMode": "topK",
+  "maxSemanticNeighborsPerEntity": 20,
   "vectorSpaceType": "cosinesimil",
   "queryEmbeddingSource": "semanticCatalog",
   "totalUniqueEntities": 237,
@@ -273,12 +279,12 @@ it to resume after the last source entity instead of reading earlier pages
 again. Results are in composite `entityId` order, not global match-count order.
 
 For each page the service loads up to 100 stored catalog vectors in one
-`mget`, sends up to 100 initial vector searches in one `_msearch`, and then
-aggregates outside-application occurrence counts for the resulting catalog
-keys. Titan is not called for these stored source entities. Extra `_msearch`
-rounds occur only when a source entity has more than one catalog candidate
-page above the threshold. For consistent results, do not seed or delete the
-indexes while paging.
+`mget`, sends up to 100 bounded top-20 vector searches in one `_msearch`, and
+then aggregates outside-application occurrence counts for the resulting
+catalog keys. Titan is not called for these stored source entities. The
+catalog search returns direct hits and does not run a composite aggregation or
+`top_hits`. For consistent results, do not seed or delete the indexes while
+paging.
 
 ## Semantic search for one text
 
@@ -294,10 +300,12 @@ matching occurrences in one filtered query.
 The response reports the path used as `queryEmbeddingSource`, either
 `semanticCatalog` or `titan`.
 
-An `exact` match has the same normalized semantic key. A `similar` match passes
-the cosine threshold. For `threshold=90`, cosine similarity must be at least
-`0.90`. The OpenSearch minimum score is `0.95` for `cosinesimil`. Responses
-report `cosinesimil` as `vectorSpaceType`.
+An `exact` match has the same normalized semantic key. A `similar` match is one
+of the 20 nearest catalog neighbors and passes the cosine threshold. For
+`threshold=90`, cosine similarity must be at least `0.90`. OpenSearch retrieves
+the nearest neighbors using `k=20`; the service converts their scores to cosine
+percentages and removes results below the threshold. Responses report
+`cosinesimil` as `vectorSpaceType`.
 
 ## Index statistics and previews
 

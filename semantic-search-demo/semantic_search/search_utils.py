@@ -1,6 +1,5 @@
 """Fast semantic matching over a deduplicated vector catalog."""
 
-from collections.abc import Callable
 from typing import Any
 
 from semantic_search.opensearch_store import (
@@ -10,9 +9,9 @@ from semantic_search.opensearch_store import (
 )
 
 ENTITY_PAGE_SIZE = 1_000
-CATALOG_PAGE_SIZE = 1_000
 OCCURRENCE_PAGE_SIZE = 5_000
 MSEARCH_BATCH_SIZE = 100
+CATALOG_NEIGHBOR_LIMIT = 20
 TERMS_BATCH_SIZE = 10_000
 UNIQUE_ENTITY_COUNT_PRECISION = 40_000
 
@@ -80,6 +79,8 @@ class SemanticSearchUtilities:
             "applicationId": application_id,
             "thresholdPercentage": threshold,
             "similarityMetric": "cosine",
+            "semanticResultMode": "topK",
+            "maxSemanticNeighborsPerEntity": CATALOG_NEIGHBOR_LIMIT,
             "vectorSpaceType": self.vector_space_type(),
             "queryEmbeddingSource": query_embedding_source,
         }
@@ -153,9 +154,12 @@ class SemanticSearchUtilities:
 
         candidate_keys = list(
             dict.fromkeys(
-                match["semanticKey"]
-                for matches in matches_by_key.values()
-                for match in matches
+                semantic_keys
+                + [
+                    match["semanticKey"]
+                    for matches in matches_by_key.values()
+                    for match in matches
+                ]
             )
         )
         occurrence_counts = self._occurrence_counts(
@@ -165,10 +169,9 @@ class SemanticSearchUtilities:
 
         for entity in entities:
             matches = matches_by_key[entity["semanticKey"]]
-            entity["exactMatchCount"] = sum(
-                occurrence_counts.get(match["semanticKey"], 0)
-                for match in matches
-                if match["matchType"] == "exact"
+            entity["exactMatchCount"] = occurrence_counts.get(
+                entity["semanticKey"],
+                0,
             )
             entity["similarMatchCount"] = sum(
                 occurrence_counts.get(match["semanticKey"], 0)
@@ -269,49 +272,25 @@ class SemanticSearchUtilities:
         threshold: int,
     ) -> dict[str, list[dict[str, Any]]]:
         matches = {key: [] for key in semantic_keys}
-        pending = [
-            (key, vectors[key], None)
-            for key in semantic_keys
-        ]
+        searches = [(key, vectors[key]) for key in semantic_keys]
 
-        while pending:
-            next_pending = []
-            for offset in range(0, len(pending), MSEARCH_BATCH_SIZE):
-                batch = pending[offset : offset + MSEARCH_BATCH_SIZE]
-                bodies = [
-                    self._catalog_vector_body(
-                        source_key,
-                        vector,
-                        threshold,
-                        after_key,
-                        self.vector_space_type(),
-                    )
-                    for source_key, vector, after_key in batch
-                ]
-                responses = self.store.multi_search_catalog(bodies)
-                if len(responses) != len(batch):
-                    raise RuntimeError(
-                        "OpenSearch returned an invalid msearch response"
-                    )
-                for state, response in zip(batch, responses):
-                    source_key, vector, _ = state
-                    result = self._catalog_result(response)
-                    matches[source_key].extend(
-                        _catalog_candidate(
-                            source_key,
-                            hit["_source"],
-                            hit["_score"],
-                            threshold,
-                            self.vector_space_type(),
-                        )
-                        for hit in self._catalog_hits(result)
-                    )
-                    after_key = result.get("after_key")
-                    if after_key and len(result["buckets"]) == CATALOG_PAGE_SIZE:
-                        next_pending.append(
-                            (source_key, vector, after_key)
-                        )
-            pending = next_pending
+        for offset in range(0, len(searches), MSEARCH_BATCH_SIZE):
+            batch = searches[offset : offset + MSEARCH_BATCH_SIZE]
+            bodies = [
+                self._catalog_vector_body(vector)
+                for _, vector in batch
+            ]
+            responses = self.store.multi_search_catalog(bodies)
+            if len(responses) != len(batch):
+                raise RuntimeError(
+                    "OpenSearch returned an invalid msearch response"
+                )
+            for (source_key, _), response in zip(batch, responses):
+                matches[source_key] = self._threshold_candidates(
+                    source_key,
+                    response,
+                    threshold,
+                )
 
         for source_matches in matches.values():
             source_matches.sort(key=_match_sort_key)
@@ -323,16 +302,10 @@ class SemanticSearchUtilities:
         vector: list[float],
         threshold: int,
     ) -> list[dict[str, Any]]:
-        return self._paged_catalog_matches(
+        return self._threshold_candidates(
             source_key,
+            self.store.search_catalog(self._catalog_vector_body(vector)),
             threshold,
-            lambda after_key: self._catalog_vector_body(
-                source_key,
-                vector,
-                threshold,
-                after_key,
-                self.vector_space_type(),
-            ),
         )
 
     def catalog_text_matches(
@@ -341,105 +314,68 @@ class SemanticSearchUtilities:
         source_key: str,
         threshold: int,
     ) -> list[dict[str, Any]]:
-        return self._paged_catalog_matches(
+        return self._threshold_candidates(
             source_key,
+            self.store.search_catalog(self._catalog_text_body(text)),
             threshold,
-            lambda after_key: self._catalog_text_body(
-                text,
-                source_key,
-                threshold,
-                after_key,
-                self.vector_space_type(),
-            ),
         )
 
-    def _paged_catalog_matches(
+    def _threshold_candidates(
         self,
         source_key: str,
+        response: dict[str, Any],
         threshold: int,
-        body_factory: Callable[[dict[str, Any] | None], dict[str, Any]],
     ) -> list[dict[str, Any]]:
         matches = []
-        after_key = None
-        while True:
-            response = self.store.search_catalog(body_factory(after_key))
-            result = self._catalog_result(response)
-            matches.extend(
-                _catalog_candidate(
-                    source_key,
-                    hit["_source"],
-                    hit["_score"],
-                    threshold,
-                    self.vector_space_type(),
-                )
-                for hit in self._catalog_hits(result)
+        for hit in self._catalog_hits(response):
+            candidate = _catalog_candidate(
+                source_key,
+                hit["_source"],
+                hit["_score"],
+                self.vector_space_type(),
             )
-            after_key = result.get("after_key")
-            if not after_key or len(result["buckets"]) < CATALOG_PAGE_SIZE:
-                break
+            if candidate["matchPercentage"] >= threshold:
+                matches.append(candidate)
         matches.sort(key=_match_sort_key)
         return matches
 
     @staticmethod
-    def _catalog_result(response: dict[str, Any]) -> dict[str, Any]:
+    def _catalog_hits(response: dict[str, Any]):
         if "error" in response:
             raise RuntimeError(
                 f"OpenSearch semantic search failed: {response['error']}"
             )
-        return response["aggregations"]["matches"]
-
-    @staticmethod
-    def _catalog_hits(result: dict[str, Any]):
-        for bucket in result["buckets"]:
-            yield bucket["sample"]["hits"]["hits"][0]
+        return response["hits"]["hits"]
 
     @staticmethod
     def _catalog_vector_body(
-        source_key: str,
         vector: list[float],
-        threshold: int,
-        after_key: dict[str, Any] | None,
-        vector_space_type: str,
     ) -> dict[str, Any]:
         return _catalog_search_body(
-            source_key,
             {
                 "knn": {
                     CATALOG_VECTOR_FIELD: {
                         "vector": vector,
-                        "min_score": _minimum_opensearch_score(
-                            threshold,
-                            vector_space_type,
-                        ),
+                        "k": CATALOG_NEIGHBOR_LIMIT,
                     }
                 }
             },
-            after_key,
         )
 
     def _catalog_text_body(
         self,
         text: str,
-        source_key: str,
-        threshold: int,
-        after_key: dict[str, Any] | None,
-        vector_space_type: str,
     ) -> dict[str, Any]:
         return _catalog_search_body(
-            source_key,
             {
                 "neural": {
                     CATALOG_VECTOR_FIELD: {
                         "query_text": text,
                         "model_id": self.store.config.semantic_model_id,
-                        "min_score": _minimum_opensearch_score(
-                            threshold,
-                            vector_space_type,
-                        ),
+                        "k": CATALOG_NEIGHBOR_LIMIT,
                     }
                 }
             },
-            after_key,
         )
 
     def _occurrence_counts(
@@ -549,43 +485,13 @@ class SemanticSearchUtilities:
 
 
 def _catalog_search_body(
-    source_key: str,
     vector_query: dict[str, Any],
-    after_key: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    composite: dict[str, Any] = {
-        "size": CATALOG_PAGE_SIZE,
-        "sources": [
-            {"semanticKey": {"terms": {"field": "semanticKey"}}}
-        ],
-    }
-    if after_key:
-        composite["after"] = after_key
     return {
-        "size": 0,
+        "size": CATALOG_NEIGHBOR_LIMIT,
         "track_total_hits": False,
-        "query": {
-            "bool": {
-                "should": [
-                    {"term": {"semanticKey": source_key}},
-                    vector_query,
-                ],
-                "minimum_should_match": 1,
-            }
-        },
-        "aggs": {
-            "matches": {
-                "composite": composite,
-                "aggs": {
-                    "sample": {
-                        "top_hits": {
-                            "size": 1,
-                            "_source": CATALOG_FIELDS,
-                        }
-                    }
-                },
-            }
-        },
+        "_source": CATALOG_FIELDS,
+        "query": vector_query,
     }
 
 
@@ -593,7 +499,6 @@ def _catalog_candidate(
     source_key: str,
     candidate: dict[str, Any],
     opensearch_score: float,
-    threshold: int,
     vector_space_type: str,
 ) -> dict[str, Any]:
     candidate_key = candidate["semanticKey"]
@@ -605,10 +510,6 @@ def _catalog_candidate(
             opensearch_score,
             vector_space_type,
         )
-        if percentage < threshold:
-            raise RuntimeError(
-                "OpenSearch returned a semantic result below min_score"
-            )
         match_type = "similar"
     return {
         "semanticKey": candidate_key,
