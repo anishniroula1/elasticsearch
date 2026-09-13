@@ -85,7 +85,6 @@ def catalog_index_definition(config: Config) -> dict[str, Any]:
     return {
         "settings": {
             "index.knn": True,
-            "index.knn.space_type": CATALOG_VECTOR_SPACE_TYPE,
             "index.default_pipeline": config.ingest_pipeline,
             "number_of_shards": config.index_shards,
             "number_of_replicas": config.index_replicas,
@@ -99,6 +98,11 @@ def catalog_index_definition(config: Config) -> dict[str, Any]:
                 CATALOG_VECTOR_FIELD: {
                     "type": "knn_vector",
                     "dimension": CATALOG_VECTOR_DIMENSION,
+                    "method": {
+                        "name": "hnsw",
+                        "space_type": CATALOG_VECTOR_SPACE_TYPE,
+                        "engine": "lucene",
+                    },
                 },
             },
         },
@@ -200,7 +204,6 @@ class OpenSearchStore:
                 "method",
                 {},
             ).get("space_type")
-            or settings.get("index.knn.space_type")
         )
         if space_type != CATALOG_VECTOR_SPACE_TYPE:
             raise RuntimeError(

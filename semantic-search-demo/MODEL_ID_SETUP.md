@@ -269,7 +269,8 @@ entitySearchTextVector
 ```
 
 `entitySearchText` must be `text`. `entitySearchTextVector` must be a
-`knn_vector` with dimension `1024`.
+`knn_vector` with dimension `1024`, using the `hnsw` method, the `lucene`
+engine, and `space_type: cosinesimil`.
 
 Check the flattened index settings:
 
@@ -281,12 +282,13 @@ The settings must include:
 
 ```text
 index.default_pipeline = my_bedrock_embedding_pipeline
-index.knn.space_type = cosinesimil
 index.knn = true
 ```
 
-The service validates the vector dimension, default pipeline, and cosine space
-at startup. An old 1,536-dimension or `semantic`-field catalog must be recreated.
+The cosine space is stored in the vector field mapping, not in the index-level
+`index.knn.space_type` setting. The service validates the vector dimension,
+default pipeline, and cosine space at startup. An old 1,536-dimension or
+`semantic`-field catalog must be recreated.
 
 Check the occurrence and semantic-catalog document counts:
 

@@ -44,7 +44,7 @@ def test_catalog_mapping_uses_explicit_cosine_vector_and_ingest_pipeline():
     properties = definition["mappings"]["properties"]
 
     assert definition["settings"]["index.knn"] is True
-    assert definition["settings"]["index.knn.space_type"] == "cosinesimil"
+    assert "index.knn.space_type" not in definition["settings"]
     assert definition["settings"]["index.default_pipeline"] == "titan-pipeline"
     assert definition["settings"]["number_of_shards"] == 1
     assert definition["settings"]["number_of_replicas"] == 1
@@ -58,6 +58,11 @@ def test_catalog_mapping_uses_explicit_cosine_vector_and_ingest_pipeline():
     assert properties["entitySearchTextVector"] == {
         "type": "knn_vector",
         "dimension": 1024,
+        "method": {
+            "name": "hnsw",
+            "space_type": "cosinesimil",
+            "engine": "lucene",
+        },
     }
 
 
@@ -77,7 +82,10 @@ def test_catalog_mapping_requires_an_ingest_pipeline():
         )
 
 
-def _catalog_mapping(dimension=CATALOG_VECTOR_DIMENSION):
+def _catalog_mapping(
+    dimension=CATALOG_VECTOR_DIMENSION,
+    space_type=CATALOG_VECTOR_SPACE_TYPE,
+):
     return {
         config.catalog_index: {
             "mappings": {
@@ -86,6 +94,11 @@ def _catalog_mapping(dimension=CATALOG_VECTOR_DIMENSION):
                     CATALOG_VECTOR_FIELD: {
                         "type": "knn_vector",
                         "dimension": dimension,
+                        "method": {
+                            "name": "hnsw",
+                            "space_type": space_type,
+                            "engine": "lucene",
+                        },
                     },
                 }
             }
@@ -93,15 +106,11 @@ def _catalog_mapping(dimension=CATALOG_VECTOR_DIMENSION):
     }
 
 
-def _catalog_settings(
-    pipeline="titan-pipeline",
-    space_type=CATALOG_VECTOR_SPACE_TYPE,
-):
+def _catalog_settings(pipeline="titan-pipeline"):
     return {
         config.catalog_index: {
             "settings": {
                 "index.default_pipeline": pipeline,
-                "index.knn.space_type": space_type,
             }
         }
     }
@@ -142,13 +151,13 @@ def test_store_rejects_non_cosine_catalog_mapping():
         @staticmethod
         def get_mapping(index):
             assert index == config.catalog_index
-            return _catalog_mapping()
+            return _catalog_mapping(space_type="l2")
 
         @staticmethod
         def get_settings(index, params):
             assert index == config.catalog_index
             assert params == {"flat_settings": "true"}
-            return _catalog_settings(space_type="l2")
+            return _catalog_settings()
 
     class FakeClient:
         indices = FakeIndices()

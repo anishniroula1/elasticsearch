@@ -115,12 +115,18 @@ field. The catalog uses an explicit text field and Titan V2 vector field:
 "entitySearchText": {"type": "text"},
 "entitySearchTextVector": {
   "type": "knn_vector",
-  "dimension": 1024
+  "dimension": 1024,
+  "method": {
+    "name": "hnsw",
+    "space_type": "cosinesimil",
+    "engine": "lucene"
+  }
 }
 ```
 
 The catalog index sets `index.default_pipeline` to
-`OPENSEARCH_INGEST_PIPELINE` and uses `index.knn.space_type: cosinesimil`.
+`OPENSEARCH_INGEST_PIPELINE`. Cosine similarity is configured on the vector
+field's HNSW method instead of the unsupported `index.knn.space_type` setting.
 
 Run:
 
