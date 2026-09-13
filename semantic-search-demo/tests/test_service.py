@@ -2,12 +2,13 @@ from types import SimpleNamespace
 
 from semantic_search.models import EntityOccurrence
 from semantic_search.opensearch_store import CATALOG_VECTOR_FIELD
-from semantic_search.service import (
-    SemanticSearchService,
+from semantic_search.search_utils import (
     _cosine_percentage,
     _minimum_opensearch_score,
 )
+from semantic_search.summary_service import SemanticSummaryService
 from semantic_search.text import semantic_key
+from semantic_search.text_search_service import SemanticTextSearchService
 
 
 class FakeStore:
@@ -193,7 +194,7 @@ def test_summary_reuses_catalog_vector_then_runs_one_count_aggregation():
         vectors={source_key: [0.1, 0.2]},
     )
 
-    result = SemanticSearchService(store).application_summary("A1", 90)
+    result = SemanticSummaryService(store).application_summary("A1", 90)
 
     assert result["queryEmbeddingSource"] == "semanticCatalog"
     assert result["entities"][0]["exactMatchCount"] == 3
@@ -267,7 +268,7 @@ def test_text_search_calls_titan_once_then_loads_occurrences():
         single_vector=None,
     )
 
-    result = SemanticSearchService(store).search_text(
+    result = SemanticTextSearchService(store).search_text(
         "A1",
         exact_text,
         90,
@@ -322,7 +323,7 @@ def test_text_search_reuses_catalog_vector_when_text_already_exists():
         single_vector=[0.1, 0.2],
     )
 
-    result = SemanticSearchService(store).search_text("A1", text, 90)
+    result = SemanticTextSearchService(store).search_text("A1", text, 90)
 
     assert result["queryEmbeddingSource"] == "semanticCatalog"
     catalog_query = store.catalog_bodies[0]["query"]["bool"]["should"][1]

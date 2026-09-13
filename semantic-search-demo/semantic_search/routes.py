@@ -6,7 +6,12 @@ from fastapi import APIRouter, HTTPException, Query
 from opensearchpy.exceptions import OpenSearchException
 
 from semantic_search.cli import seed_from_csv
-from semantic_search.components import service, store
+from semantic_search.components import (
+    paginated_summary_service,
+    store,
+    summary_service,
+    text_search_service,
+)
 from semantic_search.config import config
 
 router = APIRouter()
@@ -210,7 +215,42 @@ def application_semantic_summary(
     """Get application entities with exact and semantic match counts."""
 
     try:
-        return service.application_summary(application_id, threshold)
+        return summary_service.application_summary(
+            application_id,
+            threshold,
+        )
+    except (OpenSearchException, RuntimeError) as error:
+        raise HTTPException(
+            status_code=503,
+            detail=f"OpenSearch search failed: {error}",
+        ) from error
+
+
+@router.get(
+    "/applications/{application_id}/entities/semantic-matches",
+    tags=["Semantic search"],
+)
+def paginated_application_semantic_matches(
+    application_id: str,
+    threshold: int = Query(default=90, ge=1, le=100),
+    nextToken: str | None = Query(
+        default=None,
+        description=(
+            "Opaque OpenSearch continuation token returned by the previous "
+            "page. Omit it for the first page."
+        ),
+    ),
+):
+    """Page through application entities that match outside applications."""
+
+    try:
+        return paginated_summary_service.application_matches(
+            application_id,
+            threshold,
+            nextToken,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
     except (OpenSearchException, RuntimeError) as error:
         raise HTTPException(
             status_code=503,
@@ -230,7 +270,11 @@ def semantic_entity_text_search(
     """Find exact and semantic text matches outside the application."""
 
     try:
-        return service.search_text(application_id, text, threshold)
+        return text_search_service.search_text(
+            application_id,
+            text,
+            threshold,
+        )
     except (OpenSearchException, RuntimeError) as error:
         raise HTTPException(
             status_code=503,

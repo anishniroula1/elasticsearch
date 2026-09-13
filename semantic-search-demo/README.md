@@ -6,7 +6,10 @@ domain running OpenSearch 3.7 and Amazon Titan Text Embeddings V2.
 OpenSearch creates every embedding during seeding. The application never calls
 Bedrock directly and the CSV never contains vectors.
 
-For connector and model setup, see
+For the full ML Commons lifecycle through a Lasso proxy, including creation,
+testing, connector updates, and cleanup, see
+[OPENSEARCH_TITAN_LASSO_RUNBOOK.md](OPENSEARCH_TITAN_LASSO_RUNBOOK.md).
+For the AWS console and direct-Bedrock alternatives, see
 [MODEL_ID_SETUP.md](MODEL_ID_SETUP.md).
 
 ## Architecture
@@ -219,6 +222,56 @@ Example:
 
 Counts are matching occurrence documents outside the supplied application.
 Source locations are omitted from the summary.
+
+## Paginated entities with outside semantic matches
+
+```text
+GET /applications/{applicationId}/entities/semantic-matches?threshold=90
+```
+
+This endpoint returns only application entities whose exact or similar match
+count is greater than zero. The page size is fixed at 100. The first response
+includes the exact `totalMatchingEntities` across all pages, along with
+`totalPages`, so the UI can build its paginator immediately.
+
+```json
+{
+  "applicationId": "A000042133",
+  "thresholdPercentage": 90,
+  "similarityMetric": "cosine",
+  "vectorSpaceType": "cosinesimil",
+  "queryEmbeddingSource": "semanticCatalog",
+  "totalUniqueEntities": 237,
+  "totalMatchingEntities": 153,
+  "returnedEntities": 100,
+  "pagination": {
+    "page": 1,
+    "pageSize": 100,
+    "totalPages": 2,
+    "hasPreviousPage": false,
+    "hasNextPage": true
+  },
+  "nextToken": "<OPAQUE_TOKEN>",
+  "entities": []
+}
+```
+
+Pass the opaque token unchanged to fetch the next set:
+
+```text
+GET /applications/{applicationId}/entities/semantic-matches?threshold=90&nextToken=<NEXT_TOKEN>
+```
+
+The token wraps the `after_key` returned by the OpenSearch composite
+aggregation. It is tied to the application and threshold, and the server uses
+it to resume after the last evaluated entity instead of reading earlier pages
+again.
+
+Calculating the exact total still requires evaluating every unique entity on
+the first request because semantic matching crosses the occurrence and vector
+catalog indexes. The token improves later requests: they reuse the first-page
+totals and evaluate only enough new entities to fill the next 100 matches. For
+consistent results, do not seed or delete these indexes while paging.
 
 ## Semantic search for one text
 
