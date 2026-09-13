@@ -4,7 +4,7 @@ from typing import Any
 
 from semantic_search.opensearch_store import SEMANTIC_FIELD, OpenSearchStore
 from semantic_search.search_utils import SemanticSearchUtilities
-from semantic_search.text import normalize_text, semantic_key
+from semantic_search.text import semantic_key
 
 
 class SemanticTextSearchService:
@@ -35,19 +35,6 @@ class SemanticTextSearchService:
                 stored_vector,
                 threshold,
             )
-            if not any(
-                candidate["semanticKey"] == query_key
-                for candidate in candidates
-            ):
-                candidates.append(
-                    {
-                        "semanticKey": query_key,
-                        "normalizedText": normalize_text(text),
-                        SEMANTIC_FIELD: text,
-                        "matchPercentage": 100.0,
-                        "matchType": "exact",
-                    }
-                )
             query_embedding_source = "semanticCatalog"
 
         candidates_by_key = {

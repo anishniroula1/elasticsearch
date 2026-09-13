@@ -1,3 +1,5 @@
+import base64
+import struct
 from dataclasses import replace
 
 import pytest
@@ -389,30 +391,47 @@ def test_existing_catalog_keys_uses_batched_mget_without_sources(monkeypatch):
     }
 
 
-def test_catalog_vectors_uses_mget_source_filter_query_parameter():
+def test_catalog_vectors_use_binary_doc_values_without_source():
+    vector = [0.1, 0.2] + [0.0] * (CATALOG_VECTOR_DIMENSION - 2)
+    encoded_vector = base64.b64encode(
+        struct.pack(f"<{CATALOG_VECTOR_DIMENSION}f", *vector)
+    ).decode("ascii")
+
     class FakeClient:
         @staticmethod
-        def mget(index, body, params):
+        def search(index, body):
             assert index == config.catalog_alias
-            assert body == {"ids": ["key-1"]}
-            assert params == {
-                "_source_includes": "semanticKey,entitySearchTextVector"
+            assert body == {
+                "size": 1,
+                "track_total_hits": False,
+                "_source": False,
+                "stored_fields": "_none_",
+                "docvalue_fields": [
+                    {
+                        "field": "entitySearchTextVector",
+                        "format": "binary",
+                    }
+                ],
+                "query": {"ids": {"values": ["key-1"]}},
             }
             return {
-                "docs": [
-                    {
-                        "found": True,
-                        "_source": {
-                            "semanticKey": "key-1",
-                            "entitySearchTextVector": [0.1, 0.2],
-                        },
-                    }
-                ]
+                "hits": {
+                    "hits": [
+                        {
+                            "_id": "key-1",
+                            "fields": {
+                                "entitySearchTextVector": [encoded_vector]
+                            },
+                        }
+                    ]
+                }
             }
 
     store = OpenSearchStore(config, client=FakeClient())
+    result = store.catalog_vectors(["key-1"])["key-1"]
 
-    assert store.catalog_vectors(["key-1"]) == {"key-1": [0.1, 0.2]}
+    assert len(result) == CATALOG_VECTOR_DIMENSION
+    assert result[:2] == pytest.approx([0.1, 0.2])
 
 
 def test_store_previews_ten_unfiltered_documents_with_total_count():

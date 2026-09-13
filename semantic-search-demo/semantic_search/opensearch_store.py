@@ -1,6 +1,9 @@
 """AWS OpenSearch storage for semantic catalog and entity occurrences."""
 
+import base64
+import binascii
 import logging
+import struct
 import threading
 import time
 from typing import Any
@@ -380,7 +383,11 @@ class OpenSearchStore:
         """Return catalog IDs that already exist without loading vectors."""
 
         existing = set()
-        for offset in range(0, len(semantic_keys), CATALOG_EXISTENCE_BATCH_SIZE):
+        for offset in range(
+            0,
+            len(semantic_keys),
+            CATALOG_EXISTENCE_BATCH_SIZE,
+        ):
             key_batch = semantic_keys[
                 offset : offset + CATALOG_EXISTENCE_BATCH_SIZE
             ]
@@ -400,25 +407,46 @@ class OpenSearchStore:
         self,
         semantic_keys: list[str],
     ) -> dict[str, list[float]]:
+        """Load vectors through OpenSearch 3.7 binary doc values."""
+
         if not semantic_keys:
             return {}
-        response = self.client.mget(
-            index=self.config.catalog_alias,
-            body={"ids": semantic_keys},
-            params={
-                "_source_includes": (
-                    f"semanticKey,{CATALOG_VECTOR_FIELD}"
-                )
-            },
-        )
+
         vectors: dict[str, list[float]] = {}
-        for document in response["docs"]:
-            if not document.get("found"):
-                continue
-            source = document["_source"]
-            vector = self._catalog_vector_from_source(source)
-            if vector:
-                vectors[source["semanticKey"]] = vector
+        for offset in range(
+            0,
+            len(semantic_keys),
+            CATALOG_EXISTENCE_BATCH_SIZE,
+        ):
+            key_batch = semantic_keys[
+                offset : offset + CATALOG_EXISTENCE_BATCH_SIZE
+            ]
+            response = self.client.search(
+                index=self.config.catalog_alias,
+                body={
+                    "size": len(key_batch),
+                    "track_total_hits": False,
+                    "_source": False,
+                    "stored_fields": "_none_",
+                    "docvalue_fields": [
+                        {
+                            "field": CATALOG_VECTOR_FIELD,
+                            "format": "binary",
+                        }
+                    ],
+                    "query": {"ids": {"values": key_batch}},
+                },
+            )
+            for document in response["hits"]["hits"]:
+                values = document.get("fields", {}).get(
+                    CATALOG_VECTOR_FIELD,
+                )
+                if not values:
+                    continue
+                vectors[str(document["_id"])] = (
+                    self._decode_binary_vector(values[0])
+                )
+
         missing = sorted(set(semantic_keys) - set(vectors))
         if missing:
             raise RuntimeError(
@@ -426,6 +454,33 @@ class OpenSearchStore:
                 + ", ".join(missing[:5])
             )
         return vectors
+
+    @staticmethod
+    def _decode_binary_vector(encoded_vector: str) -> list[float]:
+        """Decode OpenSearch 3.7 binary vector doc values."""
+
+        try:
+            vector_bytes = base64.b64decode(
+                encoded_vector,
+                validate=True,
+            )
+        except (binascii.Error, ValueError) as error:
+            raise RuntimeError(
+                "OpenSearch returned an invalid binary catalog vector"
+            ) from error
+
+        expected_bytes = CATALOG_VECTOR_DIMENSION * 4
+        if len(vector_bytes) != expected_bytes:
+            raise RuntimeError(
+                "OpenSearch returned a catalog vector with "
+                f"{len(vector_bytes)} bytes; expected {expected_bytes}"
+            )
+        return list(
+            struct.unpack(
+                f"<{CATALOG_VECTOR_DIMENSION}f",
+                vector_bytes,
+            )
+        )
 
     def catalog_vector(self, semantic_key: str) -> list[float] | None:
         try:

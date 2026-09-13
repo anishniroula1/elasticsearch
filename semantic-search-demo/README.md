@@ -183,7 +183,7 @@ make seed SEED_RESET=false SEED_SENTENCE_ENTITY_ID=500001
 ```text
 applicationId
   -> load its unique entities from the occurrence index
-  -> fetch their already-generated vectors from the catalog
+  -> retrieve their vectors from catalog doc values as compact binary data
   -> raw vector _msearch against the small catalog (no Titan calls)
   -> one occurrence aggregation for exact/similar counts
 ```
@@ -201,8 +201,6 @@ Example:
   "applicationId": "A000042133",
   "thresholdPercentage": 90,
   "similarityMetric": "cosine",
-  "semanticResultMode": "topK",
-  "maxSemanticNeighborsPerEntity": 20,
   "vectorSpaceType": "cosinesimil",
   "queryEmbeddingSource": "semanticCatalog",
   "totalUniqueEntities": 1,
@@ -223,9 +221,7 @@ Example:
 ```
 
 Counts are matching occurrence documents outside the supplied application.
-Source locations are omitted from the summary. Each source entity checks its
-20 nearest catalog neighbors and then discards neighbors below the requested
-cosine threshold. Counts are therefore bounded to those top 20 catalog keys.
+Source locations are omitted from the summary.
 
 ## Paginated application entities with outside match counts
 
@@ -249,8 +245,6 @@ do not repeat the count.
   "applicationId": "A000042133",
   "thresholdPercentage": 90,
   "similarityMetric": "cosine",
-  "semanticResultMode": "topK",
-  "maxSemanticNeighborsPerEntity": 20,
   "vectorSpaceType": "cosinesimil",
   "queryEmbeddingSource": "semanticCatalog",
   "totalUniqueEntities": 237,
@@ -278,13 +272,17 @@ aggregation. It is tied to the application and threshold, and the server uses
 it to resume after the last source entity instead of reading earlier pages
 again. Results are in composite `entityId` order, not global match-count order.
 
-For each page the service loads up to 100 stored catalog vectors in one
-`mget`, sends up to 100 bounded top-20 vector searches in one `_msearch`, and
-then aggregates outside-application occurrence counts for the resulting
-catalog keys. Titan is not called for these stored source entities. The
-catalog search returns direct hits and does not run a composite aggregation or
-`top_hits`. For consistent results, do not seed or delete the indexes while
-paging.
+For each page the service retrieves up to 100 stored catalog vectors with one
+`ids` search. The request disables `_source` and asks OpenSearch 3.7 for the
+vector through `docvalue_fields` in binary format. The service decodes the
+little-endian float bytes and uses those vectors for `_msearch`. This avoids
+the vector reconstruction and large JSON-array parsing performed by the old
+`mget` `_source` path and does not require reindexing.
+
+The service then sends up to 100 threshold-based vector searches in one
+`_msearch` and aggregates outside-application occurrence counts for the
+resulting catalog keys. Titan is not called for these stored source entities.
+For consistent results, do not seed or delete the indexes while paging.
 
 ## Semantic search for one text
 
@@ -300,12 +298,10 @@ matching occurrences in one filtered query.
 The response reports the path used as `queryEmbeddingSource`, either
 `semanticCatalog` or `titan`.
 
-An `exact` match has the same normalized semantic key. A `similar` match is one
-of the 20 nearest catalog neighbors and passes the cosine threshold. For
-`threshold=90`, cosine similarity must be at least `0.90`. OpenSearch retrieves
-the nearest neighbors using `k=20`; the service converts their scores to cosine
-percentages and removes results below the threshold. Responses report
-`cosinesimil` as `vectorSpaceType`.
+An `exact` match has the same normalized semantic key. A `similar` match passes
+the cosine threshold. For `threshold=90`, cosine similarity must be at least
+`0.90`. The OpenSearch minimum score is `0.95` for `cosinesimil`. Responses
+report `cosinesimil` as `vectorSpaceType`.
 
 ## Index statistics and previews
 

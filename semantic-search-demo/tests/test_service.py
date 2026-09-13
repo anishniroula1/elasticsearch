@@ -3,7 +3,6 @@ from types import SimpleNamespace
 from semantic_search.models import EntityOccurrence
 from semantic_search.opensearch_store import CATALOG_VECTOR_FIELD
 from semantic_search.search_utils import (
-    CATALOG_NEIGHBOR_LIMIT,
     UNIQUE_ENTITY_COUNT_PRECISION,
     SemanticSearchUtilities,
     _cosine_percentage,
@@ -95,7 +94,21 @@ def _catalog_hit(text, score):
 
 
 def _catalog_response(*hits):
-    return {"hits": {"hits": list(hits)}}
+    return {
+        "aggregations": {
+            "matches": {
+                "buckets": [
+                    {
+                        "key": {
+                            "semanticKey": hit["_source"]["semanticKey"]
+                        },
+                        "sample": {"hits": {"hits": [hit]}},
+                    }
+                    for hit in hits
+                ]
+            }
+        }
+    }
 
 
 def test_source_entity_has_no_precomputed_vector_field():
@@ -210,8 +223,8 @@ def test_summary_reuses_catalog_vector_then_runs_one_count_aggregation():
         msearch_responses=[
             [
                 _catalog_response(
+                    _catalog_hit(source_text, 1.7),
                     _catalog_hit(similar_text, 0.96),
-                    _catalog_hit("below threshold", 0.94),
                 )
             ]
         ],
@@ -223,25 +236,16 @@ def test_summary_reuses_catalog_vector_then_runs_one_count_aggregation():
     assert result["queryEmbeddingSource"] == "semanticCatalog"
     assert result["entities"][0]["exactMatchCount"] == 3
     assert result["entities"][0]["similarMatchCount"] == 4
-    assert result["semanticResultMode"] == "topK"
-    assert result["maxSemanticNeighborsPerEntity"] == 20
     assert len(store.occurrence_bodies) == 2
-    counted_keys = store.occurrence_bodies[1]["query"]["bool"][
-        "filter"
-    ][0]["terms"]["semanticKey"]
-    assert semantic_key("below threshold") not in counted_keys
-    catalog_body = store.msearch_bodies[0][0]
-    vector_query = catalog_body["query"]
+    vector_query = store.msearch_bodies[0][0]["query"]["bool"]["should"][1]
     assert vector_query == {
         "knn": {
             CATALOG_VECTOR_FIELD: {
                 "vector": [0.1, 0.2],
-                "k": CATALOG_NEIGHBOR_LIMIT,
+                "min_score": 0.95,
             }
         }
     }
-    assert catalog_body["size"] == CATALOG_NEIGHBOR_LIMIT
-    assert "aggs" not in catalog_body
     assert "neural" not in str(vector_query)
 
 
@@ -294,9 +298,8 @@ def test_text_search_calls_titan_once_then_loads_occurrences():
         occurrence_responses=[occurrence_response],
         catalog_responses=[
             _catalog_response(
-                _catalog_hit(exact_text, 1.0),
+                _catalog_hit(exact_text, 1.6),
                 _catalog_hit(similar_text, 0.96),
-                _catalog_hit("below threshold", 0.94),
             )
         ],
         single_vector=None,
@@ -312,15 +315,11 @@ def test_text_search_calls_titan_once_then_loads_occurrences():
     assert result["totalMatches"] == 2
     assert result["matches"][0]["matchType"] == "exact"
     assert result["matches"][1]["matchPercentage"] == 92.0
-    searched_keys = store.occurrence_bodies[0]["query"]["bool"][
-        "filter"
-    ][0]["terms"]["semanticKey"]
-    assert semantic_key("below threshold") not in searched_keys
-    catalog_query = store.catalog_bodies[0]["query"]
+    catalog_query = store.catalog_bodies[0]["query"]["bool"]["should"][1]
     assert catalog_query["neural"][CATALOG_VECTOR_FIELD] == {
         "query_text": exact_text,
         "model_id": "model-123",
-        "k": CATALOG_NEIGHBOR_LIMIT,
+        "min_score": 0.95,
     }
     occurrence_query = store.occurrence_bodies[0]["query"]["bool"]
     assert occurrence_query["must_not"] == [
@@ -357,19 +356,19 @@ def test_text_search_reuses_catalog_vector_when_text_already_exists():
     }
     store = FakeStore(
         occurrence_responses=[occurrence_response],
-        catalog_responses=[_catalog_response()],
+        catalog_responses=[_catalog_response(_catalog_hit(text, 1.6))],
         single_vector=[0.1, 0.2],
     )
 
     result = SemanticTextSearchService(store).search_text("A1", text, 90)
 
     assert result["queryEmbeddingSource"] == "semanticCatalog"
-    catalog_query = store.catalog_bodies[0]["query"]
+    catalog_query = store.catalog_bodies[0]["query"]["bool"]["should"][1]
     assert catalog_query == {
         "knn": {
             CATALOG_VECTOR_FIELD: {
                 "vector": [0.1, 0.2],
-                "k": CATALOG_NEIGHBOR_LIMIT,
+                "min_score": 0.95,
             }
         }
     }
