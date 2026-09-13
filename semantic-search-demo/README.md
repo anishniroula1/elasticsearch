@@ -274,8 +274,9 @@ again. Results are in composite `entityId` order, not global match-count order.
 
 For each page the service retrieves up to 100 stored catalog vectors with one
 `ids` search. The request disables `_source` and asks OpenSearch 3.7 for the
-vector through `docvalue_fields` in binary format. The service decodes the
-little-endian float bytes and uses those vectors for `_msearch`. This avoids
+`semanticKey` and vector through `docvalue_fields`, with the vector in binary
+format. The service decodes the little-endian float bytes and uses those
+vectors for `_msearch`. This avoids
 the vector reconstruction and large JSON-array parsing performed by the old
 `mget` `_source` path and does not require reindexing.
 

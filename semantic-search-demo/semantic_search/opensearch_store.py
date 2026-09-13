@@ -429,6 +429,7 @@ class OpenSearchStore:
                     "_source": False,
                     "stored_fields": "_none_",
                     "docvalue_fields": [
+                        "semanticKey",
                         {
                             "field": CATALOG_VECTOR_FIELD,
                             "format": "binary",
@@ -443,7 +444,12 @@ class OpenSearchStore:
                 )
                 if not values:
                     continue
-                vectors[str(document["_id"])] = (
+                semantic_key_values = document.get("fields", {}).get(
+                    "semanticKey",
+                )
+                if not semantic_key_values:
+                    continue
+                vectors[str(semantic_key_values[0])] = (
                     self._decode_binary_vector(values[0])
                 )
 

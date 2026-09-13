@@ -407,6 +407,7 @@ def test_catalog_vectors_use_binary_doc_values_without_source():
                 "_source": False,
                 "stored_fields": "_none_",
                 "docvalue_fields": [
+                    "semanticKey",
                     {
                         "field": "entitySearchTextVector",
                         "format": "binary",
@@ -418,8 +419,8 @@ def test_catalog_vectors_use_binary_doc_values_without_source():
                 "hits": {
                     "hits": [
                         {
-                            "_id": "key-1",
                             "fields": {
+                                "semanticKey": ["key-1"],
                                 "entitySearchTextVector": [encoded_vector]
                             },
                         }
