@@ -9,6 +9,7 @@ from opensearchpy.helpers.errors import BulkIndexError
 from semantic_search.config import config
 from semantic_search.opensearch_store import (
     CATALOG_VECTOR_DIMENSION,
+    CATALOG_VECTOR_ENGINE,
     CATALOG_VECTOR_FIELD,
     CATALOG_VECTOR_SPACE_TYPE,
     OpenSearchStore,
@@ -63,7 +64,7 @@ def test_catalog_mapping_uses_explicit_cosine_vector_and_ingest_pipeline():
         "method": {
             "name": "hnsw",
             "space_type": "cosinesimil",
-            "engine": "lucene",
+            "engine": "faiss",
         },
     }
 
@@ -87,6 +88,7 @@ def test_catalog_mapping_requires_an_ingest_pipeline():
 def _catalog_mapping(
     dimension=CATALOG_VECTOR_DIMENSION,
     space_type=CATALOG_VECTOR_SPACE_TYPE,
+    engine=CATALOG_VECTOR_ENGINE,
 ):
     return {
         config.catalog_index: {
@@ -99,7 +101,7 @@ def _catalog_mapping(
                         "method": {
                             "name": "hnsw",
                             "space_type": space_type,
-                            "engine": "lucene",
+                            "engine": engine,
                         },
                     },
                 }
@@ -174,6 +176,35 @@ def test_store_rejects_non_cosine_catalog_mapping():
     )
 
     with pytest.raises(RuntimeError, match="must be cosinesimil"):
+        store._validate_catalog_mapping()
+
+
+def test_store_rejects_non_faiss_catalog_mapping():
+    class FakeIndices:
+        @staticmethod
+        def get_mapping(index):
+            assert index == config.catalog_index
+            return _catalog_mapping(engine="lucene")
+
+        @staticmethod
+        def get_settings(index, params):
+            assert index == config.catalog_index
+            assert params == {"flat_settings": "true"}
+            return _catalog_settings()
+
+    class FakeClient:
+        indices = FakeIndices()
+
+    store = OpenSearchStore(
+        replace(
+            config,
+            semantic_model_id="opensearch-model-123",
+            ingest_pipeline="titan-pipeline",
+        ),
+        client=FakeClient(),
+    )
+
+    with pytest.raises(RuntimeError, match="engine must be faiss"):
         store._validate_catalog_mapping()
 
 

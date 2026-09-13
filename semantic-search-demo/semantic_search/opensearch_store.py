@@ -22,6 +22,7 @@ SEMANTIC_FIELD = "entitySearchText"
 CATALOG_VECTOR_FIELD = "entitySearchTextVector"
 CATALOG_VECTOR_DIMENSION = 1024
 CATALOG_VECTOR_SPACE_TYPE = "cosinesimil"
+CATALOG_VECTOR_ENGINE = "faiss"
 CATALOG_MAX_ATTEMPTS = 10
 CATALOG_RETRY_DELAY_SECONDS = 5
 RETRYABLE_CATALOG_STATUSES = {408, 429, 500, 502, 503, 504}
@@ -105,7 +106,7 @@ def catalog_index_definition(config: Config) -> dict[str, Any]:
                     "method": {
                         "name": "hnsw",
                         "space_type": CATALOG_VECTOR_SPACE_TYPE,
-                        "engine": "lucene",
+                        "engine": CATALOG_VECTOR_ENGINE,
                     },
                 },
             },
@@ -213,6 +214,13 @@ class OpenSearchStore:
             raise RuntimeError(
                 "Catalog vector space_type must be cosinesimil; found "
                 f"{space_type or 'no space_type'}. Run `make reset`."
+            )
+        engine = vector_field.get("method", {}).get("engine")
+        if engine != CATALOG_VECTOR_ENGINE:
+            raise RuntimeError(
+                "Catalog vector engine must be faiss; found "
+                f"{engine or 'no engine'}. Recreate the catalog or migrate "
+                "it to a new Faiss index."
             )
         self.vector_space_type = CATALOG_VECTOR_SPACE_TYPE
 

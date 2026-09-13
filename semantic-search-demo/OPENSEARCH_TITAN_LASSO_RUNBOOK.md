@@ -384,7 +384,7 @@ PUT /ner_entity_semantic_catalog-v1
         "method": {
           "name": "hnsw",
           "space_type": "cosinesimil",
-          "engine": "lucene"
+          "engine": "faiss"
         }
       }
     }
@@ -598,4 +598,3 @@ then delete in dependency order.
 - [k-NN vector mapping](https://docs.opensearch.org/latest/mappings/supported-field-types/knn-vector/)
 - [Neural query](https://docs.opensearch.org/latest/query-dsl/specialized/neural/)
 - [Titan Text Embeddings V2 parameters](https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-titan-embed-text.html)
-

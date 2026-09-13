@@ -123,7 +123,7 @@ field. The catalog uses an explicit text field and Titan V2 vector field:
   "method": {
     "name": "hnsw",
     "space_type": "cosinesimil",
-    "engine": "lucene"
+    "engine": "faiss"
   }
 }
 ```
@@ -131,6 +131,81 @@ field. The catalog uses an explicit text field and Titan V2 vector field:
 The catalog index sets `index.default_pipeline` to
 `OPENSEARCH_INGEST_PIPELINE`. Cosine similarity is configured on the vector
 field's HNSW method instead of the unsupported `index.knn.space_type` setting.
+The service also validates that an existing catalog uses Faiss, so a Lucene
+catalog cannot silently continue serving after this mapping change.
+
+### Migrating a Lucene catalog to Faiss
+
+The vector engine is fixed when a field is created, so do not try to update the
+existing mapping in place. Create a new physical catalog index with the Faiss
+mapping above, keeping the existing index available until validation and alias
+cutover are complete.
+
+Existing 1,024-dimension vectors can be copied without calling Titan again.
+When reindexing, explicitly set the destination pipeline to `_none`; otherwise
+the destination's `index.default_pipeline` generates every embedding again.
+Confirm that the old index can return its vector before starting:
+
+```json
+GET /ner_entity_semantic_catalog-v1/_search
+{
+  "size": 1,
+  "_source": ["semanticKey", "entitySearchTextVector"]
+}
+```
+
+If `entitySearchTextVector` is absent, the old index cannot supply embeddings
+to `_reindex` and they must be regenerated through the Titan pipeline.
+
+```json
+POST /_reindex?wait_for_completion=false&slices=auto
+{
+  "source": {
+    "index": "ner_entity_semantic_catalog-v1"
+  },
+  "dest": {
+    "index": "ner_entity_semantic_catalog-v2",
+    "pipeline": "_none",
+    "op_type": "create"
+  }
+}
+```
+
+The request returns a task ID. Monitor it with `GET /_tasks/<task-id>`, then
+compare both `_count` responses and test representative threshold searches.
+Pause catalog writes during the final copy and cutover so documents indexed
+after the reindex snapshot are not missed. Warm the completed Faiss index:
+
+```text
+GET /_plugins/_knn/warmup/ner_entity_semantic_catalog-v2?pretty
+```
+
+Atomically move the application alias after validation:
+
+```json
+POST /_aliases
+{
+  "actions": [
+    {
+      "remove": {
+        "index": "ner_entity_semantic_catalog-v1",
+        "alias": "ner_entity_semantic_catalog"
+      }
+    },
+    {
+      "add": {
+        "index": "ner_entity_semantic_catalog-v2",
+        "alias": "ner_entity_semantic_catalog",
+        "is_write_index": true
+      }
+    }
+  ]
+}
+```
+
+Finally set `OPENSEARCH_CATALOG_INDEX=ner_entity_semantic_catalog-v2` in
+`.env` and restart the API. The occurrence index and its alias do not change.
+Keep the old catalog until the new index has been verified in production.
 
 Run:
 

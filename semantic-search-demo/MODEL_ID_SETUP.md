@@ -269,7 +269,7 @@ entitySearchTextVector
 ```
 
 `entitySearchText` must be `text`. `entitySearchTextVector` must be a
-`knn_vector` with dimension `1024`, using the `hnsw` method, the `lucene`
+`knn_vector` with dimension `1024`, using the `hnsw` method, the `faiss`
 engine, and `space_type: cosinesimil`.
 
 Check the flattened index settings:
@@ -287,8 +287,9 @@ index.knn = true
 
 The cosine space is stored in the vector field mapping, not in the index-level
 `index.knn.space_type` setting. The service validates the vector dimension,
-default pipeline, and cosine space at startup. An old 1,536-dimension or
-`semantic`-field catalog must be recreated.
+default pipeline, cosine space, and Faiss engine at startup. An old
+1,536-dimension, Lucene, or `semantic`-field catalog must be recreated or
+migrated to a new index.
 
 Check the occurrence and semantic-catalog document counts:
 
