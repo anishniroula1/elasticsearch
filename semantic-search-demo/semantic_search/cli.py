@@ -1,9 +1,12 @@
 import argparse
 import csv
 import json
+import sqlite3
+import tempfile
 from collections import deque
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -56,7 +59,10 @@ def _record(row: dict[str, str], line_number: int) -> EntityOccurrence:
         raise ValueError(f"Invalid CSV row {line_number}: {error}") from error
 
 
-def _csv_batches(path: Path) -> Iterator[list[EntityOccurrence]]:
+def _csv_batches(
+    path: Path,
+    start_sentence_entity_id: int | None = None,
+) -> Iterator[list[EntityOccurrence]]:
     with path.open(newline="", encoding="utf-8-sig") as input_file:
         reader = csv.DictReader(input_file)
         actual_columns = set(reader.fieldnames or [])
@@ -66,12 +72,87 @@ def _csv_batches(path: Path) -> Iterator[list[EntityOccurrence]]:
 
         batch: list[EntityOccurrence] = []
         for line_number, row in enumerate(reader, start=2):
+            try:
+                sentence_entity_id = int(row["sentenceEntityId"])
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"Invalid CSV row {line_number}: sentenceEntityId must "
+                    "be an integer"
+                ) from error
+            if (
+                start_sentence_entity_id is not None
+                and sentence_entity_id < start_sentence_entity_id
+            ):
+                continue
             batch.append(_record(row, line_number))
             if len(batch) == config.seed_batch_size:
                 yield batch
                 batch = []
         if batch:
             yield batch
+
+
+def _sqlite_batches(
+    connection: sqlite3.Connection,
+) -> Iterator[list[EntityOccurrence]]:
+    cursor = connection.execute(
+        "SELECT payload FROM seed_records "
+        "ORDER BY sentence_entity_id, source_order"
+    )
+    batch = []
+    for (payload,) in cursor:
+        batch.append(EntityOccurrence.model_validate_json(payload))
+        if len(batch) == config.seed_batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+@contextmanager
+def _ordered_csv_batches(
+    path: Path,
+    start_sentence_entity_id: int | None,
+    input_is_ordered: bool,
+) -> Iterator[Iterator[list[EntityOccurrence]]]:
+    if input_is_ordered:
+        yield _csv_batches(path, start_sentence_entity_id)
+        return
+
+    with tempfile.TemporaryDirectory(prefix="semantic-seed-sort-") as directory:
+        database_path = Path(directory) / "records.sqlite3"
+        connection = sqlite3.connect(database_path)
+        try:
+            connection.execute(
+                "CREATE TABLE seed_records ("
+                "sentence_entity_id INTEGER NOT NULL, "
+                "source_order INTEGER NOT NULL, "
+                "payload TEXT NOT NULL)"
+            )
+            source_order = 0
+            for batch in _csv_batches(path, start_sentence_entity_id):
+                rows = []
+                for record in batch:
+                    rows.append(
+                        (
+                            record.sentenceEntityId,
+                            source_order,
+                            record.model_dump_json(),
+                        )
+                    )
+                    source_order += 1
+                connection.executemany(
+                    "INSERT INTO seed_records VALUES (?, ?, ?)",
+                    rows,
+                )
+            connection.execute(
+                "CREATE INDEX seed_records_order "
+                "ON seed_records(sentence_entity_id, source_order)"
+            )
+            connection.commit()
+            yield _sqlite_batches(connection)
+        finally:
+            connection.close()
 
 
 PendingSeedBatch = tuple[
@@ -100,19 +181,36 @@ def _commit_seed_batch(
 def seed_from_csv(
     path: Path,
     target_store: OpenSearchStore | None = None,
+    reset: bool = True,
+    start_sentence_entity_id: int | None = None,
 ) -> dict:
-    """Recreate both indexes and load all validated CSV records."""
+    """Load validated CSV records, optionally recreating both indexes."""
 
     if not path.is_file():
         raise ValueError(f"CSV file does not exist: {path}")
+    if start_sentence_entity_id is not None and start_sentence_entity_id < 1:
+        raise ValueError("sentenceEntityId must be at least 1")
+    if reset and start_sentence_entity_id is not None:
+        raise ValueError(
+            "sentenceEntityId can only be used with reset=false so existing "
+            "records are preserved"
+        )
     target_store = target_store or _default_store()
 
-    # Validate the complete file and deduplicate text before changing indexes.
+    # Validate the selected rows and deduplicate text before changing indexes.
     catalog: dict[str, dict[str, str]] = {}
     records_read = 0
-    for batch in _csv_batches(path):
+    input_is_ordered = True
+    previous_sentence_entity_id = None
+    for batch in _csv_batches(path, start_sentence_entity_id):
         records_read += len(batch)
         for record in batch:
+            if (
+                previous_sentence_entity_id is not None
+                and record.sentenceEntityId < previous_sentence_entity_id
+            ):
+                input_is_ordered = False
+            previous_sentence_entity_id = record.sentenceEntityId
             key = semantic_key(record.entitySearchText)
             catalog.setdefault(
                 key,
@@ -124,53 +222,72 @@ def seed_from_csv(
             )
 
     # Catalog batches run concurrently because OpenSearch must call Titan for
-    # every unique text. Occurrence batches are committed in original CSV order
+    # every unique text. Occurrence batches are committed in ascending ID order
     # only after the catalog documents needed by that batch have succeeded.
-    target_store.recreate_indices()
+    if reset:
+        target_store.recreate_indices()
+        existing_catalog_keys: set[str] = set()
+    else:
+        target_store.ensure_indices()
+        existing_catalog_keys = target_store.existing_catalog_keys(list(catalog))
     unique_semantic_texts = len(catalog)
-    scheduled_keys: set[str] = set()
+    scheduled_keys = set(existing_catalog_keys)
     pending: deque[PendingSeedBatch] = deque()
     indexed = 0
     catalog_indexed = 0
     completed_batches = 0
 
-    with ThreadPoolExecutor(
-        max_workers=config.seed_workers,
-        thread_name_prefix="semantic-catalog-seed",
-    ) as executor:
-        for batch in _csv_batches(path):
-            catalog_sources = []
-            occurrence_sources = []
-            for record in batch:
-                key = semantic_key(record.entitySearchText)
-                if key not in catalog:
-                    raise RuntimeError(
-                        "CSV changed after validation; stop and run the seed "
-                        "again with a stable file."
-                    )
-                if key not in scheduled_keys:
-                    catalog_sources.append(catalog[key])
-                    scheduled_keys.add(key)
+    with _ordered_csv_batches(
+        path,
+        start_sentence_entity_id,
+        input_is_ordered,
+    ) as ordered_batches:
+        with ThreadPoolExecutor(
+            max_workers=config.seed_workers,
+            thread_name_prefix="semantic-catalog-seed",
+        ) as executor:
+            for batch in ordered_batches:
+                catalog_sources = []
+                occurrence_sources = []
+                for record in batch:
+                    key = semantic_key(record.entitySearchText)
+                    if key not in catalog:
+                        raise RuntimeError(
+                            "CSV changed after validation; stop and run the "
+                            "seed again with a stable file."
+                        )
+                    if key not in scheduled_keys:
+                        catalog_sources.append(catalog[key])
+                        scheduled_keys.add(key)
 
-                source = record.model_dump(mode="json")
-                source["semanticKey"] = key
-                occurrence_sources.append(source)
+                    source = record.model_dump(mode="json")
+                    source["semanticKey"] = key
+                    occurrence_sources.append(source)
 
-            catalog_future = executor.submit(
-                target_store.bulk_index_catalog,
-                catalog_sources,
-            )
-            pending.append(
-                (
-                    catalog_future,
-                    occurrence_sources,
-                    len(catalog_sources),
+                catalog_future = executor.submit(
+                    target_store.bulk_index_catalog,
+                    catalog_sources,
                 )
-            )
+                pending.append(
+                    (
+                        catalog_future,
+                        occurrence_sources,
+                        len(catalog_sources),
+                    )
+                )
 
-            # Keep only a small bounded window of work ahead. Completing the
-            # oldest item preserves a contiguous occurrence checkpoint.
-            if len(pending) >= config.seed_workers:
+                # Keep only a small bounded window of work ahead. Completing
+                # the oldest item preserves a contiguous ID checkpoint.
+                if len(pending) >= config.seed_workers:
+                    occurrence_count, catalog_count = _commit_seed_batch(
+                        target_store,
+                        pending.popleft(),
+                    )
+                    indexed += occurrence_count
+                    catalog_indexed += catalog_count
+                    completed_batches += 1
+
+            while pending:
                 occurrence_count, catalog_count = _commit_seed_batch(
                     target_store,
                     pending.popleft(),
@@ -178,15 +295,6 @@ def seed_from_csv(
                 indexed += occurrence_count
                 catalog_indexed += catalog_count
                 completed_batches += 1
-
-        while pending:
-            occurrence_count, catalog_count = _commit_seed_batch(
-                target_store,
-                pending.popleft(),
-            )
-            indexed += occurrence_count
-            catalog_indexed += catalog_count
-            completed_batches += 1
 
     if len(scheduled_keys) != unique_semantic_texts:
         raise RuntimeError(
@@ -198,12 +306,16 @@ def seed_from_csv(
         "recordsRead": records_read,
         "occurrencesIndexed": indexed,
         "catalogDocumentsIndexed": catalog_indexed,
+        "catalogDocumentsReused": len(existing_catalog_keys),
         "uniqueSemanticTexts": unique_semantic_texts,
-        "embeddingsGeneratedByOpenSearch": unique_semantic_texts,
+        "embeddingsGeneratedByOpenSearch": catalog_indexed,
         "completedBatches": completed_batches,
         "seedBatchSize": config.seed_batch_size,
         "seedWorkers": config.seed_workers,
-        "reset": True,
+        "reset": reset,
+        "startSentenceEntityId": start_sentence_entity_id,
+        "inputWasOrderedBySentenceEntityId": input_is_ordered,
+        "recordsSortedBySentenceEntityId": not input_is_ordered,
         "ingestPipeline": config.ingest_pipeline,
         "semanticTextField": "entitySearchText",
         "semanticVectorField": "entitySearchTextVector",
@@ -221,9 +333,22 @@ def main() -> None:
     subparsers.add_parser("reset", help="Delete and recreate the physical index")
     seed_parser = subparsers.add_parser(
         "seed",
-        help="Recreate the index, generate fresh vectors, and load a CSV",
+        help="Load a CSV and optionally recreate both indexes first",
     )
     seed_parser.add_argument("path", type=Path)
+    seed_parser.add_argument(
+        "--reset",
+        type=_as_bool,
+        required=True,
+        metavar="{true,false}",
+        help="true recreates both indexes; false preserves and upserts data",
+    )
+    seed_parser.add_argument(
+        "--sentence-entity-id",
+        type=int,
+        default=None,
+        help="inclusive resume ID; valid only with --reset false",
+    )
     args = parser.parse_args()
 
     store = _default_store()
@@ -235,7 +360,11 @@ def main() -> None:
         store.recreate_indices()
         result = {"message": "Semantic search indexes were recreated"}
     else:
-        result = seed_from_csv(args.path)
+        result = seed_from_csv(
+            args.path,
+            reset=args.reset,
+            start_sentence_entity_id=args.sentence_entity_id,
+        )
     print(json.dumps(result, indent=2))
 
 

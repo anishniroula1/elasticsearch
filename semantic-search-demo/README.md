@@ -76,17 +76,18 @@ can be selected:
 AWS_PROFILE=my-profile make seed
 ```
 
-## Fresh seeding flow
+## Seeding flow
 
 ```text
 CSV
   -> validate all occurrence records
   -> normalize and deduplicate entitySearchText
-  -> recreate occurrence and catalog indexes
-  -> send catalog documents through the configured text_embedding pipeline
+  -> reset=true: recreate both indexes
+  -> reset=false: preserve both indexes and find existing catalog keys
+  -> send only required catalog documents through the text_embedding pipeline
   -> generate catalog embeddings in bounded parallel batches
   -> after each catalog batch succeeds, index its occurrence batch
-  -> commit occurrence batches in original CSV order
+  -> commit occurrence batches in ascending sentenceEntityId order
   -> refresh both indexes once after the seed completes
 ```
 
@@ -136,15 +137,25 @@ make test
 make seed
 ```
 
-The same fresh seed operation is available in Swagger through:
+The same seed operation is available in Swagger through:
 
 ```text
-POST /admin/seed?csvPath=data/seed.csv
+POST /admin/seed?reset=true&csvPath=data/seed.csv
+POST /admin/seed?reset=false&sentenceEntityId=500001&csvPath=data/seed.csv
 ```
 
-`csvPath` may be absolute or relative to the semantic project folder. This is
-an administrative, destructive operation: it validates the complete CSV and
-then recreates both indexes before loading the data and generating embeddings.
+`reset` is required in Swagger. With `reset=true`, the operation validates the
+complete CSV and then recreates both indexes before loading the data. With
+`reset=false`, it preserves both indexes, reuses catalog embeddings that already
+exist, embeds only new semantic texts, and upserts occurrences by
+`sentenceEntityId`. `csvPath` may be absolute or relative to the semantic
+project folder.
+
+`sentenceEntityId` is an optional, inclusive resume point and is accepted only
+with `reset=false`. Rows below it are skipped. Selected rows are always indexed
+in ascending `sentenceEntityId` order. An already ordered CSV continues to
+stream normally; an unordered CSV is sorted in a temporary on-disk SQLite file
+so millions of records are not held in memory.
 
 Use another CSV with:
 
@@ -152,7 +163,17 @@ Use another CSV with:
 make seed SEED_FILE=/absolute/path/entities.csv
 ```
 
-Seeding recreates both indexes, so all vectors are generated fresh.
+`make seed` defaults to `SEED_RESET=true`. Preserve existing data with:
+
+```bash
+make seed SEED_FILE=/absolute/path/entities.csv SEED_RESET=false
+```
+
+Resume from a specific ID with:
+
+```bash
+make seed SEED_RESET=false SEED_SENTENCE_ENTITY_ID=500001
+```
 
 ## Fast semantic-summary flow
 
@@ -256,8 +277,8 @@ DELETE /admin/indexes?confirm=true
 The confirmation parameter prevents an accidental deletion from Swagger. The
 endpoint uses only the exact index and alias names from `.env`; it does not use
 wildcards. After deletion, `GET /stats` reports zero documents. Use
-`POST /admin/init` to recreate empty indexes or `POST /admin/seed` to recreate
-and populate them.
+`POST /admin/init` to recreate empty indexes or `POST /admin/seed?reset=true`
+to recreate and populate them.
 
 Start the application in its AWS runtime with:
 

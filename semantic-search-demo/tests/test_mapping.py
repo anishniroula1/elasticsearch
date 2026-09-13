@@ -365,16 +365,39 @@ def test_catalog_bulk_does_not_retry_permanent_400_errors(monkeypatch):
     assert delays == []
 
 
+def test_existing_catalog_keys_uses_batched_mget_without_sources(monkeypatch):
+    class FakeClient:
+        @staticmethod
+        def mget(index, body, params):
+            assert index == config.catalog_alias
+            assert params == {"_source": "false"}
+            return {
+                "docs": [
+                    {"_id": key, "found": key.endswith("1")}
+                    for key in body["ids"]
+                ]
+            }
+
+    monkeypatch.setattr(
+        "semantic_search.opensearch_store.CATALOG_EXISTENCE_BATCH_SIZE",
+        2,
+    )
+    store = OpenSearchStore(config, client=FakeClient())
+
+    assert store.existing_catalog_keys(["key-1", "key-2", "key-3"]) == {
+        "key-1"
+    }
+
+
 def test_catalog_vectors_uses_mget_source_filter_query_parameter():
     class FakeClient:
         @staticmethod
-        def mget(index, body, _source_includes):
+        def mget(index, body, params):
             assert index == config.catalog_alias
             assert body == {"ids": ["key-1"]}
-            assert _source_includes == [
-                "semanticKey",
-                "entitySearchTextVector",
-            ]
+            assert params == {
+                "_source_includes": "semanticKey,entitySearchTextVector"
+            }
             return {
                 "docs": [
                     {

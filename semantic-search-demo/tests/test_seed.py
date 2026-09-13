@@ -3,7 +3,10 @@ from dataclasses import replace
 from pathlib import Path
 from threading import Barrier, Lock
 
+import pytest
+
 from semantic_search import cli
+from semantic_search.text import semantic_key
 
 
 class FakeSeedStore:
@@ -11,6 +14,8 @@ class FakeSeedStore:
         self.catalog_keys = set()
         self.occurrence_ids = []
         self.refresh_calls = 0
+        self.recreate_calls = 0
+        self.ensure_calls = 0
         self._workers = workers
         self._first_wave = Barrier(workers)
         self._catalog_calls = 0
@@ -19,8 +24,15 @@ class FakeSeedStore:
         self._lock = Lock()
 
     def recreate_indices(self):
+        self.recreate_calls += 1
         self.catalog_keys.clear()
         self.occurrence_ids.clear()
+
+    def ensure_indices(self):
+        self.ensure_calls += 1
+
+    def existing_catalog_keys(self, semantic_keys):
+        return set(semantic_keys) & self.catalog_keys
 
     def bulk_index_catalog(self, sources):
         with self._lock:
@@ -73,4 +85,76 @@ def test_seed_parallelizes_catalog_and_commits_occurrences_in_csv_order(
     assert result["recordsRead"] == len(expected_ids)
     assert result["occurrencesIndexed"] == len(expected_ids)
     assert result["catalogDocumentsIndexed"] == len(target_store.catalog_keys)
+    assert result["catalogDocumentsReused"] == 0
     assert result["seedWorkers"] == workers
+    assert result["reset"] is True
+    assert target_store.recreate_calls == 1
+    assert target_store.ensure_calls == 0
+
+
+def test_seed_without_reset_reuses_catalog_and_upserts_occurrences(monkeypatch):
+    monkeypatch.setattr(
+        cli,
+        "config",
+        replace(cli.config, seed_batch_size=5, seed_workers=1),
+    )
+    seed_path = Path(__file__).resolve().parents[1] / "data/seed.csv"
+    target_store = FakeSeedStore(workers=1)
+    target_store.catalog_keys.add(semantic_key("jack x"))
+
+    result = cli.seed_from_csv(
+        seed_path,
+        target_store=target_store,
+        reset=False,
+    )
+
+    assert result["reset"] is False
+    assert result["catalogDocumentsReused"] == 1
+    assert result["catalogDocumentsIndexed"] == 3
+    assert result["embeddingsGeneratedByOpenSearch"] == 3
+    assert target_store.recreate_calls == 0
+    assert target_store.ensure_calls == 1
+    assert len(target_store.catalog_keys) == 4
+    assert target_store.occurrence_ids == list(range(1, 27))
+
+
+def test_resume_skips_earlier_ids_and_sorts_unordered_csv(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        cli,
+        "config",
+        replace(cli.config, seed_batch_size=3, seed_workers=1),
+    )
+    seed_path = Path(__file__).resolve().parents[1] / "data/seed.csv"
+    unordered_path = tmp_path / "unordered.csv"
+    with seed_path.open(newline="", encoding="utf-8-sig") as input_file:
+        reader = csv.DictReader(input_file)
+        rows = list(reader)
+        fieldnames = reader.fieldnames
+    with unordered_path.open("w", newline="", encoding="utf-8") as output_file:
+        writer = csv.DictWriter(output_file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(reversed(rows))
+
+    target_store = FakeSeedStore(workers=1)
+    result = cli.seed_from_csv(
+        unordered_path,
+        target_store=target_store,
+        reset=False,
+        start_sentence_entity_id=20,
+    )
+
+    assert target_store.occurrence_ids == list(range(20, 27))
+    assert result["recordsRead"] == 7
+    assert result["startSentenceEntityId"] == 20
+    assert result["inputWasOrderedBySentenceEntityId"] is False
+    assert result["recordsSortedBySentenceEntityId"] is True
+
+
+def test_resume_id_requires_reset_false():
+    seed_path = Path(__file__).resolve().parents[1] / "data/seed.csv"
+    with pytest.raises(ValueError, match="only be used with reset=false"):
+        cli.seed_from_csv(
+            seed_path,
+            reset=True,
+            start_sentence_entity_id=10,
+        )

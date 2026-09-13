@@ -152,22 +152,44 @@ def delete_indices(
 
 @router.post("/admin/seed", tags=["Admin"])
 def seed(
+    reset: Annotated[
+        bool,
+        Query(
+            description=(
+                "true recreates both indexes; false preserves existing data "
+                "and only embeds catalog texts that do not already exist."
+            ),
+        ),
+    ],
     csvPath: str = Query(
         default="data/seed.csv",
         min_length=1,
         description=(
-            "Absolute CSV path or a path relative to this project. "
-            "Seeding recreates both indexes."
+            "Absolute CSV path or a path relative to this project."
         ),
     ),
+    sentenceEntityId: Annotated[
+        int | None,
+        Query(
+            ge=1,
+            description=(
+                "Inclusive resume ID. Rows with a smaller sentenceEntityId "
+                "are skipped. Valid only when reset=false."
+            ),
+        ),
+    ] = None,
 ):
-    """Recreate both indexes and generate fresh catalog embeddings."""
+    """Seed with an explicit choice to reset or preserve existing data."""
 
     csv_path = Path(csvPath).expanduser()
     if not csv_path.is_absolute():
         csv_path = PROJECT_ROOT / csv_path
     try:
-        return seed_from_csv(csv_path)
+        return seed_from_csv(
+            csv_path,
+            reset=reset,
+            start_sentence_entity_id=sentenceEntityId,
+        )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     except (OpenSearchException, RuntimeError) as error:

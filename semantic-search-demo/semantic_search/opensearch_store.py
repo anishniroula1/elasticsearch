@@ -22,6 +22,7 @@ CATALOG_VECTOR_SPACE_TYPE = "cosinesimil"
 CATALOG_MAX_ATTEMPTS = 10
 CATALOG_RETRY_DELAY_SECONDS = 5
 RETRYABLE_CATALOG_STATUSES = {408, 429, 500, 502, 503, 504}
+CATALOG_EXISTENCE_BATCH_SIZE = 1_000
 
 logger = logging.getLogger(__name__)
 
@@ -375,6 +376,26 @@ class OpenSearchStore:
         )
         return response["responses"]
 
+    def existing_catalog_keys(self, semantic_keys: list[str]) -> set[str]:
+        """Return catalog IDs that already exist without loading vectors."""
+
+        existing = set()
+        for offset in range(0, len(semantic_keys), CATALOG_EXISTENCE_BATCH_SIZE):
+            key_batch = semantic_keys[
+                offset : offset + CATALOG_EXISTENCE_BATCH_SIZE
+            ]
+            response = self.client.mget(
+                index=self.config.catalog_alias,
+                body={"ids": key_batch},
+                params={"_source": "false"},
+            )
+            existing.update(
+                str(document["_id"])
+                for document in response["docs"]
+                if document.get("found")
+            )
+        return existing
+
     def catalog_vectors(
         self,
         semantic_keys: list[str],
@@ -384,7 +405,11 @@ class OpenSearchStore:
         response = self.client.mget(
             index=self.config.catalog_alias,
             body={"ids": semantic_keys},
-            _source_includes=["semanticKey", CATALOG_VECTOR_FIELD],
+            params={
+                "_source_includes": (
+                    f"semanticKey,{CATALOG_VECTOR_FIELD}"
+                )
+            },
         )
         vectors: dict[str, list[float]] = {}
         for document in response["docs"]:
