@@ -60,7 +60,7 @@ class SemanticSearchService:
 
     def _vector_space_type(self) -> str:
         space_type = self.store.vector_space_type
-        if space_type not in {"cosinesimil", "l2"}:
+        if space_type != "cosinesimil":
             raise RuntimeError(
                 "Semantic catalog vector space is not initialized"
             )
@@ -458,8 +458,8 @@ class SemanticSearchService:
             after_key,
         )
 
-    @staticmethod
     def _catalog_text_body(
+        self,
         text: str,
         source_key: str,
         threshold: int,
@@ -470,8 +470,9 @@ class SemanticSearchService:
             source_key,
             {
                 "neural": {
-                    SEMANTIC_FIELD: {
+                    CATALOG_VECTOR_FIELD: {
                         "query_text": text,
+                        "model_id": self.store.config.semantic_model_id,
                         "min_score": _minimum_opensearch_score(
                             threshold,
                             vector_space_type,
@@ -675,26 +676,19 @@ def _minimum_opensearch_score(
     threshold: int,
     vector_space_type: str = "cosinesimil",
 ) -> float:
+    if vector_space_type != "cosinesimil":
+        raise ValueError(f"Unsupported vector space: {vector_space_type}")
     cosine_threshold = threshold / 100.0
-    if vector_space_type == "cosinesimil":
-        return (1.0 + cosine_threshold) / 2.0
-    if vector_space_type == "l2":
-        # Titan V2 is normalized by default. For unit vectors, squared L2
-        # distance is 2 - (2 * cosine_similarity).
-        return 1.0 / (3.0 - (2.0 * cosine_threshold))
-    raise ValueError(f"Unsupported vector space: {vector_space_type}")
+    return (1.0 + cosine_threshold) / 2.0
 
 
 def _cosine_percentage(
     opensearch_score: float,
     vector_space_type: str = "cosinesimil",
 ) -> float:
-    if vector_space_type == "cosinesimil":
-        cosine_similarity = (2.0 * opensearch_score) - 1.0
-    elif vector_space_type == "l2":
-        cosine_similarity = (3.0 - (1.0 / opensearch_score)) / 2.0
-    else:
+    if vector_space_type != "cosinesimil":
         raise ValueError(f"Unsupported vector space: {vector_space_type}")
+    cosine_similarity = (2.0 * opensearch_score) - 1.0
     cosine_similarity = max(-1.0, min(1.0, cosine_similarity))
     return round(max(0.0, cosine_similarity) * 100.0, 2)
 

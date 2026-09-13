@@ -33,7 +33,9 @@ def health():
         "semanticCatalogIndex": config.catalog_index,
         "semanticCatalogAlias": config.catalog_alias,
         "semanticModelId": config.semantic_model_id,
-        "semanticField": "entitySearchText",
+        "ingestPipeline": config.ingest_pipeline,
+        "semanticTextField": "entitySearchText",
+        "semanticVectorField": "entitySearchTextVector",
         "modelInvoked": False,
     }
     if is_ready:
@@ -113,6 +115,7 @@ def init_indices():
         "occurrenceAlias": config.occurrence_alias,
         "semanticCatalogIndex": config.catalog_index,
         "semanticCatalogAlias": config.catalog_alias,
+        "ingestPipeline": config.ingest_pipeline,
     }
 
 

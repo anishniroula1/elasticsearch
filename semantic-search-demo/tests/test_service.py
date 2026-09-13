@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from semantic_search.models import EntityOccurrence
 from semantic_search.opensearch_store import CATALOG_VECTOR_FIELD
 from semantic_search.service import (
@@ -24,6 +26,7 @@ class FakeStore:
         self.vectors = vectors or {}
         self.single_vector = single_vector
         self.vector_space_type = vector_space_type
+        self.config = SimpleNamespace(semantic_model_id="model-123")
         self.occurrence_bodies = []
         self.catalog_bodies = []
         self.msearch_bodies = []
@@ -138,13 +141,6 @@ def test_90_percent_cosine_threshold_uses_095_opensearch_score():
     assert _cosine_percentage(0.96) == 92.0
 
 
-def test_90_percent_cosine_threshold_supports_normalized_l2_space():
-    score = _minimum_opensearch_score(90, "l2")
-
-    assert round(score, 6) == 0.833333
-    assert _cosine_percentage(score, "l2") == 90.0
-
-
 def test_summary_reuses_catalog_vector_then_runs_one_count_aggregation():
     source_text = "acme corporation"
     source_key = semantic_key(source_text)
@@ -214,6 +210,7 @@ def test_summary_reuses_catalog_vector_then_runs_one_count_aggregation():
     }
     assert "neural" not in str(vector_query)
 
+
 def test_text_search_calls_titan_once_then_loads_occurrences():
     exact_text = "acme corporation"
     similar_text = "acme company"
@@ -281,7 +278,11 @@ def test_text_search_calls_titan_once_then_loads_occurrences():
     assert result["matches"][0]["matchType"] == "exact"
     assert result["matches"][1]["matchPercentage"] == 92.0
     catalog_query = store.catalog_bodies[0]["query"]["bool"]["should"][1]
-    assert catalog_query["neural"]["entitySearchText"]["min_score"] == 0.95
+    assert catalog_query["neural"][CATALOG_VECTOR_FIELD] == {
+        "query_text": exact_text,
+        "model_id": "model-123",
+        "min_score": 0.95,
+    }
     occurrence_query = store.occurrence_bodies[0]["query"]["bool"]
     assert occurrence_query["must_not"] == [
         {"term": {"applicationId": "A1"}}

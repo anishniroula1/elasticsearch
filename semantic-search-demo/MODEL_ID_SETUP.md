@@ -37,8 +37,7 @@ An ID from one AWS domain cannot be used by another domain.
 
 Before creating the integration, confirm the following:
 
-- The target domain runs OpenSearch 3.1 or later. The `semantic` field was
-  introduced in OpenSearch 3.1.
+- The target domain runs OpenSearch 3.7, matching this project.
 - Fine-grained access control is enabled when using the AWS-provided
   CloudFormation integration.
 - Titan Text Embeddings V2 is available in the selected AWS Region.
@@ -55,8 +54,8 @@ Normalize:  true
 Type:       float
 ```
 
-This project expects the OpenSearch model configuration to describe the same
-dimension and vector space used by the connector.
+This project expects 1,024-dimension, normalized embeddings and uses
+`cosinesimil` for its explicit `knn_vector` field.
 
 ## Option A: AWS Console Integration (Recommended)
 
@@ -141,8 +140,8 @@ top-level `_id` of the matching hit:
 }
 ```
 
-Do not use `connector_id`, `model_group_id`, or `task_id` as the semantic-field
-`model_id`.
+Do not use `connector_id`, `model_group_id`, or `task_id` as the project model
+ID.
 
 ### 4. Verify the model
 
@@ -177,7 +176,7 @@ OpenSearch 2.13 and later can automatically deploy an externally hosted model
 on its first prediction, but an explicit deployment check makes setup failures
 easier to diagnose.
 
-### 5. Test the semantic-field inference contract
+### 5. Test the text-embedding inference contract
 
 ```json
 POST /_plugins/_ml/_predict/text_embedding/xhR35JQBLopfJ2xsO9pr
@@ -190,13 +189,42 @@ POST /_plugins/_ml/_predict/text_embedding/xhR35JQBLopfJ2xsO9pr
 
 A successful response contains an inference result with a float embedding. For
 the 1,024-dimension Titan V2 configuration, the output shape should be 1,024.
-This exact test matters: a `semantic` field sends `text_docs`, while Titan
-expects `inputText`. The connector preprocessor must translate between them.
-Testing `/_plugins/_ml/models/<MODEL_ID>/_predict` with an already formed
-`parameters.inputText` body can succeed even when semantic-field ingestion will
-fail.
+This exact test matters: the `text_embedding` processor and `neural` query send
+`text_docs`, while Titan expects `inputText`. The connector preprocessor must
+translate between them. Testing `/_plugins/_ml/models/<MODEL_ID>/_predict` with
+an already formed `parameters.inputText` body can succeed even when pipeline
+ingestion will fail.
 
-### 6. Configure this project
+### 6. Create the ingest pipeline
+
+Create the pipeline once in the same OpenSearch domain. Substitute the
+OpenSearch model ID from Step 3:
+
+```json
+PUT /_ingest/pipeline/my_bedrock_embedding_pipeline
+{
+  "description": "Titan V2 entity text embedding pipeline",
+  "processors": [
+    {
+      "text_embedding": {
+        "model_id": "xhR35JQBLopfJ2xsO9pr",
+        "field_map": {
+          "entitySearchText": "entitySearchTextVector"
+        }
+      }
+    }
+  ]
+}
+```
+
+The names in `field_map` are part of the application contract and must remain
+exactly as shown. Confirm the saved pipeline with:
+
+```text
+GET /_ingest/pipeline/my_bedrock_embedding_pipeline
+```
+
+### 7. Configure this project
 
 From `semantic-search-demo`, edit the included `.env`. If it is missing, copy
 the template first:
@@ -211,6 +239,7 @@ Set the OpenSearch model ID and AWS domain settings:
 AWS_REGION=us-east-1
 OPENSEARCH_HOST=search-my-domain.us-east-1.es.amazonaws.com
 OPENSEARCH_SEMANTIC_MODEL_ID=xhR35JQBLopfJ2xsO9pr
+OPENSEARCH_INGEST_PIPELINE=my_bedrock_embedding_pipeline
 ```
 
 Then run:
@@ -220,10 +249,11 @@ make seed
 ```
 
 During `make seed`, the CSV contains only normal entity fields. The seeder
-deduplicates `entitySearchText`, and OpenSearch generates one embedding per
-unique text in the semantic catalog. Occurrence documents contain no vectors.
+deduplicates `entitySearchText`, and the catalog index's default ingest pipeline
+generates one embedding per unique text. Occurrence documents contain no
+vectors.
 
-### 7. Verify the semantic field and generated vector
+### 8. Verify the generated vector
 
 Check the index mapping:
 
@@ -231,22 +261,32 @@ Check the index mapping:
 GET /ner_entity_semantic_catalog-v1/_mapping
 ```
 
-It should contain both:
+It should contain both explicit fields:
 
 ```text
 entitySearchText
-entitySearchText_semantic_info
+entitySearchTextVector
 ```
 
-`entitySearchText` is the configured `semantic` field. OpenSearch creates
-`entitySearchText_semantic_info`, including the underlying embedding and model
-metadata.
+`entitySearchText` must be `text`. `entitySearchTextVector` must be a
+`knn_vector` with dimension `1024`.
 
-Inspect the generated embedding mapping and note its `space_type`. The project
-supports `cosinesimil` directly and `l2` for normalized Titan V2 embeddings.
-Titan V2 normalization defaults to `true`. The API converts the requested
-cosine-similarity percentage to the correct OpenSearch score for either space.
-Startup fails only for another vector space or a missing `space_type`.
+Check the flattened index settings:
+
+```text
+GET /ner_entity_semantic_catalog-v1/_settings?flat_settings=true
+```
+
+The settings must include:
+
+```text
+index.default_pipeline = my_bedrock_embedding_pipeline
+index.knn.space_type = cosinesimil
+index.knn = true
+```
+
+The service validates the vector dimension, default pipeline, and cosine space
+at startup. An old 1,536-dimension or `semantic`-field catalog must be recreated.
 
 Check the occurrence and semantic-catalog document counts:
 
@@ -361,11 +401,11 @@ POST /_plugins/_ml/connectors/_create
 
 Save the returned `connector_id`.
 
-### 3. Register the model with semantic-field configuration
+### 3. Register the model with text-embedding configuration
 
-The `model_config` is required for a remote model used by a `semantic` field.
-Without it, index creation can fail with `Model config is null for the remote
-model`.
+The `model_config` describes the output used by the `text_embedding` processor
+and `neural` queries. Without it, OpenSearch can fail with `Model config is null
+for the remote model`.
 
 ```json
 POST /_plugins/_ml/models/_register?deploy=true
@@ -385,10 +425,7 @@ POST /_plugins/_ml/models/_register?deploy=true
 }
 ```
 
-`cosinesimil` is recommended for a new manual registration because it directly
-matches the API contract. An existing working Titan V2 registration that
-reports `l2` is also supported and does not need to be recreated, provided its
-embeddings use Titan's default normalization.
+`cosinesimil` is required by this project's percentage-threshold contract.
 
 Depending on the OpenSearch version, the response contains either `model_id`
 directly or a `task_id`. If it returns a task, retrieve it:
@@ -409,8 +446,9 @@ GET  /_plugins/_ml/models/<MODEL_ID>
 POST /_plugins/_ml/_predict/text_embedding/<MODEL_ID>
 ```
 
-Use the `text_docs` request body shown in Option A. Only proceed to `make seed`
-after that prediction succeeds.
+Use the `text_docs` request body shown in Option A. After prediction succeeds,
+create the ingest pipeline from Option A, Step 6, set both IDs in `.env`, and
+only then run `make seed`.
 
 ## Troubleshooting
 
@@ -439,8 +477,8 @@ AWS console integration.
 ### `Some parameter placeholder not filled in payload: inputText`
 
 The model can reach its connector, but the connector is not compatible with
-the input contract used by neural and `semantic` field operations. OpenSearch
-sends this shape:
+the input contract used by `neural` queries and the `text_embedding` processor.
+OpenSearch sends this shape:
 
 ```json
 {
@@ -499,17 +537,18 @@ Check that:
 - Titan V2 is available in the connector's Region.
 - The connector Region, Bedrock endpoint Region, and IAM resource Region agree.
 
-### Semantic field is unknown
+### `text_embedding` processor is unknown
 
-The target domain is older than OpenSearch 3.1. Upgrade it or use the explicit
-ingest-pipeline plus `knn_vector` implementation supported by the older version.
+Confirm the domain version and that the Neural Search/ML Commons components are
+available. This project is built and validated for OpenSearch 3.7.
 
 ## Official references
 
 - [AWS OpenSearch Bedrock integration](https://docs.aws.amazon.com/opensearch-service/latest/developerguide/cfn-template-bedrock.html)
 - [AWS remote-inference CloudFormation setup](https://docs.aws.amazon.com/opensearch-service/latest/developerguide/cfn-template.html)
 - [AWS OpenSearch connectors for AWS services](https://docs.aws.amazon.com/opensearch-service/latest/developerguide/ml-amazon-connector.html)
-- [OpenSearch semantic field](https://docs.opensearch.org/latest/mappings/supported-field-types/semantic/)
+- [OpenSearch Bedrock Titan semantic-search tutorial](https://docs.opensearch.org/latest/tutorials/vector-search/semantic-search/semantic-search-bedrock-titan/)
+- [OpenSearch text-embedding processor](https://docs.opensearch.org/latest/ingest-pipelines/processors/text-embedding/)
 - [OpenSearch text-embedding Predict API](https://docs.opensearch.org/latest/ml-commons-plugin/api/train-predict/predict/)
 - [OpenSearch Search Model API](https://docs.opensearch.org/latest/ml-commons-plugin/api/model-apis/search-model/)
 - [OpenSearch Get Model API](https://docs.opensearch.org/latest/ml-commons-plugin/api/model-apis/get-model/)

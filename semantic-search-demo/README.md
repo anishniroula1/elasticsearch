@@ -1,7 +1,7 @@
 # Fast AWS OpenSearch Entity Semantic Search
 
 This self-contained project targets an IAM-protected Amazon OpenSearch Service
-domain running OpenSearch 3.1 or later and Amazon Titan Text Embeddings V2.
+domain running OpenSearch 3.7 and Amazon Titan Text Embeddings V2.
 
 OpenSearch creates every embedding during seeding. The application never calls
 Bedrock directly and the CSV never contains vectors.
@@ -42,6 +42,7 @@ OPENSEARCH_HOST=search-your-domain.us-east-1.es.amazonaws.com
 OPENSEARCH_PORT=443
 OPENSEARCH_SERVICE=es
 OPENSEARCH_SEMANTIC_MODEL_ID=n17yX5cBsaYnPfyOzmQU
+OPENSEARCH_INGEST_PIPELINE=my_bedrock_embedding_pipeline
 
 OPENSEARCH_INDEX=ner_entity_occurrences-v1
 OPENSEARCH_ALIAS=ner_entity_occurrences
@@ -56,6 +57,15 @@ SEED_WORKERS=4
 
 The model ID is the opaque OpenSearch model ID, not the Bedrock foundation
 model ID `amazon.titan-embed-text-v2:0`.
+
+The ingest pipeline must already exist in OpenSearch and contain a
+`text_embedding` processor with this exact field map:
+
+```json
+"field_map": {
+  "entitySearchText": "entitySearchTextVector"
+}
+```
 
 The standard AWS credential chain is used. An AWS deployment should use its IAM
 role. Set `IAM_ACCESS_ROLE` only when the application must assume a separate
@@ -73,6 +83,7 @@ CSV
   -> validate all occurrence records
   -> normalize and deduplicate entitySearchText
   -> recreate occurrence and catalog indexes
+  -> send catalog documents through the configured text_embedding pipeline
   -> generate catalog embeddings in bounded parallel batches
   -> after each catalog batch succeeds, index its occurrence batch
   -> commit occurrence batches in original CSV order
@@ -84,6 +95,11 @@ concurrently. Start with `4`; reduce it if the Bedrock connector is throttled, o
 increase it carefully up to `16` if the domain and Bedrock quota have capacity.
 `SEED_BATCH_SIZE` controls the documents in each batch.
 
+Each catalog batch gets at most 10 total attempts. Transient proxy, connection,
+HTTP 408/429, and HTTP 5xx failures wait five seconds before retrying. A
+successful attempt resets the counter for the next batch. Permanent 4xx errors,
+including invalid mappings or vector dimensions, stop immediately.
+
 While a seed is running, `GET /stats` shows its durable progress. The
 `occurrenceDocuments` count is the reliable contiguous CSV checkpoint because
 an occurrence batch is written only after its required catalog documents have
@@ -93,14 +109,18 @@ both indexes are explicitly refreshed when seeding completes.
 
 The occurrence mapping preserves the original fields and adds only the internal
 `semanticKey` keyword. Its `entitySearchText` is normal text, not a semantic
-field. Only the catalog mapping contains:
+field. The catalog uses an explicit text field and Titan V2 vector field:
 
 ```json
-"entitySearchText": {
-  "type": "semantic",
-  "model_id": "<OPENSEARCH_SEMANTIC_MODEL_ID>"
+"entitySearchText": {"type": "text"},
+"entitySearchTextVector": {
+  "type": "knn_vector",
+  "dimension": 1024
 }
 ```
+
+The catalog index sets `index.default_pipeline` to
+`OPENSEARCH_INGEST_PIPELINE` and uses `index.knn.space_type: cosinesimil`.
 
 Run:
 
@@ -151,7 +171,7 @@ Example:
   "applicationId": "A000042133",
   "thresholdPercentage": 90,
   "similarityMetric": "cosine",
-  "vectorSpaceType": "l2",
+  "vectorSpaceType": "cosinesimil",
   "queryEmbeddingSource": "semanticCatalog",
   "totalUniqueEntities": 1,
   "entities": [
@@ -180,17 +200,17 @@ GET /applications/{applicationId}/entities/semantic-search?text=acme%20corporati
 ```
 
 If the supplied text already exists in the catalog, the endpoint reuses its
-stored vector. Otherwise, the catalog `semantic` query invokes Titan to embed
-the new query. It then loads matching occurrences in one filtered query.
+stored vector. Otherwise, a `neural` query invokes Titan to embed the new query
+and searches the explicit `entitySearchTextVector` field. It then loads
+matching occurrences in one filtered query.
 
 The response reports the path used as `queryEmbeddingSource`, either
 `semanticCatalog` or `titan`.
 
 An `exact` match has the same normalized semantic key. A `similar` match passes
 the cosine threshold. For `threshold=90`, cosine similarity must be at least
-`0.90`. The OpenSearch minimum score is `0.95` for `cosinesimil`, or
-approximately `0.833333` for normalized Titan vectors using `l2`. Responses
-report the detected mapping as `vectorSpaceType`.
+`0.90`. The OpenSearch minimum score is `0.95` for `cosinesimil`. Responses
+report `cosinesimil` as `vectorSpaceType`.
 
 ## Index statistics and previews
 
@@ -245,7 +265,8 @@ change.
 
 ## References
 
-- [OpenSearch semantic field](https://docs.opensearch.org/latest/mappings/supported-field-types/semantic/)
+- [OpenSearch Titan ingest-pipeline tutorial](https://docs.opensearch.org/latest/tutorials/vector-search/semantic-search/semantic-search-bedrock-titan/)
+- [OpenSearch text embedding processor](https://docs.opensearch.org/latest/ingest-pipelines/processors/text-embedding/)
 - [OpenSearch k-NN query](https://docs.opensearch.org/latest/query-dsl/specialized/k-nn/index/)
 - [OpenSearch Multi-Search API](https://docs.opensearch.org/latest/api-reference/search-apis/multi-search/)
 - [OpenSearch vector spaces](https://docs.opensearch.org/latest/mappings/supported-field-types/knn-spaces/)

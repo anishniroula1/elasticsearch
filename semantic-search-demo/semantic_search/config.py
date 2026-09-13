@@ -47,6 +47,7 @@ class Config:
     aws_region: str
     iam_access_role: str
     semantic_model_id: str
+    ingest_pipeline: str
     occurrence_index: str
     occurrence_alias: str
     catalog_index: str
@@ -76,6 +77,10 @@ class Config:
             semantic_model_id=os.getenv(
                 "OPENSEARCH_SEMANTIC_MODEL_ID",
                 "",
+            ).strip(),
+            ingest_pipeline=os.getenv(
+                "OPENSEARCH_INGEST_PIPELINE",
+                "my_bedrock_embedding_pipeline",
             ).strip(),
             occurrence_index=os.getenv(
                 "OPENSEARCH_INDEX",
@@ -112,6 +117,7 @@ class Config:
             "OPENSEARCH_ALIAS": self.occurrence_alias,
             "OPENSEARCH_CATALOG_INDEX": self.catalog_index,
             "OPENSEARCH_CATALOG_ALIAS": self.catalog_alias,
+            "OPENSEARCH_INGEST_PIPELINE": self.ingest_pipeline,
         }
         missing = [name for name, value in required.items() if not value]
         if missing:

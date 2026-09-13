@@ -1,19 +1,29 @@
 """AWS OpenSearch storage for semantic catalog and entity occurrences."""
 
+import logging
+import threading
 import time
 from typing import Any
 
 from opensearchpy import (
     NotFoundError,
+    TransportError,
     helpers,
 )
+from opensearchpy.helpers.errors import BulkIndexError
 
 from semantic_search.config import Config
 from semantic_search.open_search_client import OpenSearchClient
 
 SEMANTIC_FIELD = "entitySearchText"
-SEMANTIC_INFO_FIELD = f"{SEMANTIC_FIELD}_semantic_info"
-CATALOG_VECTOR_FIELD = f"{SEMANTIC_INFO_FIELD}.embedding"
+CATALOG_VECTOR_FIELD = "entitySearchTextVector"
+CATALOG_VECTOR_DIMENSION = 1024
+CATALOG_VECTOR_SPACE_TYPE = "cosinesimil"
+CATALOG_MAX_ATTEMPTS = 10
+CATALOG_RETRY_DELAY_SECONDS = 5
+RETRYABLE_CATALOG_STATUSES = {408, 429, 500, 502, 503, 504}
+
+logger = logging.getLogger(__name__)
 
 
 def occurrence_index_definition(config: Config) -> dict[str, Any]:
@@ -62,7 +72,7 @@ def occurrence_index_definition(config: Config) -> dict[str, Any]:
 
 
 def catalog_index_definition(config: Config) -> dict[str, Any]:
-    """One semantic document per normalized entity search text."""
+    """One pipeline-embedded vector document per normalized entity text."""
 
     if not config.semantic_model_id:
         raise ValueError(
@@ -70,9 +80,13 @@ def catalog_index_definition(config: Config) -> dict[str, Any]:
             "registered/deployed in OpenSearch, not the Bedrock foundation "
             "model ID."
         )
+    if not config.ingest_pipeline:
+        raise ValueError("OPENSEARCH_INGEST_PIPELINE is required")
     return {
         "settings": {
             "index.knn": True,
+            "index.knn.space_type": CATALOG_VECTOR_SPACE_TYPE,
+            "index.default_pipeline": config.ingest_pipeline,
             "number_of_shards": config.index_shards,
             "number_of_replicas": config.index_replicas,
         },
@@ -81,9 +95,10 @@ def catalog_index_definition(config: Config) -> dict[str, Any]:
             "properties": {
                 "semanticKey": {"type": "keyword"},
                 "normalizedText": {"type": "keyword"},
-                SEMANTIC_FIELD: {
-                    "type": "semantic",
-                    "model_id": config.semantic_model_id,
+                SEMANTIC_FIELD: {"type": "text"},
+                CATALOG_VECTOR_FIELD: {
+                    "type": "knn_vector",
+                    "dimension": CATALOG_VECTOR_DIMENSION,
                 },
             },
         },
@@ -95,6 +110,8 @@ class OpenSearchStore:
         self.config = config
         self.client = client or OpenSearchClient(config).create_client()
         self.vector_space_type: str | None = None
+        self._catalog_backoff_lock = threading.Lock()
+        self._catalog_cooldown_until = 0.0
 
     def wait_until_ready(
         self,
@@ -147,39 +164,50 @@ class OpenSearchStore:
     def _validate_catalog_mapping(self) -> None:
         mapping = self.client.indices.get_mapping(index=self.config.catalog_index)
         properties = mapping[self.config.catalog_index]["mappings"]["properties"]
-        semantic_field = properties.get(SEMANTIC_FIELD, {})
-        if semantic_field.get("type") != "semantic":
+        text_field = properties.get(SEMANTIC_FIELD, {})
+        if text_field.get("type") != "text":
             raise RuntimeError(
-                "Existing catalog entitySearchText is not a semantic field. "
+                "Existing catalog entitySearchText is not a text field. "
                 "Run `make reset`."
             )
-        actual_model_id = semantic_field.get("model_id")
-        if actual_model_id != self.config.semantic_model_id:
+        vector_field = properties.get(CATALOG_VECTOR_FIELD, {})
+        if vector_field.get("type") != "knn_vector":
             raise RuntimeError(
-                "Existing semantic model ID does not match "
-                f"OPENSEARCH_SEMANTIC_MODEL_ID ({actual_model_id} != "
-                f"{self.config.semantic_model_id}). Run `make reset`."
+                f"Existing catalog {CATALOG_VECTOR_FIELD} is not a "
+                "knn_vector. Run `make reset`."
+            )
+        dimension = vector_field.get("dimension")
+        if dimension != CATALOG_VECTOR_DIMENSION:
+            raise RuntimeError(
+                f"Existing catalog vector dimension is {dimension}; expected "
+                f"{CATALOG_VECTOR_DIMENSION}. Run `make reset`."
             )
 
-        embedding = (
-            properties.get(SEMANTIC_INFO_FIELD, {})
-            .get(
-                "properties",
-                {},
-            )
-            .get("embedding", {})
-        )
-        space_type = embedding.get("space_type") or embedding.get(
-            "method",
-            {},
-        ).get("space_type")
-        if space_type not in {"cosinesimil", "l2"}:
+        settings = self.client.indices.get_settings(
+            index=self.config.catalog_index,
+            params={"flat_settings": "true"},
+        )[self.config.catalog_index]["settings"]
+        pipeline = settings.get("index.default_pipeline")
+        if pipeline != self.config.ingest_pipeline:
             raise RuntimeError(
-                "Semantic threshold percentages support registered model "
-                "space_type values cosinesimil and l2; found "
-                f"{space_type or 'no space_type'}."
+                "Existing catalog default pipeline does not match "
+                f"OPENSEARCH_INGEST_PIPELINE ({pipeline} != "
+                f"{self.config.ingest_pipeline}). Run `make reset`."
             )
-        self.vector_space_type = space_type
+        space_type = (
+            vector_field.get("space_type")
+            or vector_field.get(
+                "method",
+                {},
+            ).get("space_type")
+            or settings.get("index.knn.space_type")
+        )
+        if space_type != CATALOG_VECTOR_SPACE_TYPE:
+            raise RuntimeError(
+                "Catalog vector space_type must be cosinesimil; found "
+                f"{space_type or 'no space_type'}. Run `make reset`."
+            )
+        self.vector_space_type = CATALOG_VECTOR_SPACE_TYPE
 
     def recreate_indices(self) -> None:
         catalog_index_definition(self.config)
@@ -213,7 +241,97 @@ class OpenSearchStore:
             }
             for source in sources
         ]
-        self._bulk(actions)
+        self._bulk_catalog_with_retry(actions)
+
+    def _bulk_catalog_with_retry(
+        self,
+        actions: list[dict[str, Any]],
+    ) -> None:
+        if not actions:
+            return
+
+        pending_actions = actions
+        for attempt in range(1, CATALOG_MAX_ATTEMPTS + 1):
+            # If another catalog worker is backing off, do not send another
+            # request through the Lasso proxy until its delay has completed.
+            self._wait_for_catalog_cooldown()
+
+            try:
+                self._bulk(pending_actions)
+                return
+            except (BulkIndexError, TransportError) as error:
+                retry_actions = self._retryable_catalog_actions(
+                    error,
+                    pending_actions,
+                )
+                if retry_actions is None or attempt == CATALOG_MAX_ATTEMPTS:
+                    raise
+                pending_actions = retry_actions
+                logger.warning(
+                    "Catalog batch attempt %s/%s failed; retrying %s "
+                    "document(s) after %s seconds",
+                    attempt,
+                    CATALOG_MAX_ATTEMPTS,
+                    len(pending_actions),
+                    CATALOG_RETRY_DELAY_SECONDS,
+                )
+                self._start_catalog_cooldown()
+
+    def _start_catalog_cooldown(self) -> None:
+        with self._catalog_backoff_lock:
+            self._catalog_cooldown_until = max(
+                self._catalog_cooldown_until,
+                time.monotonic() + CATALOG_RETRY_DELAY_SECONDS,
+            )
+        self._wait_for_catalog_cooldown()
+
+    def _wait_for_catalog_cooldown(self) -> None:
+        while True:
+            with self._catalog_backoff_lock:
+                remaining = self._catalog_cooldown_until - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(remaining)
+
+    @staticmethod
+    def _retryable_catalog_actions(
+        error: BulkIndexError | TransportError,
+        actions: list[dict[str, Any]],
+    ) -> list[dict[str, Any]] | None:
+        if isinstance(error, TransportError):
+            status = error.status_code
+            if status == "N/A":
+                return actions
+            try:
+                status = int(status)
+            except (TypeError, ValueError):
+                return None
+            if status in RETRYABLE_CATALOG_STATUSES:
+                return actions
+            return None
+
+        failed_ids = set()
+        for item in error.errors:
+            details = next(iter(item.values()), {})
+            status = details.get("status")
+            try:
+                status = int(status)
+            except (TypeError, ValueError):
+                return None
+            failed_id = details.get("_id")
+            if status not in RETRYABLE_CATALOG_STATUSES or failed_id is None:
+                return None
+            failed_ids.add(str(failed_id))
+
+        if not failed_ids:
+            return None
+        retry_actions = [
+            action for action in actions if str(action.get("_id")) in failed_ids
+        ]
+        retry_ids = {str(action.get("_id")) for action in retry_actions}
+        if retry_ids != failed_ids:
+            return None
+        return retry_actions
 
     def _bulk(self, actions: list[dict[str, Any]]) -> None:
         if not actions:
@@ -296,7 +414,7 @@ class OpenSearchStore:
     def _catalog_vector_from_source(
         source: dict[str, Any],
     ) -> list[float] | None:
-        return source.get(SEMANTIC_INFO_FIELD, {}).get("embedding")
+        return source.get(CATALOG_VECTOR_FIELD)
 
     def stats(self) -> dict[str, Any]:
         return {

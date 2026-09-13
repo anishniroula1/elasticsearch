@@ -2,9 +2,13 @@ from dataclasses import replace
 
 import pytest
 from opensearchpy import NotFoundError
+from opensearchpy.helpers.errors import BulkIndexError
 
 from semantic_search.config import config
 from semantic_search.opensearch_store import (
+    CATALOG_VECTOR_DIMENSION,
+    CATALOG_VECTOR_FIELD,
+    CATALOG_VECTOR_SPACE_TYPE,
     OpenSearchStore,
     catalog_index_definition,
     occurrence_index_definition,
@@ -29,23 +33,31 @@ def test_occurrence_mapping_has_original_fields_but_no_vector():
     )
 
 
-def test_catalog_mapping_embeds_only_unique_semantic_text_documents():
+def test_catalog_mapping_uses_explicit_cosine_vector_and_ingest_pipeline():
     definition = catalog_index_definition(
-        replace(config, semantic_model_id="opensearch-model-123")
+        replace(
+            config,
+            semantic_model_id="opensearch-model-123",
+            ingest_pipeline="titan-pipeline",
+        )
     )
     properties = definition["mappings"]["properties"]
 
     assert definition["settings"]["index.knn"] is True
+    assert definition["settings"]["index.knn.space_type"] == "cosinesimil"
+    assert definition["settings"]["index.default_pipeline"] == "titan-pipeline"
     assert definition["settings"]["number_of_shards"] == 1
     assert definition["settings"]["number_of_replicas"] == 1
     assert set(properties) == {
         "semanticKey",
         "normalizedText",
         "entitySearchText",
+        "entitySearchTextVector",
     }
-    assert properties["entitySearchText"] == {
-        "type": "semantic",
-        "model_id": "opensearch-model-123",
+    assert properties["entitySearchText"] == {"type": "text"}
+    assert properties["entitySearchTextVector"] == {
+        "type": "knn_vector",
+        "dimension": 1024,
     }
 
 
@@ -54,22 +66,26 @@ def test_catalog_mapping_requires_an_opensearch_model_id():
         catalog_index_definition(replace(config, semantic_model_id=""))
 
 
-def _catalog_mapping(space_type):
+def test_catalog_mapping_requires_an_ingest_pipeline():
+    with pytest.raises(ValueError, match="OPENSEARCH_INGEST_PIPELINE"):
+        catalog_index_definition(
+            replace(
+                config,
+                semantic_model_id="opensearch-model-123",
+                ingest_pipeline="",
+            )
+        )
+
+
+def _catalog_mapping(dimension=CATALOG_VECTOR_DIMENSION):
     return {
         config.catalog_index: {
             "mappings": {
                 "properties": {
-                    "entitySearchText": {
-                        "type": "semantic",
-                        "model_id": "opensearch-model-123",
-                    },
-                    "entitySearchText_semantic_info": {
-                        "properties": {
-                            "embedding": {
-                                "type": "knn_vector",
-                                "method": {"space_type": space_type},
-                            }
-                        }
+                    "entitySearchText": {"type": "text"},
+                    CATALOG_VECTOR_FIELD: {
+                        "type": "knn_vector",
+                        "dimension": dimension,
                     },
                 }
             }
@@ -77,42 +93,92 @@ def _catalog_mapping(space_type):
     }
 
 
-def test_store_accepts_normalized_l2_catalog_mapping():
+def _catalog_settings(
+    pipeline="titan-pipeline",
+    space_type=CATALOG_VECTOR_SPACE_TYPE,
+):
+    return {
+        config.catalog_index: {
+            "settings": {
+                "index.default_pipeline": pipeline,
+                "index.knn.space_type": space_type,
+            }
+        }
+    }
+
+
+def test_store_accepts_pipeline_cosine_catalog_mapping():
     class FakeIndices:
         @staticmethod
         def get_mapping(index):
             assert index == config.catalog_index
-            return _catalog_mapping("l2")
+            return _catalog_mapping()
+
+        @staticmethod
+        def get_settings(index, params):
+            assert index == config.catalog_index
+            assert params == {"flat_settings": "true"}
+            return _catalog_settings()
 
     class FakeClient:
         indices = FakeIndices()
 
     store = OpenSearchStore(
-        replace(config, semantic_model_id="opensearch-model-123"),
+        replace(
+            config,
+            semantic_model_id="opensearch-model-123",
+            ingest_pipeline="titan-pipeline",
+        ),
         client=FakeClient(),
     )
 
     store._validate_catalog_mapping()
 
-    assert store.vector_space_type == "l2"
+    assert store.vector_space_type == "cosinesimil"
 
 
-def test_store_rejects_unsupported_catalog_mapping():
+def test_store_rejects_non_cosine_catalog_mapping():
     class FakeIndices:
         @staticmethod
         def get_mapping(index):
             assert index == config.catalog_index
-            return _catalog_mapping("innerproduct")
+            return _catalog_mapping()
+
+        @staticmethod
+        def get_settings(index, params):
+            assert index == config.catalog_index
+            assert params == {"flat_settings": "true"}
+            return _catalog_settings(space_type="l2")
 
     class FakeClient:
         indices = FakeIndices()
 
     store = OpenSearchStore(
-        replace(config, semantic_model_id="opensearch-model-123"),
+        replace(
+            config,
+            semantic_model_id="opensearch-model-123",
+            ingest_pipeline="titan-pipeline",
+        ),
         client=FakeClient(),
     )
 
-    with pytest.raises(RuntimeError, match="cosinesimil and l2"):
+    with pytest.raises(RuntimeError, match="must be cosinesimil"):
+        store._validate_catalog_mapping()
+
+
+def test_store_rejects_wrong_catalog_vector_dimension():
+    class FakeIndices:
+        @staticmethod
+        def get_mapping(index):
+            assert index == config.catalog_index
+            return _catalog_mapping(dimension=1536)
+
+    class FakeClient:
+        indices = FakeIndices()
+
+    store = OpenSearchStore(config, client=FakeClient())
+
+    with pytest.raises(RuntimeError, match="expected 1024"):
         store._validate_catalog_mapping()
 
 
@@ -186,6 +252,110 @@ def test_bulk_skips_per_batch_refresh_and_refreshes_both_indexes_once(
     )
 
 
+def test_catalog_bulk_retries_only_failed_500_documents(monkeypatch):
+    store = OpenSearchStore(config, client=object())
+    attempted_ids = []
+    delays = []
+    clock = [0.0]
+
+    def fake_bulk(actions):
+        attempted_ids.append([action["_id"] for action in actions])
+        if len(attempted_ids) == 1:
+            raise BulkIndexError(
+                "1 document failed",
+                [
+                    {
+                        "index": {
+                            "_id": "key-2",
+                            "status": 500,
+                            "error": {"type": "status_exception"},
+                        }
+                    }
+                ],
+            )
+
+    monkeypatch.setattr(store, "_bulk", fake_bulk)
+
+    def fake_sleep(seconds):
+        delays.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr("semantic_search.opensearch_store.time.sleep", fake_sleep)
+    monkeypatch.setattr(
+        "semantic_search.opensearch_store.time.monotonic",
+        lambda: clock[0],
+    )
+
+    store.bulk_index_catalog(
+        [
+            {"semanticKey": "key-1", "entitySearchText": "one"},
+            {"semanticKey": "key-2", "entitySearchText": "two"},
+        ]
+    )
+
+    assert attempted_ids == [["key-1", "key-2"], ["key-2"]]
+    assert delays == [5]
+
+
+def test_catalog_bulk_stops_after_ten_transient_failures(monkeypatch):
+    store = OpenSearchStore(config, client=object())
+    attempts = 0
+    delays = []
+    clock = [0.0]
+
+    def always_fail(_):
+        nonlocal attempts
+        attempts += 1
+        raise BulkIndexError(
+            "1 document failed",
+            [{"index": {"_id": "key-1", "status": 500}}],
+        )
+
+    monkeypatch.setattr(store, "_bulk", always_fail)
+
+    def fake_sleep(seconds):
+        delays.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr("semantic_search.opensearch_store.time.sleep", fake_sleep)
+    monkeypatch.setattr(
+        "semantic_search.opensearch_store.time.monotonic",
+        lambda: clock[0],
+    )
+
+    with pytest.raises(BulkIndexError):
+        store.bulk_index_catalog([{"semanticKey": "key-1", "entitySearchText": "one"}])
+
+    assert attempts == 10
+    assert delays == [5] * 9
+
+
+def test_catalog_bulk_does_not_retry_permanent_400_errors(monkeypatch):
+    store = OpenSearchStore(config, client=object())
+    attempts = 0
+    delays = []
+
+    def fail_with_mapping_error(_):
+        nonlocal attempts
+        attempts += 1
+        raise BulkIndexError(
+            "1 document failed",
+            [{"index": {"_id": "key-1", "status": 400}}],
+        )
+
+    monkeypatch.setattr(store, "_bulk", fail_with_mapping_error)
+    monkeypatch.setattr(
+        "semantic_search.opensearch_store.time.sleep",
+        delays.append,
+    )
+
+    with pytest.raises(BulkIndexError):
+        store.bulk_index_catalog([{"semanticKey": "key-1", "entitySearchText": "one"}])
+
+    assert attempts == 1
+    assert delays == []
+
+
 def test_catalog_vectors_uses_mget_source_filter_query_parameter():
     class FakeClient:
         @staticmethod
@@ -194,7 +364,7 @@ def test_catalog_vectors_uses_mget_source_filter_query_parameter():
             assert body == {"ids": ["key-1"]}
             assert _source_includes == [
                 "semanticKey",
-                "entitySearchText_semantic_info.embedding",
+                "entitySearchTextVector",
             ]
             return {
                 "docs": [
@@ -202,7 +372,7 @@ def test_catalog_vectors_uses_mget_source_filter_query_parameter():
                         "found": True,
                         "_source": {
                             "semanticKey": "key-1",
-                            "entitySearchText_semantic_info": {"embedding": [0.1, 0.2]},
+                            "entitySearchTextVector": [0.1, 0.2],
                         },
                     }
                 ]

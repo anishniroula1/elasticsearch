@@ -23,6 +23,7 @@ def test_config_loads_connection_index_and_seed_settings(monkeypatch):
         "AWS_REGION": "us-west-2",
         "IAM_ACCESS_ROLE": "arn:aws:iam::123456789012:role/search",
         "OPENSEARCH_SEMANTIC_MODEL_ID": "model-123",
+        "OPENSEARCH_INGEST_PIPELINE": "titan-pipeline",
         "OPENSEARCH_INDEX": "occurrences-v2",
         "OPENSEARCH_ALIAS": "occurrences",
         "OPENSEARCH_CATALOG_INDEX": "catalog-v2",
@@ -43,6 +44,7 @@ def test_config_loads_connection_index_and_seed_settings(monkeypatch):
     assert loaded.aws_region == "us-west-2"
     assert loaded.iam_access_role == settings["IAM_ACCESS_ROLE"]
     assert loaded.semantic_model_id == "model-123"
+    assert loaded.ingest_pipeline == "titan-pipeline"
     assert loaded.occurrence_index == "occurrences-v2"
     assert loaded.occurrence_alias == "occurrences"
     assert loaded.catalog_index == "catalog-v2"
