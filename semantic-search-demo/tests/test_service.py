@@ -3,6 +3,8 @@ from types import SimpleNamespace
 from semantic_search.models import EntityOccurrence
 from semantic_search.opensearch_store import CATALOG_VECTOR_FIELD
 from semantic_search.search_utils import (
+    UNIQUE_ENTITY_COUNT_PRECISION,
+    SemanticSearchUtilities,
     _cosine_percentage,
     _minimum_opensearch_score,
 )
@@ -134,6 +136,41 @@ def test_source_entity_has_no_precomputed_vector_field():
 
     assert source["entitySearchText"] == "jack x"
     assert not any("embedding" in key.lower() for key in source)
+
+
+def test_first_entity_page_uses_fast_cardinality_total():
+    store = FakeStore(
+        occurrence_responses=[
+            {
+                "aggregations": {
+                    "entities": {"buckets": []},
+                    "totalUniqueEntities": {"value": 42},
+                }
+            }
+        ]
+    )
+
+    entities, after_key, total = (
+        SemanticSearchUtilities(store).application_entity_summary_page(
+            "A1",
+            90,
+            after_key=None,
+            size=100,
+            include_total=True,
+        )
+    )
+
+    assert entities == []
+    assert after_key is None
+    assert total == 42
+    assert store.occurrence_bodies[0]["aggs"][
+        "totalUniqueEntities"
+    ] == {
+        "cardinality": {
+            "field": "entityId",
+            "precision_threshold": UNIQUE_ENTITY_COUNT_PRECISION,
+        }
+    }
 
 
 def test_90_percent_cosine_threshold_uses_095_opensearch_score():

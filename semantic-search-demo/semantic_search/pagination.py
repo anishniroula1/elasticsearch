@@ -5,7 +5,7 @@ import binascii
 import json
 from typing import Any
 
-TOKEN_VERSION = 1
+TOKEN_VERSION = 2
 
 
 def encode_semantic_page_token(
@@ -14,12 +14,11 @@ def encode_semantic_page_token(
     threshold: int,
     after_key: dict[str, Any] | None,
     total_unique_entities: int,
-    total_matching_entities: int,
-    returned_matching_entities: int,
+    returned_entities: int,
 ) -> str | None:
-    """Wrap an OpenSearch after_key and first-page totals for the client."""
+    """Wrap an OpenSearch after_key and paging state for the client."""
 
-    if not after_key or returned_matching_entities >= total_matching_entities:
+    if not after_key:
         return None
     payload = {
         "version": TOKEN_VERSION,
@@ -27,8 +26,7 @@ def encode_semantic_page_token(
         "threshold": threshold,
         "afterKey": after_key,
         "totalUniqueEntities": total_unique_entities,
-        "totalMatchingEntities": total_matching_entities,
-        "returnedMatchingEntities": returned_matching_entities,
+        "returnedEntities": returned_entities,
     }
     serialized = json.dumps(
         payload,
@@ -74,12 +72,7 @@ def decode_semantic_page_token(
     if not isinstance(after_key, dict) or not after_key:
         raise ValueError("Invalid nextToken afterKey")
 
-    integer_fields = (
-        "totalUniqueEntities",
-        "totalMatchingEntities",
-        "returnedMatchingEntities",
-    )
-    for field in integer_fields:
+    for field in ("totalUniqueEntities", "returnedEntities"):
         value = payload.get(field)
         if (
             not isinstance(value, int)
@@ -87,10 +80,5 @@ def decode_semantic_page_token(
             or value < 0
         ):
             raise ValueError(f"Invalid nextToken {field}")
-    if (
-        payload["returnedMatchingEntities"]
-        >= payload["totalMatchingEntities"]
-    ):
-        raise ValueError("nextToken has no remaining results")
 
     return payload

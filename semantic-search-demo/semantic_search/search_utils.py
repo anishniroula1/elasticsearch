@@ -12,8 +12,9 @@ from semantic_search.opensearch_store import (
 ENTITY_PAGE_SIZE = 1_000
 CATALOG_PAGE_SIZE = 1_000
 OCCURRENCE_PAGE_SIZE = 5_000
-MSEARCH_BATCH_SIZE = 50
+MSEARCH_BATCH_SIZE = 100
 TERMS_BATCH_SIZE = 10_000
+UNIQUE_ENTITY_COUNT_PRECISION = 40_000
 
 ENTITY_FIELDS = [
     "entityId",
@@ -93,7 +94,7 @@ class SemanticSearchUtilities:
         entities: list[dict[str, Any]] = []
         after_key = None
         while True:
-            page, after_key = self.application_entity_summary_page(
+            page, after_key, _ = self.application_entity_summary_page(
                 application_id,
                 threshold,
                 after_key=after_key,
@@ -119,18 +120,26 @@ class SemanticSearchUtilities:
         *,
         after_key: dict[str, Any] | None,
         size: int,
-    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        include_total: bool = False,
+    ) -> tuple[
+        list[dict[str, Any]],
+        dict[str, Any] | None,
+        int | None,
+    ]:
         """Summarize one OpenSearch composite-aggregation page."""
 
         if size < 1:
             raise ValueError("Semantic summary page size must be positive")
-        entities, next_after_key = self._application_entities_page(
-            application_id,
-            after_key=after_key,
-            size=size,
+        entities, next_after_key, total_unique_entities = (
+            self._application_entities_page(
+                application_id,
+                after_key=after_key,
+                size=size,
+                include_total=include_total,
+            )
         )
         if not entities:
-            return [], None
+            return [], None, total_unique_entities
 
         semantic_keys = list(
             dict.fromkeys(entity["semanticKey"] for entity in entities)
@@ -168,7 +177,7 @@ class SemanticSearchUtilities:
             )
             entity.pop("semanticKey")
 
-        return entities, next_after_key
+        return entities, next_after_key, total_unique_entities
 
     def _application_entities_page(
         self,
@@ -176,7 +185,12 @@ class SemanticSearchUtilities:
         *,
         after_key: dict[str, Any] | None,
         size: int,
-    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        include_total: bool,
+    ) -> tuple[
+        list[dict[str, Any]],
+        dict[str, Any] | None,
+        int | None,
+    ]:
         composite: dict[str, Any] = {
             "size": size,
             "sources": [
@@ -185,24 +199,36 @@ class SemanticSearchUtilities:
         }
         if after_key:
             composite["after"] = after_key
+
+        aggregations: dict[str, Any] = {
+            "entities": {
+                "composite": composite,
+                "aggs": {
+                    "sample": {
+                        "top_hits": {
+                            "size": 1,
+                            "_source": ENTITY_FIELDS,
+                        }
+                    }
+                },
+            }
+        }
+        if include_total:
+            aggregations["totalUniqueEntities"] = {
+                "cardinality": {
+                    "field": "entityId",
+                    "precision_threshold": (
+                        UNIQUE_ENTITY_COUNT_PRECISION
+                    ),
+                }
+            }
+
         response = self.store.search_occurrences(
             {
                 "size": 0,
                 "track_total_hits": False,
                 "query": {"term": {"applicationId": application_id}},
-                "aggs": {
-                    "entities": {
-                        "composite": composite,
-                        "aggs": {
-                            "sample": {
-                                "top_hits": {
-                                    "size": 1,
-                                    "_source": ENTITY_FIELDS,
-                                }
-                            }
-                        },
-                    }
-                },
+                "aggs": aggregations,
             }
         )
         result = response["aggregations"]["entities"]
@@ -229,7 +255,12 @@ class SemanticSearchUtilities:
         next_after_key = result.get("after_key")
         if len(buckets) < size:
             next_after_key = None
-        return entities, next_after_key
+        total_unique_entities = None
+        if include_total:
+            total_unique_entities = int(
+                response["aggregations"]["totalUniqueEntities"]["value"]
+            )
+        return entities, next_after_key, total_unique_entities
 
     def _stored_vector_matches(
         self,

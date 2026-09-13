@@ -241,7 +241,7 @@ def paginated_application_semantic_matches(
         ),
     ),
 ):
-    """Page through application entities that match outside applications."""
+    """Page through application entities with outside match counts."""
 
     try:
         return paginated_summary_service.application_matches(

@@ -223,16 +223,22 @@ Example:
 Counts are matching occurrence documents outside the supplied application.
 Source locations are omitted from the summary.
 
-## Paginated entities with outside semantic matches
+## Paginated application entities with outside match counts
 
 ```text
 GET /applications/{applicationId}/entities/semantic-matches?threshold=90
 ```
 
-This endpoint returns only application entities whose exact or similar match
-count is greater than zero. The page size is fixed at 100. The first response
-includes the exact `totalMatchingEntities` across all pages, along with
-`totalPages`, so the UI can build its paginator immediately.
+This endpoint pages the application's unique entities in groups of 100. It
+runs semantic matching only for those 100 source entities and returns every
+entity on the page, including entities whose exact and similar match counts
+are both zero. It does not create or use a third index.
+
+The first request calculates `totalUniqueEntities` with an OpenSearch
+cardinality aggregation using the maximum supported precision threshold. The
+value is fast to calculate but, like every OpenSearch cardinality result, is
+an estimate. It is carried in subsequent continuation tokens so later pages
+do not repeat the count.
 
 ```json
 {
@@ -242,12 +248,11 @@ includes the exact `totalMatchingEntities` across all pages, along with
   "vectorSpaceType": "cosinesimil",
   "queryEmbeddingSource": "semanticCatalog",
   "totalUniqueEntities": 237,
-  "totalMatchingEntities": 153,
   "returnedEntities": 100,
   "pagination": {
     "page": 1,
     "pageSize": 100,
-    "totalPages": 2,
+    "totalPages": 3,
     "hasPreviousPage": false,
     "hasNextPage": true
   },
@@ -264,14 +269,16 @@ GET /applications/{applicationId}/entities/semantic-matches?threshold=90&nextTok
 
 The token wraps the `after_key` returned by the OpenSearch composite
 aggregation. It is tied to the application and threshold, and the server uses
-it to resume after the last evaluated entity instead of reading earlier pages
-again.
+it to resume after the last source entity instead of reading earlier pages
+again. Results are in composite `entityId` order, not global match-count order.
 
-Calculating the exact total still requires evaluating every unique entity on
-the first request because semantic matching crosses the occurrence and vector
-catalog indexes. The token improves later requests: they reuse the first-page
-totals and evaluate only enough new entities to fill the next 100 matches. For
-consistent results, do not seed or delete these indexes while paging.
+For each page the service loads up to 100 stored catalog vectors in one
+`mget`, sends up to 100 initial vector searches in one `_msearch`, and then
+aggregates outside-application occurrence counts for the resulting catalog
+keys. Titan is not called for these stored source entities. Extra `_msearch`
+rounds occur only when a source entity has more than one catalog candidate
+page above the threshold. For consistent results, do not seed or delete the
+indexes while paging.
 
 ## Semantic search for one text
 
