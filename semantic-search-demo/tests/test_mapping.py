@@ -60,7 +60,7 @@ def test_catalog_mapping_uses_explicit_cosine_vector_and_ingest_pipeline():
     assert properties["entitySearchText"] == {"type": "text"}
     assert properties["entitySearchTextVector"] == {
         "type": "knn_vector",
-        "dimension": 1024,
+        "dimension": 512,
         "method": {
             "name": "hnsw",
             "space_type": "cosinesimil",
@@ -220,7 +220,7 @@ def test_store_rejects_wrong_catalog_vector_dimension():
 
     store = OpenSearchStore(config, client=FakeClient())
 
-    with pytest.raises(RuntimeError, match="expected 1024"):
+    with pytest.raises(RuntimeError, match="expected 512"):
         store._validate_catalog_mapping()
 
 

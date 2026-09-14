@@ -20,7 +20,7 @@ from semantic_search.open_search_client import OpenSearchClient
 
 SEMANTIC_FIELD = "entitySearchText"
 CATALOG_VECTOR_FIELD = "entitySearchTextVector"
-CATALOG_VECTOR_DIMENSION = 1024
+CATALOG_VECTOR_DIMENSION = 512
 CATALOG_VECTOR_SPACE_TYPE = "cosinesimil"
 CATALOG_VECTOR_ENGINE = "faiss"
 CATALOG_MAX_ATTEMPTS = 10

@@ -5,8 +5,6 @@ export
 
 SEED_FILE ?= data/seed.csv
 SEED_RESET ?= true
-SEED_SENTENCE_ENTITY_ID ?=
-SEED_START_ARG = $(if $(strip $(SEED_SENTENCE_ENTITY_ID)),--sentence-entity-id "$(SEED_SENTENCE_ENTITY_ID)",)
 
 .PHONY: help setup lock test dev init seed reset
 
@@ -36,7 +34,7 @@ init: setup
 
 seed: setup
 	uv run --locked python -m semantic_search.cli seed "$(SEED_FILE)" \
-		--reset "$(SEED_RESET)" $(SEED_START_ARG)
+		--reset "$(SEED_RESET)"
 
 reset: setup
 	uv run --locked python -m semantic_search.cli reset

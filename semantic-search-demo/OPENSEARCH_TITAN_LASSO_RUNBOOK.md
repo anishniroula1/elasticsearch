@@ -8,7 +8,7 @@ OpenSearch document
   -> deployed ML Commons model
   -> standalone Lasso connector
   -> Amazon Bedrock Titan Text Embeddings V2
-  -> 1,024-float embedding
+  -> 512-float embedding
   -> entitySearchTextVector
 ```
 
@@ -148,7 +148,7 @@ POST /_plugins/_ml/connectors/_create
   "protocol": "http",
   "parameters": {
     "model": "amazon.titan-embed-text-v2:0",
-    "dimensions": 1024,
+    "dimensions": 512,
     "normalize": true,
     "embeddingTypes": ["float"]
   },
@@ -204,12 +204,12 @@ POST /_plugins/_ml/models/_register
 {
   "name": "Amazon Titan Text Embeddings V2 through Lasso",
   "function_name": "remote",
-  "description": "Titan V2 normalized 1024-dimensional float embeddings",
+  "description": "Titan V2 normalized 512-dimensional float embeddings",
   "model_group_id": "<MODEL_GROUP_ID>",
   "connector_id": "<CONNECTOR_ID>",
   "model_config": {
     "model_type": "TEXT_EMBEDDING",
-    "embedding_dimension": 1024,
+    "embedding_dimension": 512,
     "framework_type": "SENTENCE_TRANSFORMERS",
     "additional_config": {
       "space_type": "cosinesimil"
@@ -233,7 +233,7 @@ group, or task ID where a model ID is required.
 | Field | Value here | Purpose |
 | --- | --- | --- |
 | `model_type` | `TEXT_EMBEDDING` | Identifies this as a dense text-embedding model |
-| `embedding_dimension` | `1024` | Declares the exact output vector length |
+| `embedding_dimension` | `512` | Declares the exact output vector length |
 | `framework_type` | `SENTENCE_TRANSFORMERS` | Supplies the ML Commons text-embedding interface metadata |
 | `additional_config.space_type` | `cosinesimil` | Makes the model's similarity contract cosine |
 
@@ -241,9 +241,9 @@ The dimension must agree in four places: the Titan request, Titan response,
 OpenSearch `model_config`, and `knn_vector` mapping. A dimension change requires
 a new compatible model configuration and a newly created vector index.
 
-Titan V2 supports 1,024, 512, and 256 dimensions. This project deliberately
-uses 1,024. Do not reduce it only because entity text is short; evaluate search
-quality on representative labeled pairs before choosing a smaller vector.
+Titan V2 supports 1,024, 512, and 256 dimensions. This project uses 512 to
+reduce vector memory, storage, and distance-computation work. Validate search
+quality and recalibrate semantic thresholds on representative labeled pairs.
 
 `normalize: true` produces unit-length embeddings and is appropriate for this
 project's cosine similarity search. `embeddingTypes: ["float"]` selects the
@@ -306,7 +306,7 @@ POST /_plugins/_ml/_predict/text_embedding/<MODEL_ID>
 }
 ```
 
-The result should contain one float embedding with 1,024 values. If the direct
+The result should contain one float embedding with 512 values. If the direct
 test works but this test fails, the connector's preprocessor, postprocessor, or
 model configuration is wrong.
 
@@ -349,7 +349,7 @@ POST /_ingest/pipeline/my_bedrock_embedding_pipeline/_simulate
 ```
 
 The simulated `_source` should include an `entitySearchTextVector` array of
-length 1,024. Start with the processor's default single-item behavior; only add
+length 512. Start with the processor's default single-item behavior; only add
 processor `batch_size` after confirming that the Lasso/Titan path supports the
 resulting load and request contract.
 
@@ -380,7 +380,7 @@ PUT /ner_entity_semantic_catalog-v1
       },
       "entitySearchTextVector": {
         "type": "knn_vector",
-        "dimension": 1024,
+        "dimension": 512,
         "method": {
           "name": "hnsw",
           "space_type": "cosinesimil",
@@ -579,7 +579,7 @@ then delete in dependency order.
 | Connector URL is not trusted | The full Lasso URL does not match `trusted_connector_endpoints_regex`; correct the narrow regex and redeploy the model |
 | `Some parameter placeholder not filled ... inputText` | `${parameters.inputText}` is missing, misspelled, or not populated by `connector.pre_process.bedrock.embedding` |
 | Direct prediction returns a nested raw `response` | Add or correct `connector.post_process.bedrock_v2.embedding.float`, redeploy, and rerun the text-embedding test |
-| `Vector dimension mismatch. Expected: 1536, Given: 1024` | Connector/model/mapping dimensions differ; use 1,024 everywhere and recreate the index whose immutable mapping is wrong |
+| `Vector dimension mismatch` | Connector/model/mapping dimensions differ; use 512 everywhere and recreate the index whose immutable mapping is wrong |
 | Strict mapping rejects `entitySearchtextVector` | Fix the capitalization to `entitySearchTextVector` in both the pipeline and mapping |
 | Model space type is not `cosinesimil` | Register the model with `model_config.additional_config.space_type` set to `cosinesimil` |
 | Lasso returns HTTP 5xx | Lasso or its upstream Bedrock call failed; use bounded retries with backoff, but do not retry mapping or other permanent 4xx errors |

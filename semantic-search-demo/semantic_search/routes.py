@@ -173,16 +173,6 @@ def seed(
             "Absolute CSV path or a path relative to this project."
         ),
     ),
-    sentenceEntityId: Annotated[
-        int | None,
-        Query(
-            ge=1,
-            description=(
-                "Inclusive resume ID. Rows with a smaller sentenceEntityId "
-                "are skipped. Valid only when reset=false."
-            ),
-        ),
-    ] = None,
 ):
     """Seed with an explicit choice to reset or preserve existing data."""
 
@@ -193,7 +183,6 @@ def seed(
         return seed_from_csv(
             csv_path,
             reset=reset,
-            start_sentence_entity_id=sentenceEntityId,
         )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error

@@ -21,7 +21,7 @@ The data is split into two indexes, using these default names:
 | `ner_entity_occurrences-v1` | Every entity occurrence and source location; no vectors |
 | `ner_entity_semantic_catalog-v1` | One semantic document and vector per unique normalized `entitySearchText` |
 
-This avoids putting the same 1,024-dimension vector on every repeated occurrence.
+This avoids putting the same 512-dimension vector on every repeated occurrence.
 If seven million occurrences contain 100,000 unique entity texts, only 100,000
 catalog embeddings and vector graph entries are created.
 
@@ -90,7 +90,7 @@ CSV
   -> send only required catalog documents through the text_embedding pipeline
   -> generate catalog embeddings in bounded parallel batches
   -> after each catalog batch succeeds, index its occurrence batch
-  -> commit occurrence batches in ascending sentenceEntityId order
+  -> preserve the original CSV row order
   -> refresh both indexes once after the seed completes
 ```
 
@@ -119,7 +119,7 @@ field. The catalog uses an explicit text field and Titan V2 vector field:
 "entitySearchText": {"type": "text"},
 "entitySearchTextVector": {
   "type": "knn_vector",
-  "dimension": 1024,
+  "dimension": 512,
   "method": {
     "name": "hnsw",
     "space_type": "cosinesimil",
@@ -134,38 +134,39 @@ field's HNSW method instead of the unsupported `index.knn.space_type` setting.
 The service also validates that an existing catalog uses Faiss, so a Lucene
 catalog cannot silently continue serving after this mapping change.
 
-### Migrating a Lucene catalog to Faiss
+### Migrating an existing catalog to Faiss with 512 dimensions
 
 The vector engine is fixed when a field is created, so do not try to update the
 existing mapping in place. Create a new physical catalog index with the Faiss
 mapping above, keeping the existing index available until validation and alias
 cutover are complete.
 
-Existing 1,024-dimension vectors can be copied without calling Titan again.
-When reindexing, explicitly set the destination pipeline to `_none`; otherwise
-the destination's `index.default_pipeline` generates every embedding again.
-Confirm that the old index can return its vector before starting:
+Existing 1,024-dimension vectors cannot be copied into this 512-dimension
+mapping. Titan must generate a new 512-value embedding from
+`entitySearchText`. Do not set the destination pipeline to `_none` during this
+dimension migration; the destination's `index.default_pipeline` must run.
+Confirm that the old index can return the source text before starting:
 
 ```json
 GET /ner_entity_semantic_catalog-v1/_search
 {
   "size": 1,
-  "_source": ["semanticKey", "entitySearchTextVector"]
+  "_source": ["semanticKey", "normalizedText", "entitySearchText"]
 }
 ```
 
-If `entitySearchTextVector` is absent, the old index cannot supply embeddings
-to `_reindex` and they must be regenerated through the Titan pipeline.
+If `entitySearchText` is absent, the old catalog cannot be re-embedded through
+the Titan pipeline and must be rebuilt from the source CSV.
 
 ```json
 POST /_reindex?wait_for_completion=false&slices=auto
 {
   "source": {
-    "index": "ner_entity_semantic_catalog-v1"
+    "index": "ner_entity_semantic_catalog-v1",
+    "_source": ["semanticKey", "normalizedText", "entitySearchText"]
   },
   "dest": {
     "index": "ner_entity_semantic_catalog-v2",
-    "pipeline": "_none",
     "op_type": "create"
   }
 }
@@ -219,21 +220,16 @@ The same seed operation is available in Swagger through:
 
 ```text
 POST /admin/seed?reset=true&csvPath=data/seed.csv
-POST /admin/seed?reset=false&sentenceEntityId=500001&csvPath=data/seed.csv
+POST /admin/seed?reset=false&csvPath=data/seed.csv
 ```
 
 `reset` is required in Swagger. With `reset=true`, the operation validates the
 complete CSV and then recreates both indexes before loading the data. With
 `reset=false`, it preserves both indexes, reuses catalog embeddings that already
 exist, embeds only new semantic texts, and upserts occurrences by
-`sentenceEntityId`. `csvPath` may be absolute or relative to the semantic
-project folder.
-
-`sentenceEntityId` is an optional, inclusive resume point and is accepted only
-with `reset=false`. Rows below it are skipped. Selected rows are always indexed
-in ascending `sentenceEntityId` order. An already ordered CSV continues to
-stream normally; an unordered CSV is sorted in a temporary on-disk SQLite file
-so millions of records are not held in memory.
+`sentenceEntityId`. In both modes, seeding starts at the first data row and
+processes records in their original CSV order. `csvPath` may be absolute or
+relative to the semantic project folder.
 
 Use another CSV with:
 
@@ -245,12 +241,6 @@ make seed SEED_FILE=/absolute/path/entities.csv
 
 ```bash
 make seed SEED_FILE=/absolute/path/entities.csv SEED_RESET=false
-```
-
-Resume from a specific ID with:
-
-```bash
-make seed SEED_RESET=false SEED_SENTENCE_ENTITY_ID=500001
 ```
 
 ## Fast semantic-summary flow

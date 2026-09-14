@@ -3,8 +3,6 @@ from dataclasses import replace
 from pathlib import Path
 from threading import Barrier, Lock
 
-import pytest
-
 from semantic_search import cli
 from semantic_search.text import semantic_key
 
@@ -60,7 +58,7 @@ class FakeSeedStore:
         self.refresh_calls += 1
 
 
-def test_seed_parallelizes_catalog_and_commits_occurrences_in_csv_order(
+def test_seed_parallelizes_catalog_and_commits_occurrences_in_original_csv_order(
     monkeypatch,
 ):
     workers = 3
@@ -118,7 +116,7 @@ def test_seed_without_reset_reuses_catalog_and_upserts_occurrences(monkeypatch):
     assert target_store.occurrence_ids == list(range(1, 27))
 
 
-def test_resume_skips_earlier_ids_and_sorts_unordered_csv(monkeypatch, tmp_path):
+def test_seed_preserves_unordered_csv_row_order(monkeypatch, tmp_path):
     monkeypatch.setattr(
         cli,
         "config",
@@ -140,21 +138,8 @@ def test_resume_skips_earlier_ids_and_sorts_unordered_csv(monkeypatch, tmp_path)
         unordered_path,
         target_store=target_store,
         reset=False,
-        start_sentence_entity_id=20,
     )
 
-    assert target_store.occurrence_ids == list(range(20, 27))
-    assert result["recordsRead"] == 7
-    assert result["startSentenceEntityId"] == 20
-    assert result["inputWasOrderedBySentenceEntityId"] is False
-    assert result["recordsSortedBySentenceEntityId"] is True
-
-
-def test_resume_id_requires_reset_false():
-    seed_path = Path(__file__).resolve().parents[1] / "data/seed.csv"
-    with pytest.raises(ValueError, match="only be used with reset=false"):
-        cli.seed_from_csv(
-            seed_path,
-            reset=True,
-            start_sentence_entity_id=10,
-        )
+    expected_ids = list(reversed(range(1, 27)))
+    assert target_store.occurrence_ids == expected_ids
+    assert result["recordsRead"] == len(expected_ids)

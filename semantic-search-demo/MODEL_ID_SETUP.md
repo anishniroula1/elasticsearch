@@ -49,12 +49,12 @@ Titan Text Embeddings V2 currently uses this Bedrock model ID and configuration:
 
 ```text
 Model:      amazon.titan-embed-text-v2:0
-Dimensions: 1024 by default; 512 and 256 are also supported
+Dimensions: 512 for this project; 1,024 is the Titan default and 256 is supported
 Normalize:  true
 Type:       float
 ```
 
-This project expects 1,024-dimension, normalized embeddings and uses
+This project expects 512-dimension, normalized embeddings and uses
 `cosinesimil` for its explicit `knn_vector` field.
 
 ## Option A: AWS Console Integration (Recommended)
@@ -188,7 +188,7 @@ POST /_plugins/_ml/_predict/text_embedding/xhR35JQBLopfJ2xsO9pr
 ```
 
 A successful response contains an inference result with a float embedding. For
-the 1,024-dimension Titan V2 configuration, the output shape should be 1,024.
+the 512-dimension Titan V2 configuration, the output shape should be 512.
 This exact test matters: the `text_embedding` processor and `neural` query send
 `text_docs`, while Titan expects `inputText`. The connector preprocessor must
 translate between them. Testing `/_plugins/_ml/models/<MODEL_ID>/_predict` with
@@ -269,7 +269,7 @@ entitySearchTextVector
 ```
 
 `entitySearchText` must be `text`. `entitySearchTextVector` must be a
-`knn_vector` with dimension `1024`, using the `hnsw` method, the `faiss`
+`knn_vector` with dimension `512`, using the `hnsw` method, the `faiss`
 engine, and `space_type: cosinesimil`.
 
 Check the flattened index settings:
@@ -378,7 +378,7 @@ POST /_plugins/_ml/connectors/_create
     "region": "<REGION>",
     "service_name": "bedrock",
     "model": "amazon.titan-embed-text-v2:0",
-    "dimensions": 1024,
+    "dimensions": 512,
     "normalize": true,
     "embeddingTypes": ["float"]
   },
@@ -415,11 +415,11 @@ POST /_plugins/_ml/models/_register?deploy=true
 {
   "name": "Bedrock Titan Text Embeddings V2",
   "function_name": "remote",
-  "description": "Titan V2 1024-dimensional normalized embeddings",
+  "description": "Titan V2 512-dimensional normalized embeddings",
   "connector_id": "<CONNECTOR_ID>",
   "model_config": {
     "model_type": "TEXT_EMBEDDING",
-    "embedding_dimension": 1024,
+    "embedding_dimension": 512,
     "framework_type": "SENTENCE_TRANSFORMERS",
     "additional_config": {
       "space_type": "cosinesimil"
@@ -474,7 +474,7 @@ Search the model registry again and use the matching hit's `_id`.
 ### `Model config is null for the remote model`
 
 The model was registered manually without `model_config`. Register a new model
-with `embedding_dimension: 1024` and the appropriate `space_type`, or use the
+with `embedding_dimension: 512` and the appropriate `space_type`, or use the
 AWS console integration.
 
 ### `Some parameter placeholder not filled in payload: inputText`
