@@ -1,199 +1,201 @@
-# Final OpenSearch Entity Search Performance Report
+# Final Semantic Search Performance Report
 
-**Status:** Final 512-dimensional test completed. Recommended to proceed with
-the OpenSearch semantic-search implementation.
+## Final result
 
-## Executive summary
+The final test passed. We should move forward with OpenSearch semantic search.
 
-The semantic vector implementation produced the best complete result for the
-tested application:
+The test used:
 
-- The same application used in the earlier fuzzy test contained **1,530 unique
-  entities**.
-- The previous RapidFuzz summary required approximately **20–30 seconds**.
-- The new semantic summary returned the result in **less than 5 seconds**.
-- Exact matching remains **under 1 second**.
-- Semantic search finds reordered or meaning-equivalent names that the current
-  Levenshtein implementation misses.
+- The same application used for the old fuzzy-search test
+- 1,530 unique entities
+- A 90% match threshold
+- Amazon Titan Text Embeddings V2
+- 512-dimension vectors
+- The Faiss vector engine
 
-Using the five-second upper bound, semantic search reduced elapsed time by
-approximately **75–83%** compared with the 20–30 second fuzzy summary. It is
-roughly **4–6 times faster** while providing a broader kind of matching.
+Here are the measured times:
 
-This was the final test using 512-dimensional vectors. The result is strong
-enough to approve moving forward with OpenSearch semantic search.
+| Search type | Time |
+| --- | ---: |
+| Exact search | Less than 1 second |
+| Old RapidFuzz summary | About 20–30 seconds |
+| New semantic summary | Less than 5 seconds |
 
-## What was compared
+The semantic summary is about 4–6 times faster than the old RapidFuzz
+summary. It reduced the wait time by about 75–83%.
 
-The comparison uses the same application/document from the previous entity
-matching test.
+This is the final test. It used the final 512-dimension setup. No more
+performance testing is required for this decision.
 
-| Test input | Value |
+## What we tested
+
+| Item | Test value |
 | --- | --- |
-| Previous data set | About 7 million entity-occurrence records |
-| Application used for comparison | `2822082` |
+| Data available during the test | About 7 million occurrence records |
+| Application ID | 2822082 |
 | Unique entities in the application | 1,530 |
 | Match threshold | 90% |
-| Exact key | SHA-256 `semanticKey` created from normalized entity text |
-| Semantic metric | Cosine similarity |
-| Vector model | Amazon Titan Text Embeddings V2 |
-| Tested vector size | 512 dimensions |
+| Embedding model | Amazon Titan Text Embeddings V2 |
+| Vector size | 512 |
 | Vector engine | Faiss HNSW |
+| Vector comparison | Cosine similarity |
 
-The reported semantic timing was measured with the final 512-dimensional
-configuration.
+An occurrence record is one place where an entity was found. One entity can
+have many occurrence records.
 
-## Results side by side
+## Simple comparison
 
-| Capability | Exact search | Previous RapidFuzz summary | Semantic vector summary |
+| Question | Exact search | RapidFuzz | Semantic search |
 | --- | --- | --- | --- |
-| Observed time | Under 1 second | About 20–30 seconds | Under 5 seconds |
-| Scope | Identical normalized text | All 1,530 source entities | All 1,530 source entities |
-| Match rule | Same `semanticKey` | Character-edit similarity | Meaning and context in the embedding |
-| Handles spelling edits | No | Yes | Often; very short text can remain ambiguous |
-| Handles reordered words | No | Poorly with the current Levenshtein scorer | Yes in the tested example |
-| Handles related wording | No | No | Yes |
-| OpenSearch candidate work | Exact keyword lookup | Fuzzy candidate search for every entity | Faiss vector search in batches |
-| Application-side scoring | None | Levenshtein score for every candidate | None; OpenSearch applies cosine threshold |
-| Best use | Deterministic exact counts | Optional lexical fallback | Main similar-entity workflow |
+| How fast was it? | Less than 1 second | About 20–30 seconds | Less than 5 seconds |
+| Does it find the same text? | Yes | Yes | Yes |
+| Does it handle small spelling changes? | No | Yes | Often |
+| Does it handle a different word order? | No | Not well with our current scorer | Yes |
+| Does it understand similar meaning? | No | No | Yes |
+| Where is matching done? | OpenSearch | OpenSearch and Python | OpenSearch |
+| Best use | Exact counts | Optional backup | Main similar-entity search |
 
-Exact search is still the fastest operation, but it answers a smaller question.
-The semantic summary answers both of these questions in one response:
+Exact search is still the fastest option, but it only finds the same normalized
+text. Semantic search finds exact matches and meaning-based matches.
 
-1. How many exact occurrences exist outside the current application?
-2. How many semantically similar occurrences exist outside it?
+## Easy example
 
-## Example that shows the quality improvement
+Input names:
 
-Consider these two entity names:
-
-```text
 Government of United States
+
 United States Government
-```
 
-| Method at a 90% threshold | Result | Reason |
+Output at a 90% threshold:
+
+| Search type | Result | Why |
 | --- | --- | --- |
-| Exact | No match | The normalized strings are different |
-| Current RapidFuzz/Levenshtein | No match | Normalized Levenshtein similarity is approximately 14.81% because most characters moved |
-| Titan semantic vector | Match | The two names express the same organization despite the different word order |
+| Exact search | No match | The words are not in the same order |
+| Our current RapidFuzz search | No match | Moving the words creates a very low character score |
+| Semantic search | Match | Both names have the same meaning |
 
-The previous application uses RapidFuzz's normalized Levenshtein similarity.
-RapidFuzz also has token-aware scorers that would handle some word reordering,
-but token scoring still does not understand meaning. Semantic embeddings cover
-word order, related wording, and many variations through the same search path.
+Our RapidFuzz code uses character changes to calculate the score. Its score for
+this example is about 14.81%, so it fails the 90% threshold.
 
-Semantic search does not guarantee that every typographical error will match,
-especially for acronyms and very short names. Keeping the exact path and
-measuring real false positives and false negatives remains important.
+Semantic search compares meaning. It understands that both names point to the
+same type of organization even though the words moved.
 
-## Why the semantic design performs better
+Semantic search is not perfect. A very short name or acronym can still be hard
+to understand. Exact matching should stay in the application so we always have
+a reliable exact count.
 
-The previous bulk fuzzy summary did expensive work for every source entity:
+## Why semantic search is faster
 
-```text
-1,530 application entities
-  -> OpenSearch fuzzy candidate searches
-  -> candidate text transfer to the API
-  -> local Levenshtein calculation
-  -> threshold filtering and counting
-```
+The old RapidFuzz flow repeated a lot of work for every entity.
 
-The semantic design prepares the expensive representation once during seeding:
+Old flow:
 
-```text
-unique entitySearchText
-  -> Titan embedding once
-  -> one vector in the semantic catalog
-```
+Application with 1,530 entities
+→ Search for possible text matches for every entity
+→ Send those names back to Python
+→ Calculate RapidFuzz scores in Python
+→ Remove results below the threshold
+→ Count the remaining records
 
-At query time it reuses stored vectors:
+The semantic flow creates the vector once during seeding.
 
-```text
-applicationId
-  -> unique entities from occurrence index
-  -> stored vectors from semantic catalog
-  -> Faiss cosine searches in batches of 100
-  -> exact and similar occurrence counts
-```
+Seeding flow:
 
-Titan is not called for `/semantic-summary`. That removes model-network latency
-from the application-summary request. Titan is called during seeding only for a
-new unique text, or for a one-off text query that does not already have a
-catalog vector.
+New unique entity text
+→ Titan creates one vector
+→ OpenSearch saves it in the semantic catalog
 
-## Why two indexes remain the right design
+Search flow:
 
-| Index | Stored data | Performance purpose |
+Application ID
+→ Get its unique entities
+→ Get their saved vectors
+→ Search the catalog with Faiss
+→ Count exact and similar records
+
+The semantic-summary endpoint does not call Titan while the user is waiting.
+It reuses vectors already saved in OpenSearch. Titan is called during seeding
+when a new unique text is added.
+
+Titan may also be called when a user searches for text that is not already in
+the catalog.
+
+## Why we use two indexes
+
+| Index | What it saves | Why we need it |
 | --- | --- | --- |
-| Occurrence index | Every occurrence, application ID, entity ID, offsets and source data | Fast filtering and exact counts |
-| Semantic catalog | One normalized text and vector per unique semantic key | Prevents repeated vectors and keeps the Faiss graph smaller |
+| Occurrence index | Every entity record and its source information | Finds applications, records, locations, and exact counts |
+| Semantic catalog | One text and one vector for each unique name | Avoids saving the same vector many times |
 
-Storing a vector on every occurrence would duplicate the same embedding many
-times. The catalog makes seeding, storage, graph memory, and semantic searches
-depend on unique text count rather than occurrence count.
+Example:
 
-The link between indexes is deterministic: the same normalized text always
-produces the same SHA-256 `semanticKey`.
+If Ethiopian Airlines appears in 10,000 records, the occurrence index keeps
+all 10,000 records. The semantic catalog keeps only one Ethiopian Airlines
+vector.
 
-## Understanding the 90% threshold
+This saves storage and memory. It also keeps the Faiss search graph smaller.
 
-The two 90% values are not the same mathematical measurement:
+Both indexes use semanticKey to connect their records. The same normalized text
+always creates the same SHA-256 semanticKey.
 
-- RapidFuzz 90% means normalized character-edit similarity.
-- Semantic 90% means cosine similarity converted to a percentage.
+## What the 90% threshold means
 
-The API correctly configures `cosinesimil` and converts a requested threshold
-to OpenSearch's minimum score. Still, 90% must be treated as a business setting,
-not a universal truth.
+RapidFuzz 90% and semantic 90% do not mean the same thing.
 
-The final comparison used 90%. This is the selected starting threshold for the
-application. It can be adjusted later through normal production tuning if user
-feedback shows too many missed or incorrect matches.
+- RapidFuzz 90% means the characters are very similar.
+- Semantic 90% means the vectors have at least 90% cosine similarity.
 
-## Effect of using 512 dimensions
+The API changes the requested 90% semantic threshold into the OpenSearch score
+needed by the cosinesimil setting.
 
-The current mapping uses 512 values instead of 1,024. This approximately halves
-the raw vector storage and the numeric work for each distance comparison. The
-complete index will not be exactly half the size because HNSW graph links,
-Lucene metadata, `_source`, and keyword fields still exist.
+We used 90% for the final test. It is a good starting value. It can be changed
+later if real users see too many wrong matches or too many missing matches.
 
-All four places must use 512:
+## Why we use 512 dimensions
 
-1. Titan connector request: `"dimensions": 512`
-2. OpenSearch model configuration: `"embedding_dimension": 512`
-3. Pipeline output
-4. Catalog `knn_vector` mapping: `"dimension": 512`
+Each vector has 512 numbers. The older setup used 1,024 numbers.
 
-Existing 1,024-dimensional vectors cannot be mixed with or copied into the new
-512-dimensional index. Create a new model configuration and catalog, generate
-fresh embeddings, validate them, and then move the alias.
+Using 512 numbers gives us:
 
-## Recommendation
+- About half the raw vector storage
+- Less vector data to move
+- Less calculation during vector comparison
+- Good results for our short entity names
 
-Proceed with the semantic OpenSearch implementation and use this matching
-policy:
+The complete index will not become exactly half the size because OpenSearch
+also saves text, index data, and Faiss graph links.
 
-| Need | Recommended path |
+These four settings must all use 512:
+
+1. Titan connector dimensions
+2. OpenSearch model embedding dimension
+3. Ingest pipeline output
+4. Catalog vector mapping dimension
+
+A 1,024-dimension vector cannot be placed in a 512-dimension field. Old vectors
+must be created again with the 512-dimension model.
+
+## Recommended search setup
+
+| Need | Use this search |
 | --- | --- |
-| Exact occurrence count | `semanticKey`/keyword lookup |
-| Similar entity summary | Stored-vector Faiss search |
-| Search for user-entered text | Titan `neural` query against the catalog |
-| Bulk RapidFuzz summary | Retire from the main application page |
-| Special typo/acronym fallback | Add only if production feedback shows it is needed |
-
-This recommendation is supported by both measured speed and better result
-coverage. Semantic search reduced the full-summary time from 20–30 seconds to
-under 5 seconds and matched the tested reordered government name that the
-current fuzzy scorer rejected.
+| Count the exact same entity text | semanticKey exact search |
+| Find similar entities for an application | Stored-vector Faiss search |
+| Search using text entered by a user | Titan neural text search |
+| Run the full RapidFuzz summary | Remove it from the main application page |
+| Handle special typo or acronym cases | Add a backup only if real results show it is needed |
 
 ## Final decision
 
-The final 512-dimensional test supports moving forward with OpenSearch semantic
-search. No additional performance test is required for the decision documented
-in this report.
+Move forward with OpenSearch semantic search.
 
-The result is materially faster than the previous full RapidFuzz summary,
-retains sub-second exact matching, and adds meaning-based matching that the
-character-edit approach cannot provide. The project can proceed with the
-planned OpenSearch cluster resize and semantic-search rollout.
+The final 512-dimension test shows that:
+
+- Exact search stays under 1 second.
+- The full semantic summary stays under 5 seconds for 1,530 unique entities.
+- The old RapidFuzz summary takes about 20–30 seconds.
+- Semantic search finds meaning-based matches that RapidFuzz misses.
+- The two-index design avoids saving the same vector many times.
+
+The result is fast enough and gives better matches. The project can continue
+with the planned OpenSearch cluster upgrade and semantic-search rollout.
