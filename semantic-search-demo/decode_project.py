@@ -1,5 +1,3 @@
-"""Copy a complete project folder to a new location."""
-
 import shutil
 import sys
 from pathlib import Path

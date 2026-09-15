@@ -18,9 +18,15 @@ def test_client_uses_environment_backed_connection_settings(monkeypatch):
         signer_calls.append((actual_credentials, region, service))
         return "signed-auth"
 
+    def fake_session(**kwargs):
+        return FakeSession()
+
+    def fake_opensearch(**kwargs):
+        return kwargs
+
     monkeypatch.setattr(
         "semantic_search.open_search_client.boto3.Session",
-        lambda **kwargs: FakeSession(),
+        fake_session,
     )
     monkeypatch.setattr(
         "semantic_search.open_search_client.AWSV4SignerAuth",
@@ -28,7 +34,7 @@ def test_client_uses_environment_backed_connection_settings(monkeypatch):
     )
     monkeypatch.setattr(
         "semantic_search.open_search_client.OpenSearch",
-        lambda **kwargs: kwargs,
+        fake_opensearch,
     )
     test_config = replace(
         config,

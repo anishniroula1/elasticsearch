@@ -1,13 +1,9 @@
-"""AWS OpenSearch storage for semantic catalog and entity occurrences."""
-
 import base64
 import binascii
 import logging
 import struct
 import threading
 import time
-from typing import Any
-
 from opensearchpy import (
     NotFoundError,
     TransportError,
@@ -31,8 +27,8 @@ CATALOG_EXISTENCE_BATCH_SIZE = 1_000
 logger = logging.getLogger(__name__)
 
 
-def occurrence_index_definition(config: Config) -> dict[str, Any]:
-    """Original occurrence fields without duplicated vector storage."""
+def occurrence_index_definition(config: Config) -> dict:
+    """Make the mapping for occurrence records that do not store vectors."""
 
     return {
         "settings": {
@@ -76,8 +72,8 @@ def occurrence_index_definition(config: Config) -> dict[str, Any]:
     }
 
 
-def catalog_index_definition(config: Config) -> dict[str, Any]:
-    """One pipeline-embedded vector document per normalized entity text."""
+def catalog_index_definition(config: Config) -> dict:
+    """Make the mapping for one vector per unique entity text."""
 
     if not config.semantic_model_id:
         raise ValueError(
@@ -116,9 +112,11 @@ def catalog_index_definition(config: Config) -> dict[str, Any]:
 
 class OpenSearchStore:
     def __init__(self, config: Config, client=None):
+        """Save the settings and create a client when one is not given."""
+
         self.config = config
         self.client = client or OpenSearchClient(config).create_client()
-        self.vector_space_type: str | None = None
+        self.vector_space_type: str | None = CATALOG_VECTOR_SPACE_TYPE
         self._catalog_backoff_lock = threading.Lock()
         self._catalog_cooldown_until = 0.0
 
@@ -127,6 +125,8 @@ class OpenSearchStore:
         max_attempts: int = 60,
         delay_seconds: int = 2,
     ) -> None:
+        """Keep checking OpenSearch until it is ready or time runs out."""
+
         for _ in range(max_attempts):
             if self.client.ping():
                 return
@@ -134,6 +134,8 @@ class OpenSearchStore:
         raise RuntimeError("OpenSearch did not become ready")
 
     def ensure_indices(self) -> None:
+        """Create the two indexes and aliases when they are missing."""
+
         self._ensure_index(
             self.config.occurrence_index,
             self.config.occurrence_alias,
@@ -144,14 +146,16 @@ class OpenSearchStore:
             self.config.catalog_alias,
             catalog_index_definition(self.config),
         )
-        self._validate_catalog_mapping()
+        self.vector_space_type = CATALOG_VECTOR_SPACE_TYPE
 
     def _ensure_index(
         self,
         physical_index: str,
         alias: str,
-        definition: dict[str, Any],
+        definition: dict,
     ) -> None:
+        """Create one index and connect its alias."""
+
         if not self.client.indices.exists(index=physical_index):
             body = {**definition, "aliases": {alias: {"is_write_index": True}}}
             self.client.indices.create(index=physical_index, body=body)
@@ -170,61 +174,9 @@ class OpenSearchStore:
                 }
             )
 
-    def _validate_catalog_mapping(self) -> None:
-        mapping = self.client.indices.get_mapping(index=self.config.catalog_index)
-        properties = mapping[self.config.catalog_index]["mappings"]["properties"]
-        text_field = properties.get(SEMANTIC_FIELD, {})
-        if text_field.get("type") != "text":
-            raise RuntimeError(
-                "Existing catalog entitySearchText is not a text field. "
-                "Run `make reset`."
-            )
-        vector_field = properties.get(CATALOG_VECTOR_FIELD, {})
-        if vector_field.get("type") != "knn_vector":
-            raise RuntimeError(
-                f"Existing catalog {CATALOG_VECTOR_FIELD} is not a "
-                "knn_vector. Run `make reset`."
-            )
-        dimension = vector_field.get("dimension")
-        if dimension != CATALOG_VECTOR_DIMENSION:
-            raise RuntimeError(
-                f"Existing catalog vector dimension is {dimension}; expected "
-                f"{CATALOG_VECTOR_DIMENSION}. Run `make reset`."
-            )
-
-        settings = self.client.indices.get_settings(
-            index=self.config.catalog_index,
-            params={"flat_settings": "true"},
-        )[self.config.catalog_index]["settings"]
-        pipeline = settings.get("index.default_pipeline")
-        if pipeline != self.config.ingest_pipeline:
-            raise RuntimeError(
-                "Existing catalog default pipeline does not match "
-                f"OPENSEARCH_INGEST_PIPELINE ({pipeline} != "
-                f"{self.config.ingest_pipeline}). Run `make reset`."
-            )
-        space_type = (
-            vector_field.get("space_type")
-            or vector_field.get(
-                "method",
-                {},
-            ).get("space_type")
-        )
-        if space_type != CATALOG_VECTOR_SPACE_TYPE:
-            raise RuntimeError(
-                "Catalog vector space_type must be cosinesimil; found "
-                f"{space_type or 'no space_type'}. Run `make reset`."
-            )
-        engine = vector_field.get("method", {}).get("engine")
-        if engine != CATALOG_VECTOR_ENGINE:
-            raise RuntimeError(
-                "Catalog vector engine must be faiss; found "
-                f"{engine or 'no engine'}. Recreate the catalog or migrate "
-                "it to a new Faiss index."
-            )
-        self.vector_space_type = CATALOG_VECTOR_SPACE_TYPE
-
     def recreate_indices(self) -> None:
+        """Delete both indexes and make them again."""
+
         catalog_index_definition(self.config)
         for index in (
             self.config.catalog_index,
@@ -234,7 +186,9 @@ class OpenSearchStore:
                 self.client.indices.delete(index=index)
         self.ensure_indices()
 
-    def bulk_index_occurrences(self, sources: list[dict[str, Any]]) -> None:
+    def bulk_index_occurrences(self, sources: list) -> None:
+        """Save one group of occurrence records."""
+
         actions = [
             {
                 "_op_type": "index",
@@ -246,7 +200,9 @@ class OpenSearchStore:
         ]
         self._bulk(actions)
 
-    def bulk_index_catalog(self, sources: list[dict[str, Any]]) -> None:
+    def bulk_index_catalog(self, sources: list) -> None:
+        """Save one catalog group and retry temporary failures."""
+
         actions = [
             {
                 "_op_type": "index",
@@ -260,8 +216,10 @@ class OpenSearchStore:
 
     def _bulk_catalog_with_retry(
         self,
-        actions: list[dict[str, Any]],
+        actions: list,
     ) -> None:
+        """Try failed catalog records again, up to ten times."""
+
         if not actions:
             return
 
@@ -293,6 +251,8 @@ class OpenSearchStore:
                 self._start_catalog_cooldown()
 
     def _start_catalog_cooldown(self) -> None:
+        """Start the shared wait time before another try."""
+
         with self._catalog_backoff_lock:
             self._catalog_cooldown_until = max(
                 self._catalog_cooldown_until,
@@ -301,6 +261,8 @@ class OpenSearchStore:
         self._wait_for_catalog_cooldown()
 
     def _wait_for_catalog_cooldown(self) -> None:
+        """Wait until catalog requests can start again."""
+
         while True:
             with self._catalog_backoff_lock:
                 remaining = self._catalog_cooldown_until - time.monotonic()
@@ -311,8 +273,10 @@ class OpenSearchStore:
     @staticmethod
     def _retryable_catalog_actions(
         error: BulkIndexError | TransportError,
-        actions: list[dict[str, Any]],
-    ) -> list[dict[str, Any]] | None:
+        actions: list,
+    ) -> list | None:
+        """Pick the failed records that are safe to try again."""
+
         if isinstance(error, TransportError):
             status = error.status_code
             if status == "N/A":
@@ -348,7 +312,9 @@ class OpenSearchStore:
             return None
         return retry_actions
 
-    def _bulk(self, actions: list[dict[str, Any]]) -> None:
+    def _bulk(self, actions: list) -> None:
+        """Send one group of records to OpenSearch."""
+
         if not actions:
             return
         helpers.bulk(
@@ -359,26 +325,32 @@ class OpenSearchStore:
         )
 
     def refresh_indices(self) -> None:
-        """Make the completed seed immediately visible to searches and counts."""
+        """Make newly seeded records show up in searches right away."""
 
         self.client.indices.refresh(
             index=(f"{self.config.occurrence_alias},{self.config.catalog_alias}")
         )
 
-    def search_occurrences(self, body: dict[str, Any]) -> dict[str, Any]:
+    def search_occurrences(self, body: dict) -> dict:
+        """Search the occurrence index."""
+
         return self.client.search(
             index=self.config.occurrence_alias,
             body=body,
         )
 
-    def search_catalog(self, body: dict[str, Any]) -> dict[str, Any]:
+    def search_catalog(self, body: dict) -> dict:
+        """Search the semantic catalog."""
+
         return self.client.search(index=self.config.catalog_alias, body=body)
 
     def multi_search_catalog(
         self,
-        bodies: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        request: list[dict[str, Any]] = []
+        bodies: list,
+    ) -> list:
+        """Send many catalog searches in one request."""
+
+        request = []
         for body in bodies:
             request.extend(({"index": self.config.catalog_alias}, body))
         response = self.client.msearch(
@@ -387,8 +359,8 @@ class OpenSearchStore:
         )
         return response["responses"]
 
-    def existing_catalog_keys(self, semantic_keys: list[str]) -> set[str]:
-        """Return catalog IDs that already exist without loading vectors."""
+    def existing_catalog_keys(self, semantic_keys: list) -> set:
+        """Find which catalog IDs already exist without loading vectors."""
 
         existing = set()
         for offset in range(
@@ -413,14 +385,20 @@ class OpenSearchStore:
 
     def catalog_vectors(
         self,
-        semantic_keys: list[str],
-    ) -> dict[str, list[float]]:
-        """Load vectors through OpenSearch 3.7 binary doc values."""
+        semantic_keys: list,
+    ) -> dict:
+        """Get saved vectors from OpenSearch without loading full documents.
+
+        Input:
+            ["key-1", "key-2"]
+        Output:
+            {"key-1": [0.12, -0.04, ...]}
+        """
 
         if not semantic_keys:
             return {}
 
-        vectors: dict[str, list[float]] = {}
+        vectors = {}
         for offset in range(
             0,
             len(semantic_keys),
@@ -446,6 +424,8 @@ class OpenSearchStore:
                     "query": {"ids": {"values": key_batch}},
                 },
             )
+            # The keyword doc value identifies each binary vector because
+            # source loading is intentionally disabled for this fast path.
             for document in response["hits"]["hits"]:
                 values = document.get("fields", {}).get(
                     CATALOG_VECTOR_FIELD,
@@ -470,8 +450,8 @@ class OpenSearchStore:
         return vectors
 
     @staticmethod
-    def _decode_binary_vector(encoded_vector: str) -> list[float]:
-        """Decode OpenSearch 3.7 binary vector doc values."""
+    def _decode_binary_vector(encoded_vector: str) -> list:
+        """Change an OpenSearch binary vector back into numbers."""
 
         try:
             vector_bytes = base64.b64decode(
@@ -496,7 +476,9 @@ class OpenSearchStore:
             )
         )
 
-    def catalog_vector(self, semantic_key: str) -> list[float] | None:
+    def catalog_vector(self, semantic_key: str) -> list | None:
+        """Get one catalog vector, or return None when it is missing."""
+
         try:
             result = self.client.get(
                 index=self.config.catalog_alias,
@@ -509,11 +491,15 @@ class OpenSearchStore:
 
     @staticmethod
     def _catalog_vector_from_source(
-        source: dict[str, Any],
-    ) -> list[float] | None:
+        source: dict,
+    ) -> list | None:
+        """Get the vector field from a catalog record."""
+
         return source.get(CATALOG_VECTOR_FIELD)
 
-    def stats(self) -> dict[str, Any]:
+    def stats(self) -> dict:
+        """Get both record counts and the cluster health."""
+
         return {
             "occurrenceDocuments": self._document_count(self.config.occurrence_alias),
             "semanticCatalogDocuments": self._document_count(self.config.catalog_alias),
@@ -521,13 +507,15 @@ class OpenSearchStore:
         }
 
     def _document_count(self, index: str) -> int:
+        """Count index records. Return zero when the index is missing."""
+
         try:
             return self.client.count(index=index)["count"]
         except NotFoundError:
             return 0
 
-    def delete_indices_and_aliases(self) -> dict[str, list[str]]:
-        """Delete both configured aliases and physical indexes."""
+    def delete_indices_and_aliases(self) -> dict:
+        """Delete both indexes and both aliases."""
 
         aliases = (
             self.config.occurrence_alias,
@@ -539,6 +527,8 @@ class OpenSearchStore:
         )
         deleted_aliases = []
         missing_aliases = []
+        # Detach aliases first so the response can report alias and physical
+        # index deletion independently, including partially missing setups.
         for alias in aliases:
             if not self.client.indices.exists_alias(name=alias):
                 missing_aliases.append(alias)
@@ -576,8 +566,8 @@ class OpenSearchStore:
         self,
         index: str,
         size: int = 10,
-    ) -> dict[str, Any]:
-        """Return unfiltered documents and the exact index count."""
+    ) -> dict:
+        """Get sample records and the full record count."""
 
         response = self.client.search(
             index=index,

@@ -94,11 +94,11 @@ The ingest pipeline must already exist in OpenSearch and contain a
 
 The standard AWS credential chain is used. An AWS deployment should use its IAM
 role. Set `IAM_ACCESS_ROLE` only when the application must assume a separate
-OpenSearch access role. For an administration command, an existing CLI profile
-can be selected:
+OpenSearch access role. For local API development, an existing AWS profile can
+be selected:
 
 ```bash
-AWS_PROFILE=my-profile make seed
+AWS_PROFILE=my-profile make dev
 ```
 
 ## Seeding flow
@@ -153,8 +153,9 @@ field. The catalog uses an explicit text field and Titan V2 vector field:
 The catalog index sets `index.default_pipeline` to
 `OPENSEARCH_INGEST_PIPELINE`. Cosine similarity is configured on the vector
 field's HNSW method instead of the unsupported `index.knn.space_type` setting.
-The service also validates that an existing catalog uses Faiss, so a Lucene
-catalog cannot silently continue serving after this mapping change.
+The API creates this mapping when the catalog does not exist. It does not
+inspect or rewrite an existing catalog, so point the alias to a compatible
+512-dimensional Faiss index before starting the API.
 
 ### Migrating an existing catalog to Faiss with 512 dimensions
 
@@ -235,10 +236,10 @@ Run:
 ```bash
 make setup
 make test
-make seed
+make dev
 ```
 
-The same seed operation is available in Swagger through:
+Open Swagger at `http://localhost:8000/docs`, then use:
 
 ```text
 POST /admin/seed?reset=true&csvPath=data/seed.csv
@@ -253,17 +254,8 @@ exist, embeds only new semantic texts, and upserts occurrences by
 processes records in their original CSV order. `csvPath` may be absolute or
 relative to the semantic project folder.
 
-Use another CSV with:
-
-```bash
-make seed SEED_FILE=/absolute/path/entities.csv
-```
-
-`make seed` defaults to `SEED_RESET=true`. Preserve existing data with:
-
-```bash
-make seed SEED_FILE=/absolute/path/entities.csv SEED_RESET=false
-```
+For another CSV, pass its absolute path in `csvPath`. Set `reset=false` to
+preserve existing indexes and reuse catalog embeddings.
 
 ## Fast semantic-summary flow
 
@@ -390,6 +382,30 @@ An `exact` match has the same normalized semantic key. A `similar` match passes
 the cosine threshold. For `threshold=90`, cosine similarity must be at least
 `0.90`. The OpenSearch minimum score is `0.95` for `cosinesimil`. Responses
 report `cosinesimil` as `vectorSpaceType`.
+
+### Paginated text search
+
+Use this endpoint when a text search may return many entities:
+
+```text
+GET /applications/{applicationId}/entities/semantic-search-paginated?text=acme%20corporation&threshold=90
+```
+
+The first request returns the total number of matching entity IDs. It returns
+at most 100 matches and loads source locations only for those 100 entities.
+Use the returned `nextToken` without changing the application ID, text, or
+threshold:
+
+```text
+GET /applications/{applicationId}/entities/semantic-search-paginated?text=acme%20corporation&threshold=90&nextToken=<NEXT_TOKEN>
+```
+
+The response includes `totalMatches`, `returnedMatches`,
+`returnedSourceLocations`, `pagination`, `nextToken`, and `matches`. The total
+is calculated on the first request and carried in the token for later pages.
+OpenSearch counts unique entity IDs for this total. For very large result sets,
+the total can be a small estimate. The cursor follows stable `entityId` order.
+Matches inside each returned page are sorted by match percentage.
 
 ## Index statistics and previews
 

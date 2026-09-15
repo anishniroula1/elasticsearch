@@ -248,13 +248,9 @@ OPENSEARCH_SEMANTIC_MODEL_ID=xhR35JQBLopfJ2xsO9pr
 OPENSEARCH_INGEST_PIPELINE=my_bedrock_embedding_pipeline
 ```
 
-Then run:
-
-```bash
-make seed
-```
-
-During `make seed`, the CSV contains only normal entity fields. The seeder
+Start the API with `make dev`, open `http://localhost:8000/docs`, and call
+`POST /admin/seed` with the required `reset` and `csvPath` query parameters.
+During API seeding, the CSV contains only normal entity fields. The seeder
 deduplicates `entitySearchText`, and the catalog index's default ingest pipeline
 generates one embedding per unique text. Occurrence documents contain no
 vectors.
@@ -292,10 +288,11 @@ index.knn = true
 ```
 
 The cosine space is stored in the vector field mapping, not in the index-level
-`index.knn.space_type` setting. The service validates the vector dimension,
-default pipeline, cosine space, and Faiss engine at startup. An old
-1,536-dimension, Lucene, or `semantic`-field catalog must be recreated or
-migrated to a new index.
+`index.knn.space_type` setting. The API does not inspect an existing mapping at
+startup. Verify the vector dimension, default pipeline, cosine space, and Faiss
+engine with the mapping and settings requests above. An old 1,536-dimension,
+Lucene, or `semantic`-field catalog must be recreated or migrated to a new
+index.
 
 Check the occurrence and semantic-catalog document counts:
 
@@ -457,7 +454,7 @@ POST /_plugins/_ml/_predict/text_embedding/<MODEL_ID>
 
 Use the `text_docs` request body shown in Option A. After prediction succeeds,
 create the ingest pipeline from Option A, Step 6, set both IDs in `.env`, and
-only then run `make seed`.
+only then start the API and call `POST /admin/seed` from Swagger.
 
 ## Troubleshooting
 

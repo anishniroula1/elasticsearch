@@ -5,7 +5,6 @@ from typing import Annotated
 from fastapi import APIRouter, HTTPException, Query
 from opensearchpy.exceptions import OpenSearchException
 
-from semantic_search.cli import seed_from_csv
 from semantic_search.components import (
     paginated_summary_service,
     store,
@@ -13,6 +12,7 @@ from semantic_search.components import (
     text_search_service,
 )
 from semantic_search.config import config
+from semantic_search.seed_service import seed_from_csv
 
 router = APIRouter()
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -25,7 +25,7 @@ class IndexSelection(StrEnum):
 
 @router.get("/health", tags=["System"])
 def health():
-    """Check OpenSearch without running model inference."""
+    """Check if OpenSearch is working. This does not call Titan."""
 
     is_ready = store.client.ping()
     response = {
@@ -50,7 +50,7 @@ def health():
 
 @router.get("/stats", tags=["System"])
 def stats():
-    """Get the record counts for both semantic-search indexes."""
+    """Count the records in both indexes."""
 
     try:
         return {
@@ -82,7 +82,7 @@ def index_documents(
         ),
     ] = 10,
 ):
-    """Return unfiltered documents from the selected index."""
+    """Show sample records from the selected index."""
 
     physical_index = (
         config.occurrence_index
@@ -105,7 +105,7 @@ def index_documents(
 
 @router.post("/admin/init", tags=["Admin"])
 def init_indices():
-    """Create the two indexes and aliases when they do not exist."""
+    """Create both indexes and aliases when they are missing."""
 
     try:
         store.ensure_indices()
@@ -135,7 +135,7 @@ def delete_indices(
         ),
     ] = False,
 ):
-    """Permanently delete both semantic-search indexes and aliases."""
+    """Delete both indexes, their records, and their aliases."""
 
     if not confirm:
         raise HTTPException(
@@ -174,7 +174,7 @@ def seed(
         ),
     ),
 ):
-    """Seed with an explicit choice to reset or preserve existing data."""
+    """Load a CSV and choose whether to replace the old data."""
 
     csv_path = Path(csvPath).expanduser()
     if not csv_path.is_absolute():
@@ -182,6 +182,7 @@ def seed(
     try:
         return seed_from_csv(
             csv_path,
+            target_store=store,
             reset=reset,
         )
     except ValueError as error:
@@ -201,7 +202,7 @@ def application_semantic_summary(
     application_id: str,
     threshold: int = Query(default=90, ge=1, le=100),
 ):
-    """Get application entities with exact and semantic match counts."""
+    """Get all application entities and their match counts."""
 
     try:
         return summary_service.application_summary(
@@ -225,12 +226,12 @@ def paginated_application_semantic_matches(
     nextToken: str | None = Query(
         default=None,
         description=(
-            "Opaque OpenSearch continuation token returned by the previous "
-            "page. Omit it for the first page."
+            "Use the nextToken from the last response. Leave it empty for "
+            "the first page."
         ),
     ),
 ):
-    """Page through application entities with outside match counts."""
+    """Get 100 application entities and their match counts at a time."""
 
     try:
         return paginated_summary_service.application_matches(
@@ -256,7 +257,7 @@ def semantic_entity_text_search(
     text: str = Query(min_length=2),
     threshold: int = Query(default=90, ge=1, le=100),
 ):
-    """Find exact and semantic text matches outside the application."""
+    """Find all text matches outside the current application."""
 
     try:
         return text_search_service.search_text(
@@ -264,6 +265,37 @@ def semantic_entity_text_search(
             text,
             threshold,
         )
+    except (OpenSearchException, RuntimeError) as error:
+        raise HTTPException(
+            status_code=503,
+            detail=f"OpenSearch search failed: {error}",
+        ) from error
+
+
+@router.get(
+    "/applications/{application_id}/entities/semantic-search-paginated",
+    tags=["Semantic search"],
+)
+def paginated_semantic_entity_text_search(
+    application_id: str,
+    text: str = Query(min_length=2),
+    threshold: int = Query(default=90, ge=1, le=100),
+    nextToken: str | None = Query(
+        default=None,
+        description="Use the nextToken from the last response.",
+    ),
+):
+    """Return up to 100 text matches at a time."""
+
+    try:
+        return text_search_service.search_text_page(
+            application_id,
+            text,
+            threshold,
+            nextToken,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
     except (OpenSearchException, RuntimeError) as error:
         raise HTTPException(
             status_code=503,

@@ -9,13 +9,13 @@ from semantic_search.config import Config
 
 
 class OpenSearchClient:
-    """Create an IAM-authenticated Amazon OpenSearch Service client."""
-
     def __init__(self, config: Config):
+        """Save the OpenSearch and AWS settings."""
+
         self.config = config
 
     def create_client(self):
-        """Use the standard AWS credential chain and SigV4 authentication."""
+        """Create an OpenSearch client using the available AWS login."""
 
         if not self.config.opensearch_host:
             raise ValueError("OPENSEARCH_HOST is required")
@@ -48,7 +48,7 @@ class OpenSearchClient:
         )
 
     def _session(self) -> boto3.Session:
-        """Optionally assume the configured OpenSearch access role."""
+        """Use the current AWS login or assume the configured role."""
 
         base_session = boto3.Session(region_name=self.config.aws_region)
         if not self.config.iam_access_role:

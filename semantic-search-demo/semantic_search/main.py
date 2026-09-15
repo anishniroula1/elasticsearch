@@ -9,6 +9,8 @@ from semantic_search.routes import router
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    """Wait for OpenSearch and prepare both indexes when the API starts."""
+
     store.wait_until_ready()
     store.ensure_indices()
     yield
@@ -23,5 +25,8 @@ app = FastAPI(
     ),
     lifespan=lifespan,
 )
+# Summary and search responses can contain hundreds of repeated field names.
+# Compressing responses over 1 KB reduces transfer time without affecting the
+# smaller health and administration responses.
 app.add_middleware(GZipMiddleware, minimum_size=1_000, compresslevel=5)
 app.include_router(router)

@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from semantic_search.paginated_summary_service import (
+from semantic_search.summary_service import (
     SEMANTIC_MATCH_PAGE_SIZE,
     PaginatedSemanticSummaryService,
 )
@@ -46,8 +46,8 @@ def _install_composite_pages(monkeypatch, service, entities, calls):
         return page, next_after_key, total
 
     monkeypatch.setattr(
-        service.utils,
-        "application_entity_summary_page",
+        service.summary,
+        "application_summary_page",
         summary_page,
     )
 

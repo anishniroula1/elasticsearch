@@ -3,7 +3,7 @@ from dataclasses import replace
 from pathlib import Path
 from threading import Barrier, Lock
 
-from semantic_search import cli
+from semantic_search import seed_service
 from semantic_search.text import semantic_key
 
 
@@ -63,14 +63,21 @@ def test_seed_parallelizes_catalog_and_commits_occurrences_in_original_csv_order
 ):
     workers = 3
     monkeypatch.setattr(
-        cli,
+        seed_service,
         "config",
-        replace(cli.config, seed_batch_size=5, seed_workers=workers),
+        replace(
+            seed_service.config,
+            seed_batch_size=5,
+            seed_workers=workers,
+        ),
     )
     seed_path = Path(__file__).resolve().parents[1] / "data/seed.csv"
     target_store = FakeSeedStore(workers)
 
-    result = cli.seed_from_csv(seed_path, target_store=target_store)
+    result = seed_service.seed_from_csv(
+        seed_path,
+        target_store=target_store,
+    )
 
     with seed_path.open(newline="", encoding="utf-8-sig") as input_file:
         expected_ids = [
@@ -92,15 +99,15 @@ def test_seed_parallelizes_catalog_and_commits_occurrences_in_original_csv_order
 
 def test_seed_without_reset_reuses_catalog_and_upserts_occurrences(monkeypatch):
     monkeypatch.setattr(
-        cli,
+        seed_service,
         "config",
-        replace(cli.config, seed_batch_size=5, seed_workers=1),
+        replace(seed_service.config, seed_batch_size=5, seed_workers=1),
     )
     seed_path = Path(__file__).resolve().parents[1] / "data/seed.csv"
     target_store = FakeSeedStore(workers=1)
     target_store.catalog_keys.add(semantic_key("jack x"))
 
-    result = cli.seed_from_csv(
+    result = seed_service.seed_from_csv(
         seed_path,
         target_store=target_store,
         reset=False,
@@ -118,9 +125,9 @@ def test_seed_without_reset_reuses_catalog_and_upserts_occurrences(monkeypatch):
 
 def test_seed_preserves_unordered_csv_row_order(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        cli,
+        seed_service,
         "config",
-        replace(cli.config, seed_batch_size=3, seed_workers=1),
+        replace(seed_service.config, seed_batch_size=3, seed_workers=1),
     )
     seed_path = Path(__file__).resolve().parents[1] / "data/seed.csv"
     unordered_path = tmp_path / "unordered.csv"
@@ -134,7 +141,7 @@ def test_seed_preserves_unordered_csv_row_order(monkeypatch, tmp_path):
         writer.writerows(reversed(rows))
 
     target_store = FakeSeedStore(workers=1)
-    result = cli.seed_from_csv(
+    result = seed_service.seed_from_csv(
         unordered_path,
         target_store=target_store,
         reset=False,

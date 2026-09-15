@@ -3,12 +3,13 @@ from types import SimpleNamespace
 from semantic_search.models import EntityOccurrence
 from semantic_search.opensearch_store import CATALOG_VECTOR_FIELD
 from semantic_search.search_utils import (
-    UNIQUE_ENTITY_COUNT_PRECISION,
-    SemanticSearchUtilities,
-    _cosine_percentage,
-    _minimum_opensearch_score,
+    cosine_percentage,
+    minimum_opensearch_score,
 )
-from semantic_search.summary_service import SemanticSummaryService
+from semantic_search.summary_service import (
+    UNIQUE_ENTITY_COUNT_PRECISION,
+    SemanticSummaryService,
+)
 from semantic_search.text import semantic_key
 from semantic_search.text_search_service import SemanticTextSearchService
 
@@ -151,7 +152,7 @@ def test_first_entity_page_uses_fast_cardinality_total():
     )
 
     entities, after_key, total = (
-        SemanticSearchUtilities(store).application_entity_summary_page(
+        SemanticSummaryService(store).application_summary_page(
             "A1",
             90,
             after_key=None,
@@ -174,9 +175,9 @@ def test_first_entity_page_uses_fast_cardinality_total():
 
 
 def test_90_percent_cosine_threshold_uses_095_opensearch_score():
-    assert _minimum_opensearch_score(90) == 0.95
-    assert _cosine_percentage(0.95) == 90.0
-    assert _cosine_percentage(0.96) == 92.0
+    assert minimum_opensearch_score(90) == 0.95
+    assert cosine_percentage(0.95) == 90.0
+    assert cosine_percentage(0.96) == 92.0
 
 
 def test_summary_reuses_catalog_vector_then_runs_one_count_aggregation():
@@ -372,3 +373,126 @@ def test_text_search_reuses_catalog_vector_when_text_already_exists():
             }
         }
     }
+
+
+def test_paginated_text_search_loads_locations_for_only_the_current_page():
+    exact_text = "acme corporation"
+    similar_text = "acme company"
+    entity_page_response = {
+        "aggregations": {
+            "entities": {
+                "buckets": [
+                    {"key": {"entityId": "E2"}},
+                    {"key": {"entityId": "E3"}},
+                ]
+            },
+            "totalMatchingEntities": {"value": 2},
+        }
+    }
+    occurrence_response = {
+        "aggregations": {
+            "matches": {
+                "buckets": [
+                    {
+                        "key": {"sentenceEntityId": 2},
+                        "sample": {
+                            "hits": {
+                                "hits": [
+                                    {
+                                        "_source": _sample_occurrence(
+                                            "E2",
+                                            exact_text,
+                                            "A2",
+                                            2,
+                                        )
+                                    }
+                                ]
+                            }
+                        },
+                    },
+                    {
+                        "key": {"sentenceEntityId": 3},
+                        "sample": {
+                            "hits": {
+                                "hits": [
+                                    {
+                                        "_source": _sample_occurrence(
+                                            "E3",
+                                            similar_text,
+                                            "A3",
+                                            3,
+                                        )
+                                    }
+                                ]
+                            }
+                        },
+                    },
+                ]
+            }
+        }
+    }
+    store = FakeStore(
+        occurrence_responses=[entity_page_response, occurrence_response],
+        catalog_responses=[
+            _catalog_response(
+                _catalog_hit(exact_text, 1.6),
+                _catalog_hit(similar_text, 0.96),
+            )
+        ],
+        single_vector=None,
+    )
+
+    result = SemanticTextSearchService(store).search_text_page(
+        "A1",
+        exact_text,
+        90,
+        None,
+    )
+
+    assert result["totalMatches"] == 2
+    assert result["returnedMatches"] == 2
+    assert result["returnedSourceLocations"] == 2
+    assert result["nextToken"] is None
+    assert result["pagination"] == {
+        "page": 1,
+        "pageSize": 100,
+        "totalPages": 1,
+        "hasPreviousPage": False,
+        "hasNextPage": False,
+    }
+    source_filter = store.occurrence_bodies[1]["query"]["bool"]["filter"]
+    assert {"terms": {"entityId": ["E2", "E3"]}} in source_filter
+
+
+def test_text_search_page_reads_one_extra_id_for_next_token():
+    buckets = [
+        {"key": {"entityId": f"E{number:04d}"}}
+        for number in range(1, 102)
+    ]
+    store = FakeStore(
+        occurrence_responses=[
+            {
+                "aggregations": {
+                    "entities": {"buckets": buckets},
+                    "totalMatchingEntities": {"value": 101},
+                }
+            }
+        ]
+    )
+
+    entity_ids, after_key, total = (
+        SemanticTextSearchService(store)._load_matching_entity_page(
+            "A1",
+            ["semantic-key"],
+            after_key=None,
+            include_total=True,
+        )
+    )
+
+    assert len(entity_ids) == 100
+    assert entity_ids[-1] == "E0100"
+    assert after_key == {"entityId": "E0100"}
+    assert total == 101
+    assert store.occurrence_bodies[0]["aggs"]["entities"]["composite"][
+        "size"
+    ] == 101

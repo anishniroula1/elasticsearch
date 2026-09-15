@@ -9,9 +9,7 @@ from opensearchpy.helpers.errors import BulkIndexError
 from semantic_search.config import config
 from semantic_search.opensearch_store import (
     CATALOG_VECTOR_DIMENSION,
-    CATALOG_VECTOR_ENGINE,
     CATALOG_VECTOR_FIELD,
-    CATALOG_VECTOR_SPACE_TYPE,
     OpenSearchStore,
     catalog_index_definition,
     occurrence_index_definition,
@@ -85,143 +83,10 @@ def test_catalog_mapping_requires_an_ingest_pipeline():
         )
 
 
-def _catalog_mapping(
-    dimension=CATALOG_VECTOR_DIMENSION,
-    space_type=CATALOG_VECTOR_SPACE_TYPE,
-    engine=CATALOG_VECTOR_ENGINE,
-):
-    return {
-        config.catalog_index: {
-            "mappings": {
-                "properties": {
-                    "entitySearchText": {"type": "text"},
-                    CATALOG_VECTOR_FIELD: {
-                        "type": "knn_vector",
-                        "dimension": dimension,
-                        "method": {
-                            "name": "hnsw",
-                            "space_type": space_type,
-                            "engine": engine,
-                        },
-                    },
-                }
-            }
-        }
-    }
-
-
-def _catalog_settings(pipeline="titan-pipeline"):
-    return {
-        config.catalog_index: {
-            "settings": {
-                "index.default_pipeline": pipeline,
-            }
-        }
-    }
-
-
-def test_store_accepts_pipeline_cosine_catalog_mapping():
-    class FakeIndices:
-        @staticmethod
-        def get_mapping(index):
-            assert index == config.catalog_index
-            return _catalog_mapping()
-
-        @staticmethod
-        def get_settings(index, params):
-            assert index == config.catalog_index
-            assert params == {"flat_settings": "true"}
-            return _catalog_settings()
-
-    class FakeClient:
-        indices = FakeIndices()
-
-    store = OpenSearchStore(
-        replace(
-            config,
-            semantic_model_id="opensearch-model-123",
-            ingest_pipeline="titan-pipeline",
-        ),
-        client=FakeClient(),
-    )
-
-    store._validate_catalog_mapping()
+def test_store_uses_the_cosine_space_defined_by_its_catalog_mapping():
+    store = OpenSearchStore(config, client=object())
 
     assert store.vector_space_type == "cosinesimil"
-
-
-def test_store_rejects_non_cosine_catalog_mapping():
-    class FakeIndices:
-        @staticmethod
-        def get_mapping(index):
-            assert index == config.catalog_index
-            return _catalog_mapping(space_type="l2")
-
-        @staticmethod
-        def get_settings(index, params):
-            assert index == config.catalog_index
-            assert params == {"flat_settings": "true"}
-            return _catalog_settings()
-
-    class FakeClient:
-        indices = FakeIndices()
-
-    store = OpenSearchStore(
-        replace(
-            config,
-            semantic_model_id="opensearch-model-123",
-            ingest_pipeline="titan-pipeline",
-        ),
-        client=FakeClient(),
-    )
-
-    with pytest.raises(RuntimeError, match="must be cosinesimil"):
-        store._validate_catalog_mapping()
-
-
-def test_store_rejects_non_faiss_catalog_mapping():
-    class FakeIndices:
-        @staticmethod
-        def get_mapping(index):
-            assert index == config.catalog_index
-            return _catalog_mapping(engine="lucene")
-
-        @staticmethod
-        def get_settings(index, params):
-            assert index == config.catalog_index
-            assert params == {"flat_settings": "true"}
-            return _catalog_settings()
-
-    class FakeClient:
-        indices = FakeIndices()
-
-    store = OpenSearchStore(
-        replace(
-            config,
-            semantic_model_id="opensearch-model-123",
-            ingest_pipeline="titan-pipeline",
-        ),
-        client=FakeClient(),
-    )
-
-    with pytest.raises(RuntimeError, match="engine must be faiss"):
-        store._validate_catalog_mapping()
-
-
-def test_store_rejects_wrong_catalog_vector_dimension():
-    class FakeIndices:
-        @staticmethod
-        def get_mapping(index):
-            assert index == config.catalog_index
-            return _catalog_mapping(dimension=1536)
-
-    class FakeClient:
-        indices = FakeIndices()
-
-    store = OpenSearchStore(config, client=FakeClient())
-
-    with pytest.raises(RuntimeError, match="expected 512"):
-        store._validate_catalog_mapping()
 
 
 def test_store_stats_counts_both_indexes():
@@ -322,10 +187,13 @@ def test_catalog_bulk_retries_only_failed_500_documents(monkeypatch):
         delays.append(seconds)
         clock[0] += seconds
 
+    def current_time():
+        return clock[0]
+
     monkeypatch.setattr("semantic_search.opensearch_store.time.sleep", fake_sleep)
     monkeypatch.setattr(
         "semantic_search.opensearch_store.time.monotonic",
-        lambda: clock[0],
+        current_time,
     )
 
     store.bulk_index_catalog(
@@ -359,10 +227,13 @@ def test_catalog_bulk_stops_after_ten_transient_failures(monkeypatch):
         delays.append(seconds)
         clock[0] += seconds
 
+    def current_time():
+        return clock[0]
+
     monkeypatch.setattr("semantic_search.opensearch_store.time.sleep", fake_sleep)
     monkeypatch.setattr(
         "semantic_search.opensearch_store.time.monotonic",
-        lambda: clock[0],
+        current_time,
     )
 
     with pytest.raises(BulkIndexError):

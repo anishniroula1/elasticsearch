@@ -11,6 +11,8 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 
 def _aws_hostname(value: str) -> str:
+    """Check the OpenSearch address and return its host name."""
+
     if not value:
         return ""
     parsed = urlparse(value if "://" in value else f"https://{value}")
@@ -25,6 +27,8 @@ def _integer_setting(
     minimum: int,
     maximum: int | None = None,
 ) -> int:
+    """Read a number from the environment and check its limits."""
+
     try:
         value = int(os.getenv(name, str(default)))
     except ValueError as error:
@@ -39,8 +43,6 @@ def _integer_setting(
 
 @dataclass(frozen=True)
 class Config:
-    """Load all AWS OpenSearch and index settings from the environment."""
-
     opensearch_host: str
     opensearch_port: int
     opensearch_service: str
@@ -60,6 +62,8 @@ class Config:
     @classmethod
     @lru_cache
     def load(cls) -> "Config":
+        """Read the environment settings once and return them."""
+
         config = cls(
             opensearch_host=_aws_hostname(os.getenv("OPENSEARCH_HOST", "").strip()),
             opensearch_port=_integer_setting(
@@ -107,6 +111,8 @@ class Config:
         return config
 
     def _validate(self) -> None:
+        """Make sure the required settings are present and do not clash."""
+
         if self.opensearch_service != "es":
             raise ValueError(
                 "OPENSEARCH_SERVICE must be es for this managed-domain app"
