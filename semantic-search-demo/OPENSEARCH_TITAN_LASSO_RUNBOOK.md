@@ -1,4 +1,39 @@
-# OpenSearch 3.7, Lasso, and Titan V2 Runbook
+# OpenSearch Semantic Search: Final Decision and Titan/Lasso Runbook
+
+## Performance decision
+
+**Recommendation: proceed with the OpenSearch semantic-search implementation.**
+
+The same application used in the previous test contained 1,530 unique entities.
+The complete results were:
+
+| Search path | Observed time | What it finds |
+| --- | ---: | --- |
+| Exact matching | Under 1 second | Identical normalized text |
+| Previous RapidFuzz summary | About 20–30 seconds | Character-edit similarity |
+| Semantic vector summary | Under 5 seconds | Exact and meaning-based similarity |
+
+Using the reported bounds, semantic search was approximately 4–6 times faster
+than the previous complete fuzzy summary. It also returned
+`United States Government` for `Government of United States` at the tested 90%
+semantic threshold. The current normalized Levenshtein score for those strings
+is approximately 14.81%, so the previous fuzzy implementation rejects the
+candidate at 90%.
+
+The semantic result is more useful because it covers word order and meaning in
+addition to many ordinary text variations. Exact matching remains in place for
+fast, deterministic counts. Bulk RapidFuzz matching is no longer recommended
+for the main application summary; add a lexical fallback later only if
+production feedback shows important acronym or typo cases that semantic search
+misses.
+
+This was the final test on the 512-dimensional catalog. It approves proceeding
+with the planned cluster resize and OpenSearch semantic-search rollout; no
+additional performance test is required for this decision. The full comparison
+and final decision are in the
+[final performance report](SEMANTIC_SEARCH_PERFORMANCE_REPORT.md).
+
+## Step-by-step setup
 
 This runbook creates the complete ML Commons path used by this project:
 

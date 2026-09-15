@@ -6,6 +6,28 @@ domain running OpenSearch 3.7 and Amazon Titan Text Embeddings V2.
 OpenSearch creates every embedding during seeding. The application never calls
 Bedrock directly and the CSV never contains vectors.
 
+## Measured outcome
+
+Using the same application from the previous fuzzy-search test, the complete
+summary covered **1,530 unique entities**:
+
+| Search path | Observed time | Result coverage |
+| --- | ---: | --- |
+| Exact matching | Under 1 second | Identical normalized entity text |
+| Previous RapidFuzz summary | About 20–30 seconds | Character and spelling similarity |
+| Semantic vector summary | Under 5 seconds | Exact plus meaning-based similarity |
+
+The semantic flow is approximately 4–6 times faster than the previous complete
+fuzzy summary using the reported bounds. It also matches reordered names such
+as `Government of United States` and `United States Government` at the tested
+90% semantic threshold; the current Levenshtein scorer does not.
+
+The recommendation is to proceed with semantic search, retain the exact path,
+and retire bulk RapidFuzz matching from the main summary. See the
+[final performance report](SEMANTIC_SEARCH_PERFORMANCE_REPORT.md) for the
+side-by-side evidence, limitations, and final approval decision. The measured
+semantic result used the final 512-dimensional configuration.
+
 For the full ML Commons lifecycle through a Lasso proxy, including creation,
 testing, connector updates, and cleanup, see
 [OPENSEARCH_TITAN_LASSO_RUNBOOK.md](OPENSEARCH_TITAN_LASSO_RUNBOOK.md).
@@ -422,6 +444,7 @@ change.
 
 ## References
 
+- [Final semantic performance report](SEMANTIC_SEARCH_PERFORMANCE_REPORT.md)
 - [OpenSearch Titan ingest-pipeline tutorial](https://docs.opensearch.org/latest/tutorials/vector-search/semantic-search/semantic-search-bedrock-titan/)
 - [OpenSearch text embedding processor](https://docs.opensearch.org/latest/ingest-pipelines/processors/text-embedding/)
 - [OpenSearch k-NN query](https://docs.opensearch.org/latest/query-dsl/specialized/k-nn/index/)

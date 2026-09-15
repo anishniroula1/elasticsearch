@@ -3,6 +3,12 @@
 This guide explains how to connect Amazon OpenSearch Service to Amazon Bedrock
 Titan Text Embeddings V2 and obtain the model ID required by this project.
 
+The project decision, measured results, and RapidFuzz comparison are in the
+[final semantic performance report](SEMANTIC_SEARCH_PERFORMANCE_REPORT.md).
+This guide uses the approved project standard of **512-dimensional normalized
+float embeddings with cosine similarity**. Configure 512 consistently in the
+connector, model registration, and catalog mapping.
+
 ## The two different IDs
 
 These IDs are related, but they are not interchangeable.
