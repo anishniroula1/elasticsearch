@@ -1,4 +1,4 @@
-from sentence_search.postgres_store import PostgresStore
+from sentence_search.postgres_store import PostgresStore, complete_match_lists
 
 
 class ConnectionThatMustNotRun:
@@ -14,111 +14,67 @@ class ExistingSentenceConnection:
         return self
 
     def __iter__(self):
-        return [
-            {
-                "globalId": "SENT-1",
-                "applicationId": "A1",
-                "sentenceKey": "1" * 64,
-                "analysisGroup": "Asylee",
-                "isTracer": False,
-                "isFormLanguage": False,
-            }
-        ].__iter__()
+        return iter(
+            [
+                {
+                    "globalId": "1",
+                    "applicationId": "A1",
+                    "tspId": "T1",
+                    "sectionName": "Affidavit",
+                    "analysisGroup": "Asylee",
+                    "matchStatus": "completed",
+                }
+            ]
+        )
 
 
-def test_edge_always_puts_smaller_global_id_first():
-    source = {
-        "globalId": "SENT-9",
-        "applicationId": "A9",
-        "sentenceKey": "9" * 64,
-    }
-    target = {
-        "globalId": "SENT-2",
-        "applicationId": "A2",
-        "sentenceKey": "2" * 64,
-    }
-    match = {
-        "similarityPercentage": 92.4,
-        "matchType": "semantic",
-    }
+def test_connected_group_is_saved_on_every_global_id():
+    lists = complete_match_lists({"1", "10", "40", "78"})
 
-    edge = PostgresStore._edge(source, target, match, "test-model")
-
-    assert edge["sentenceIdLow"] == "SENT-2"
-    assert edge["sentenceIdHigh"] == "SENT-9"
-    assert edge["similarityPercentage"] == 92.4
-    assert edge["matchType"] == "semantic"
+    assert lists["1"] == ["10", "40", "78"]
+    assert lists["10"] == ["1", "40", "78"]
+    assert lists["40"] == ["1", "10", "78"]
+    assert lists["78"] == ["1", "10", "40"]
 
 
-def test_same_global_id_cannot_have_two_sentence_keys_in_one_batch():
-    records = [
-        {
-            "globalId": "SENT-1",
-            "applicationId": "A1",
-            "sentenceKey": "1" * 64,
-            "analysisGroup": "Asylee",
-            "isTracer": False,
-            "isFormLanguage": False,
-        },
-        {
-            "globalId": "SENT-1",
-            "applicationId": "A1",
-            "sentenceKey": "2" * 64,
-            "analysisGroup": "Asylee",
-            "isTracer": False,
-            "isFormLanguage": False,
-        },
-    ]
+def test_same_global_id_cannot_have_different_metadata_in_one_batch():
+    first = _record()
+    second = _record()
+    second["sectionName"] = "B1"
 
     try:
-        PostgresStore._validate_sentence_identity(ConnectionThatMustNotRun(), records)
+        PostgresStore._validate_sentence_identity(
+            ConnectionThatMustNotRun(),
+            [first, second],
+        )
     except ValueError as error:
-        assert "different matching identity values" in str(error)
+        assert "different metadata" in str(error)
     else:
         raise AssertionError("Expected duplicate globalId validation error")
 
 
-def test_global_id_cannot_move_to_another_application():
-    records = [
-        {
-            "globalId": "SENT-1",
-            "applicationId": "A2",
-            "sentenceKey": "1" * 64,
-            "analysisGroup": "Asylee",
-            "isTracer": False,
-            "isFormLanguage": False,
-        }
-    ]
+def test_global_id_cannot_change_matching_metadata():
+    record = _record()
+    record["applicationId"] = "A2"
 
     try:
         PostgresStore._validate_sentence_identity(
             ExistingSentenceConnection(),
-            records,
+            [record],
         )
     except ValueError as error:
-        assert "different application" in str(error)
+        assert "cannot change matching metadata" in str(error)
     else:
-        raise AssertionError("Expected application identity validation error")
+        raise AssertionError("Expected matching metadata validation error")
 
 
-def test_global_id_cannot_change_matching_eligibility():
-    records = [
-        {
-            "globalId": "SENT-1",
-            "applicationId": "A1",
-            "sentenceKey": "1" * 64,
-            "analysisGroup": "Asylee",
-            "isTracer": True,
-            "isFormLanguage": False,
-        }
-    ]
-
-    try:
-        PostgresStore._validate_sentence_identity(
-            ExistingSentenceConnection(),
-            records,
-        )
-    except ValueError as error:
-        assert "cannot change analysisGroup, isTracer, or isFormLanguage" in str(error)
-    else:
-        raise AssertionError("Expected matching eligibility validation error")
+def _record() -> dict:
+    return {
+        "globalId": "1",
+        "applicationId": "A1",
+        "tspId": "T1",
+        "sectionName": "Affidavit",
+        "analysisGroup": "Asylee",
+        "isTracer": False,
+        "isFormLanguage": False,
+    }

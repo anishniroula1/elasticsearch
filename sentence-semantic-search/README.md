@@ -1,63 +1,46 @@
 # Semantic Sentence Matching
 
-This is a standalone application. It does not import code, configuration, or files from the entity semantic-search project.
+This is a standalone API. Everything needed by this project is inside this
+folder.
 
 It uses:
 
-- OpenSearch for sentence occurrences and 512-dimension Faiss vectors.
-- Amazon Titan through the registered OpenSearch model and ingest pipeline.
-- SQLAlchemy with PostgreSQL for confirmed relationships, counts, summaries, and background jobs.
-- A separate worker container for matching newly added sentences.
+- OpenSearch for sentence documents and 512-dimension Titan vectors.
+- PostgreSQL for ready-to-read matching ID lists and application totals.
+- A background worker so the seed request does not wait for every vector
+  search.
 
-## How the data moves
+## Simple data flow
 
 ```mermaid
 flowchart LR
-    A[CSV seed or POST /sentences] --> B[Occurrence index]
-    A --> C[Unique sentence catalog]
-    C --> D[Titan creates 512-value vector]
-    A --> E[PostgreSQL job queue]
-    E --> F[Background worker]
-    F --> G[OpenSearch 90%+ vector search]
-    G --> H[PostgreSQL match pairs and counts]
-    H --> I[Fast summary and match APIs]
+    A[CSV or POST sentence] --> B[OpenSearch occurrence]
+    A --> C[OpenSearch vector catalog]
+    A --> D[PostgreSQL sentence match row]
+    D --> E[Background worker]
+    E --> F[OpenSearch vector search]
+    F --> G[matchingGlobalIds arrays]
+    G --> H[Simple application summary]
 ```
 
-The API request only saves the sentence and queues the work. The worker does
-the slower vector search. The UI reads already prepared counts from PostgreSQL.
+Every sentence, including tracer and form-language text, is saved in
+OpenSearch and gets a vector. Tracer and form-language rows are marked
+`skipped`, so they never match another sentence and never increase a summary.
 
-## Why PostgreSQL is included
+Normal sentences only match sentences with the same `analysisGroup`. By
+default, application APIs use `Asylee`.
 
-OpenSearch finds similar sentence vectors. PostgreSQL saves the confirmed relationship so the same work does not need to run every time the UI opens.
-
-If sentence `SENT-1001` matches `SENT-2001`, PostgreSQL stores one ordered pair. It does not store both directions. Both sentence count rows are updated, so either sentence can return the other one.
-
-The default setting only creates matches between different applications:
+The default also prevents sentences inside the same application from matching:
 
 ```text
 MATCH_ACROSS_APPLICATIONS_ONLY=true
 ```
 
-Change it to `false` if sentences inside the same application should match each other.
-
-Matching also follows these rules:
-
-- A tracer sentence is saved in both OpenSearch indexes, so its vector is still
-  available. It is marked `skipped` instead of being sent to the matching
-  worker.
-- A form-language sentence is handled the same way. It gets a vector but does
-  not create a sentence relationship.
-- Two sentences can match only when they have the same `analysisGroup`.
-- Application summary and sentence-list APIs use `Asylee` when
-  `analysisGroup` is not provided.
-
-This keeps tracer and standard form text from increasing the match counts.
-
 ## OpenSearch indexes
 
 ### `sentence_occurrences`
 
-Every CSV or API sentence is saved here.
+This index stores every sentence and its metadata:
 
 ```text
 applicationId
@@ -76,11 +59,9 @@ updatedAt
 analysisGroup
 ```
 
-`sectionName` is the sentence version of `documentType`. `globalId` is the sentence ID, and `sentIdLocal` is its line number. `documentId` groups multiple sentences into one document. When it is omitted, `tspId` is used as the document ID.
-
 ### `sentence_semantic_catalog`
 
-Only one record is saved for each normalized sentence.
+This index stores one vector for each unique normalized sentence:
 
 ```text
 sentenceContent
@@ -90,7 +71,7 @@ createdAt
 updatedAt
 ```
 
-`sentenceContentVector` uses:
+The vector mapping uses:
 
 ```text
 dimension: 512
@@ -99,37 +80,93 @@ method: hnsw
 space_type: cosinesimil
 ```
 
-## PostgreSQL tables
+## Only two PostgreSQL tables
 
-SQLAlchemy defines and creates only three tables from
-`sentence_search/database_models.py`. There is no separate SQL schema file to
-copy or keep in sync.
+### `sentence_matches`
 
-| Table | Purpose |
-|---|---|
-| `sentence_records` | One row per sentence. It keeps metadata, match counts, and worker status. Tracer and form-language rows use the `skipped` status. |
-| `sentence_relationships` | One row per unique matching pair. Foreign keys delete relationships automatically when a sentence is removed. |
-| `application_sentence_summary` | Prepared application totals and breakdowns by `sectionName` and `analysisGroup`. |
+The important columns are:
 
-The summary table has one total row for the application, one row for each
-analysis group, and smaller rows for each section inside an analysis group.
-Tracer and form-language sentences are not included. The UI can therefore read
-`totalMatchCount` immediately without running a relationship count during the
-request.
+```text
+globalId
+tspId
+applicationId
+sectionName
+analysisGroup
+matchingGlobalIds
+```
 
-The worker retries a failed job up to 10 times. It waits five seconds after a failure. A successful job resets its attempt counter to zero.
+Example rows:
 
-If this project was already started before the three-table or matching-rule
-change, delete the old development volume once with
-`docker compose down --volumes`, and then start the project again. Use
-`reset=true` on the first new seed so the two old OpenSearch indexes are also
-recreated. This deletes the old sentence data.
+```text
+globalId 1  -> matchingGlobalIds [10, 40]
+globalId 10 -> matchingGlobalIds [1, 40]
+globalId 40 -> matchingGlobalIds [1, 10]
+```
 
-## Prepare the sentence embedding pipeline
+The same row also has a few worker fields such as `matchStatus` and
+`matchAttempts`. They allow matching to continue after the worker or AWS
+session restarts. A separate queue table is not needed.
 
-The registered OpenSearch model must return 512 values and use `cosinesimil`.
+### `application_match_summary`
 
-Create a pipeline that maps the sentence text into the vector field:
+There is one row for each application and analysis group. It contains only:
+
+```text
+applicationId
+analysisGroup
+sectionMatchCounts
+totalMatching
+updatedAt
+```
+
+Example:
+
+```json
+{
+  "applicationId": "A0001",
+  "analysisGroup": "Asylee",
+  "totalMatching": 40,
+  "sectionMatches": [
+    {"sectionName": "Affidavit", "matchingCount": 10},
+    {"sectionName": "B1", "matchingCount": 30}
+  ]
+}
+```
+
+The UI reads this one row. It does not count all matches during the request.
+
+## How connected matching works
+
+The worker first finds direct OpenSearch results that pass the configured
+threshold. The default is 90%.
+
+The saved arrays are then expanded as one connected group. Example:
+
+```text
+1 matches 10 and 40
+10 later directly matches 78
+```
+
+The group becomes:
+
+```text
+1  -> [10, 40, 78]
+10 -> [1, 40, 78]
+40 -> [1, 10, 78]
+78 -> [1, 10, 40]
+```
+
+Important: this is a connected group. It does not mean every inherited pair
+was directly measured at 90%. For example, 1 and 78 may be connected through
+10 even when their own score is lower than 90%.
+
+This format is simple to read, but it duplicates IDs. A group containing N
+sentences stores N × (N - 1) IDs. Very large connected groups can therefore use
+a lot of PostgreSQL storage.
+
+## Prepare the Titan pipeline
+
+The registered OpenSearch model must return 512 values.
 
 ```json
 PUT /_ingest/pipeline/sentence_bedrock_embedding_pipeline
@@ -148,11 +185,11 @@ PUT /_ingest/pipeline/sentence_bedrock_embedding_pipeline
 }
 ```
 
-Test the model and pipeline before starting a large seed. The model output dimension, model registration, connector, and catalog mapping must all use 512 dimensions.
+The model, pipeline, and catalog mapping must all use 512 dimensions.
 
-## Configure the project
+## Configure and run
 
-Edit `.env` and set:
+Fill in `.env`:
 
 ```text
 OPENSEARCH_HOST
@@ -162,37 +199,30 @@ AWS_SECRET_ACCESS_KEY
 AWS_SESSION_TOKEN
 ```
 
-Leave the AWS key values empty when the container receives credentials from an IAM task role. `IAM_ACCESS_ROLE` is optional and should only be used when this application must assume another role.
+Leave AWS keys empty when the container receives an IAM role. OpenSearch is not
+inside Docker because Titan and the connector run in AWS.
 
-OpenSearch is not included in Docker Compose because the embedding connector and Titan model run in AWS.
-
-## Run everything
+Start the API, worker, and PostgreSQL:
 
 ```bash
 make dev
 ```
 
-Open Swagger:
+Swagger opens at:
 
 ```text
 http://localhost:8008/docs
 ```
 
-Docker starts:
+## Initialize and seed
 
-- `api`: FastAPI on port 8008.
-- `worker`: background sentence matching.
-- `postgres`: PostgreSQL on host port 5434.
-
-## First setup
-
-Call:
+Create both OpenSearch indexes and the two PostgreSQL tables:
 
 ```text
 POST /admin/init
 ```
 
-Then seed the sample CSV:
+Seed from Swagger:
 
 ```json
 POST /admin/seed
@@ -202,11 +232,15 @@ POST /admin/seed
 }
 ```
 
-`reset=true` deletes the two OpenSearch indexes and all PostgreSQL project rows before loading the CSV.
+Use `reset=true` when old matching data must be removed. The worker continues
+matching after the seed request finishes.
 
-The seed response reports queued jobs. Matching continues in the worker so the HTTP session does not need to stay open for all vector searches.
+The worker retries a failed job up to ten times and waits five seconds between
+attempts.
 
-## Add one sentence
+## API examples
+
+Add one sentence:
 
 ```json
 POST /sentences
@@ -214,124 +248,95 @@ POST /sentences
   "applicationId": "A0003",
   "tspId": "TSP-3",
   "documentId": "DOC-3",
-  "sectionName": "Written Statement",
+  "sectionName": "Affidavit",
   "globalId": "SENT-3001",
   "sentIdLocal": 1,
-  "sentenceContent": "The notice came from the government of the United States.",
+  "sentenceContent": "The notice came from the United States government.",
   "isTracer": false,
   "isFormLanguage": false,
   "sentenceKey": null,
   "sourceType": "document",
-  "createdAt": "2026-09-17T12:10:00Z",
-  "updatedAt": "2026-09-17T12:10:00Z",
+  "createdAt": null,
+  "updatedAt": null,
   "analysisGroup": "Asylee"
 }
 ```
 
-The application generates `sentenceKey`. If a key is supplied, it must match the generated SHA-256 value.
-
-All saved relationships use `MATCH_THRESHOLD`. The default is 90%. Changing
-the threshold or deployed embedding model requires `reset=true` and a full
-reseed so old and new scores are not mixed.
-
-## Read prepared counts
-
-Application total and job status:
+Read the simple application summary:
 
 ```text
 GET /applications/A0001/summary?analysisGroup=Asylee
 ```
 
-The response contains the total first, followed by the section breakdown:
-
-```json
-{
-  "applicationId": "A0001",
-  "analysisGroup": "Asylee",
-  "totalDocuments": 12,
-  "totalSentences": 1530,
-  "matchedSentences": 420,
-  "exactMatchCount": 95,
-  "semanticMatchCount": 610,
-  "totalMatchCount": 705,
-  "status": "completed",
-  "sectionSummaries": [
-    {
-      "sectionName": "Written Statement",
-      "analysisGroup": "Asylee",
-      "totalSentences": 350,
-      "totalMatchCount": 121
-    }
-  ]
-}
-```
-
-Application sentences, 100 per page:
+Read 100 application sentence rows with each `matchingCount`:
 
 ```text
 GET /applications/A0001/sentences?analysisGroup=Asylee&pageSize=100
 ```
 
-One sentence's exact count and first 100 candidates:
+Read one sentence's matching IDs:
 
 ```text
 GET /sentences/SENT-1001/matches?pageSize=100
 ```
 
-Use `nextToken` from the response as the next `nextToken` query value. PostgreSQL returns the saved total count immediately; it does not count every relationship during the request.
+Pass the returned `nextToken` to read the next page. When `analysisGroup` is
+left out, application endpoints use `Asylee`.
 
-If `analysisGroup` is left out, both application endpoints use `Asylee`.
-They return only sentences that are not tracer text and not form language.
+## Delete data
 
-## Delete an application or TSP document
-
-Delete every sentence owned by an application:
+Delete one application:
 
 ```text
 DELETE /applications/A0001?confirm=true
 ```
 
-Delete only one TSP document inside that application:
-
-```text
-DELETE /documents/TSP-1?confirm=true
-```
-
-If a TSP ID is not globally unique, add the application safety filter:
+Delete one TSP document:
 
 ```text
 DELETE /documents/TSP-1?applicationId=A0001&confirm=true
 ```
 
-Both endpoints remove occurrence documents, sentence records, relationships,
-and affected summary counts. A catalog vector is deleted only when no remaining
-occurrence uses its `sentenceKey`. This prevents one application from deleting
-a shared vector that another application still needs.
+The deleted global IDs are removed from every surviving `matchingGlobalIds`
+array. Section and total counts are rebuilt. A catalog vector is deleted only
+when no remaining occurrence uses its `sentenceKey`.
 
-## CSV header spelling
-
-The preferred headers use the corrected names shown in `data/seed.csv`. For compatibility, the loader also accepts these names from the original description:
-
-```text
-application_Id
-local_globa_id
-senetence_content
-```
-
-They are converted internally to:
-
-```text
-applicationId
-sentIdLocal
-sentenceContent
-```
-
-The loader reads the CSV from top to bottom. It does not sort by a sentence ID or line number.
-
-## Remove everything
+Delete everything:
 
 ```text
 DELETE /admin/storage?confirm=true
 ```
 
-This deletes both OpenSearch physical indexes and aliases and truncates all PostgreSQL project tables. The Docker PostgreSQL volume remains until `make clean` is run.
+This table design is different from the older three-table version. For an old
+local Docker database, remove its volume once before starting this version:
+
+```bash
+docker compose down --volumes
+```
+
+Then start the project and seed with `reset=true`.
+
+## CSV header spelling
+
+The loader reads the CSV from top to bottom without sorting. It also accepts
+these older header spellings:
+
+```text
+application_Id -> applicationId
+local_globa_id  -> sentIdLocal
+senetence_content -> sentenceContent
+```
+
+## Portable generator
+
+`generate_project.py` contains a compressed copy of this whole project. It
+does not include real AWS credentials.
+
+Run it from any folder:
+
+```bash
+python3 generate_project.py
+```
+
+It creates a new `sentence-semantic-search` folder. You can also pass the
+parent output folder as the first argument.

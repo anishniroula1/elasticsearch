@@ -154,6 +154,7 @@ class SeedService:
 
             # Stop this batch before indexing if a global ID changed its text.
             self.postgres.validate_sentence_identity(sources)
+            self.opensearch.validate_occurrence_identity(sources)
 
             catalog_by_key = {}
             for source in sources:

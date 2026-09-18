@@ -27,6 +27,7 @@ class SentenceService:
         source = sentence.model_dump(mode="json")
         # Validate first so a bad global ID cannot leave OpenSearch half updated.
         self.postgres.validate_sentence_identity([source])
+        self.opensearch.validate_occurrence_identity([source])
         key = source["sentenceKey"]
         existing = self.opensearch.existing_catalog_keys([key])
         catalog_indexed = 0

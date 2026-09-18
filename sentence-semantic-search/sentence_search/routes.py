@@ -170,7 +170,7 @@ def delete_application(
         Query(description="Must be true to delete the application sentences."),
     ] = False,
 ):
-    """Delete one application's sentences, relationships, and summaries."""
+    """Delete one application's sentences, match lists, and summary."""
 
     if not confirm:
         raise HTTPException(status_code=400, detail="Set confirm=true to delete.")
@@ -195,7 +195,7 @@ def delete_tsp_document(
         Query(description="Must be true to delete the TSP document sentences."),
     ] = False,
 ):
-    """Delete one TSP document and every relationship using its sentences."""
+    """Delete one TSP document and remove its IDs from saved match lists."""
 
     if not confirm:
         raise HTTPException(status_code=400, detail="Set confirm=true to delete.")
@@ -215,7 +215,7 @@ def application_sentence_summary(
     applicationId: str,
     analysisGroup: Annotated[str, Query(min_length=1)] = "Asylee",
 ):
-    """Return prepared counts for one application and analysis group."""
+    """Return simple section and total matching counts."""
 
     try:
         result = postgres_store.application_summary(applicationId, analysisGroup)
@@ -239,7 +239,7 @@ def application_sentences(
     pageSize: Annotated[int, Query(ge=1, le=100)] = 100,
     nextToken: str | None = None,
 ):
-    """Return 100 application sentences and their saved match counts."""
+    """Return 100 application sentence IDs and their match-list counts."""
 
     try:
         return postgres_store.application_sentences(
@@ -263,7 +263,7 @@ def sentence_matches(
     pageSize: Annotated[int, Query(ge=1, le=100)] = 100,
     nextToken: str | None = None,
 ):
-    """Return one sentence's exact count and paginated candidate list."""
+    """Return one sentence's stored matching-global-ID list."""
 
     try:
         result = postgres_store.sentence_matches(

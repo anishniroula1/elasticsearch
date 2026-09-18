@@ -2,122 +2,88 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import CreateTable
 
 from sentence_search.database_models import (
-    ApplicationSentenceSummary,
+    ApplicationMatchSummary,
     Base,
-    SentenceRecord,
+    SentenceMatch,
 )
-from sentence_search.postgres_store import ANALYSIS_SCOPE, PostgresStore
+from sentence_search.postgres_store import PostgresStore
 
 
-def test_sqlalchemy_defines_all_matching_tables():
+def test_sqlalchemy_defines_only_two_matching_tables():
     assert set(Base.metadata.tables) == {
-        "sentence_records",
-        "sentence_relationships",
-        "application_sentence_summary",
+        "sentence_matches",
+        "application_match_summary",
     }
 
 
-def test_sentence_record_uses_camel_case_columns():
-    columns = set(SentenceRecord.__table__.columns.keys())
+def test_sentence_match_has_metadata_and_one_matching_list():
+    columns = set(SentenceMatch.__table__.columns.keys())
+
     assert {
         "globalId",
-        "applicationId",
-        "sentenceKey",
         "tspId",
-        "documentId",
+        "applicationId",
         "sectionName",
-        "sentIdLocal",
-        "sentenceContent",
-        "isTracer",
-        "isFormLanguage",
-        "sourceType",
         "analysisGroup",
-        "createdAt",
-        "updatedAt",
+        "matchingGlobalIds",
     }.issubset(columns)
-    assert {"exactMatchCount", "matchStatus", "matchAttempts"}.issubset(columns)
+    assert "sentenceKey" not in columns
+    assert "sentenceContent" not in columns
 
 
-def test_sentence_record_compiles_for_postgresql():
+def test_sentence_match_uses_postgresql_text_array():
     statement = str(
-        CreateTable(SentenceRecord.__table__).compile(dialect=postgresql.dialect())
+        CreateTable(SentenceMatch.__table__).compile(dialect=postgresql.dialect())
     )
 
-    assert '"sentIdLocal" BIGINT NOT NULL' in statement
-    assert '"sentenceContent" TEXT NOT NULL' in statement
+    assert '"matchingGlobalIds" TEXT[]' in statement
     assert "'skipped'" in statement
 
 
-def test_summary_supports_analysis_scope():
+def test_application_summary_uses_one_json_section_map():
+    columns = set(ApplicationMatchSummary.__table__.columns.keys())
     statement = str(
-        CreateTable(ApplicationSentenceSummary.__table__).compile(
+        CreateTable(ApplicationMatchSummary.__table__).compile(
             dialect=postgresql.dialect()
         )
     )
 
-    assert "'analysis'" in statement
-
-
-def test_application_summary_prepares_total_match_count():
-    counts = {
-        "totalDocuments": 2,
-        "totalSentences": 10,
-        "matchedSentences": 4,
-        "exactMatchCount": 3,
-        "semanticMatchCount": 7,
-        "pendingCount": 0,
-        "runningCount": 0,
-        "completedCount": 10,
-        "failedCount": 0,
+    assert columns == {
+        "applicationId",
+        "analysisGroup",
+        "sectionMatchCounts",
+        "totalMatching",
+        "updatedAt",
     }
-
-    summary = PostgresStore._summary_values(
-        "A1",
-        "application",
-        "",
-        "",
-        counts,
-    )
-
-    assert summary["totalMatchCount"] == 10
+    assert '"sectionMatchCounts" JSONB' in statement
 
 
-def test_matchable_sentence_is_pending():
-    values = PostgresStore._record_values(_sentence_record(), 90)
+def test_regular_sentence_is_pending():
+    values = PostgresStore._match_values(_sentence(), 90)
 
     assert values["matchStatus"] == "pending"
+    assert values["matchingGlobalIds"] == []
 
 
 def test_tracer_or_form_sentence_is_skipped():
-    tracer = _sentence_record()
+    tracer = _sentence()
     tracer["isTracer"] = True
-    form_language = _sentence_record()
+    form_language = _sentence()
     form_language["isFormLanguage"] = True
 
-    assert PostgresStore._record_values(tracer, 90)["matchStatus"] == "skipped"
-    assert PostgresStore._record_values(form_language, 90)["matchStatus"] == "skipped"
+    assert PostgresStore._match_values(tracer, 90)["matchStatus"] == "skipped"
+    assert PostgresStore._match_values(form_language, 90)["matchStatus"] == "skipped"
 
 
-def test_summary_keys_include_analysis_group():
-    keys = PostgresStore._summary_keys(_sentence_record())
-
-    assert (ANALYSIS_SCOPE, "", "Asylee") in keys
-
-
-def _sentence_record() -> dict:
+def _sentence() -> dict:
     return {
         "globalId": "S1",
         "applicationId": "A1",
         "tspId": "T1",
-        "documentId": "D1",
-        "sectionName": "Statement",
+        "sectionName": "Affidavit",
         "analysisGroup": "Asylee",
-        "sentIdLocal": 1,
-        "sentenceContent": "Example sentence",
-        "sentenceKey": "a" * 64,
         "isTracer": False,
         "isFormLanguage": False,
-        "sourceType": "document",
         "createdAt": "2026-09-17T00:00:00Z",
         "updatedAt": "2026-09-17T00:00:00Z",
     }

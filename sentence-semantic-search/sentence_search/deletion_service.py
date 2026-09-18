@@ -32,9 +32,12 @@ class SentenceDeletionService:
         application_id: str | None,
         tsp_id: str | None = None,
     ) -> dict:
-        """Delete occurrences, unused vectors, and PostgreSQL relationships."""
+        """Delete occurrences, unused vectors, and PostgreSQL match lists."""
 
-        catalog_keys = self.postgres.deletion_catalog_keys(application_id, tsp_id)
+        catalog_keys = self.opensearch.deletion_catalog_keys(
+            application_id,
+            tsp_id,
+        )
         occurrence_count = self.opensearch.delete_occurrences(
             application_id,
             tsp_id,

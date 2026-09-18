@@ -18,19 +18,21 @@ class SentenceMatchService:
         self.postgres = postgres
 
     def process_job(self, job: dict) -> dict:
-        """Find and save every threshold match for one sentence."""
+        """Find direct vector hits and merge their connected match groups."""
 
-        source = self.postgres.sentence(job["globalId"])
+        source = self.opensearch.occurrence(job["globalId"])
         if not source:
             raise RuntimeError(
-                f"Sentence registry row does not exist: {job['globalId']}"
+                f"OpenSearch occurrence does not exist: {job['globalId']}"
             )
         if not is_matchable_sentence(source):
             return {
                 "globalId": source["globalId"],
                 "threshold": int(job["matchThreshold"]),
-                "candidatesFound": 0,
-                "relationshipsInserted": 0,
+                "catalogMatchesFound": 0,
+                "directMatchesFound": 0,
+                "matchGroupSize": 1,
+                "matchListsUpdated": 0,
                 "status": "skipped",
             }
 
@@ -40,13 +42,17 @@ class SentenceMatchService:
             vector,
             int(job["matchThreshold"]),
         )
-        result = self.postgres.save_matches(
+        occurrences = self.opensearch.matching_occurrences(
             source,
             catalog_matches,
-            self.config.semantic_model_id,
+        )
+        result = self.postgres.save_match_group(
+            source["globalId"],
+            [occurrence["globalId"] for occurrence in occurrences],
         )
         return {
             "globalId": source["globalId"],
             "threshold": int(job["matchThreshold"]),
+            "catalogMatchesFound": len(catalog_matches),
             **result,
         }

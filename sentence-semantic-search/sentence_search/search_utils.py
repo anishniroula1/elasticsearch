@@ -1,6 +1,5 @@
 import base64
 import binascii
-import json
 
 
 def minimum_opensearch_score(threshold: int) -> float:
@@ -33,28 +32,6 @@ def cosine_percentage(opensearch_score: float) -> float:
     cosine_similarity = 2.0 - (1.0 / opensearch_score)
     cosine_similarity = max(-1.0, min(1.0, cosine_similarity))
     return round(max(0.0, cosine_similarity) * 100.0, 2)
-
-
-def encode_page_token(score: float, global_id: str) -> str:
-    """Create a safe cursor for the next PostgreSQL match page."""
-
-    payload = json.dumps(
-        {"score": score, "globalId": global_id},
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return base64.urlsafe_b64encode(payload).decode("ascii")
-
-
-def decode_page_token(token: str) -> tuple:
-    """Read a match cursor created by encode_page_token."""
-
-    try:
-        payload = json.loads(
-            base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8")
-        )
-        return float(payload["score"]), str(payload["globalId"])
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-        raise ValueError("Invalid nextToken") from error
 
 
 def encode_id_token(global_id: str) -> str:

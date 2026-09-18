@@ -3,6 +3,9 @@ class FakeOpenSearchStore:
         self.deleted_scope = None
         self.catalog_keys = None
 
+    def deletion_catalog_keys(self, application_id, tsp_id=None):
+        return ["key-1", "key-2"]
+
     def delete_occurrences(self, application_id, tsp_id=None):
         self.deleted_scope = (application_id, tsp_id)
         return 4
@@ -13,11 +16,8 @@ class FakeOpenSearchStore:
 
 
 class FakePostgresStore:
-    def deletion_catalog_keys(self, application_id, tsp_id=None):
-        return ["key-1", "key-2"]
-
     def delete_sentences(self, application_id, tsp_id=None):
-        return {"sentencesDeleted": 4, "relationshipsDeleted": 7}
+        return {"sentencesDeleted": 4, "matchListsUpdated": 7}
 
 
 def test_tsp_deletion_removes_both_stores_and_unused_catalog_records():
@@ -33,4 +33,4 @@ def test_tsp_deletion_removes_both_stores_and_unused_catalog_records():
     assert result["occurrencesDeleted"] == 4
     assert result["catalogDocumentsDeleted"] == 2
     assert result["sentencesDeleted"] == 4
-    assert result["relationshipsDeleted"] == 7
+    assert result["matchListsUpdated"] == 7

@@ -16,6 +16,8 @@ from sentence_search.search_utils import (
 SEMANTIC_TEXT_FIELD = "sentenceContent"
 VECTOR_FIELD = "sentenceContentVector"
 CATALOG_PAGE_SIZE = 1_000  # Catalog matches read from one aggregation page.
+OCCURRENCE_PAGE_SIZE = 5_000  # Occurrence candidates read per search page.
+TERMS_BATCH_SIZE = 10_000  # Sentence keys sent in one terms filter.
 CATALOG_RETRY_ATTEMPTS = 10  # Remote embedding failures allowed per batch.
 CATALOG_RETRY_SECONDS = 5  # Pause before retrying a failed Titan batch.
 RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
@@ -168,6 +170,50 @@ class OpenSearchStore:
                 if document.get("found"):
                     existing.add(str(document["_id"]))
         return existing
+
+    def validate_occurrence_identity(self, records: list):
+        """Stop a global ID from being reused for different sentence data."""
+
+        incoming = {}
+        identity_fields = (
+            "applicationId",
+            "tspId",
+            "sectionName",
+            "analysisGroup",
+            "sentenceKey",
+            "isTracer",
+            "isFormLanguage",
+        )
+        for record in records:
+            global_id = record["globalId"]
+            identity = {field: record[field] for field in identity_fields}
+            previous = incoming.get(global_id)
+            if previous and previous != identity:
+                raise ValueError(
+                    f"The same globalId has different sentence data: {global_id}"
+                )
+            incoming[global_id] = identity
+
+        global_ids = list(incoming)
+        for offset in range(0, len(global_ids), 1_000):
+            batch = global_ids[offset : offset + 1_000]
+            response = self.client.mget(
+                index=self.config.occurrence_alias,
+                body={"ids": batch},
+            )
+            for document in response["docs"]:
+                if not document.get("found"):
+                    continue
+                global_id = str(document["_id"])
+                existing = document["_source"]
+                if any(
+                    existing[field] != incoming[global_id][field]
+                    for field in identity_fields
+                ):
+                    raise ValueError(
+                        "globalId cannot change sentence or matching metadata "
+                        f"without reset: {global_id}"
+                    )
 
     def bulk_index_catalog(self, documents: list):
         """Index new catalog texts and retry temporary embedding failures."""
@@ -399,6 +445,69 @@ class OpenSearchStore:
                 break
         return matches
 
+    def occurrence(self, global_id: str) -> dict | None:
+        """Return one occurrence document by its global ID."""
+
+        try:
+            response = self.client.get(
+                index=self.config.occurrence_alias,
+                id=global_id,
+            )
+        except NotFoundError:
+            return None
+        return response["_source"]
+
+    def matching_occurrences(self, source: dict, catalog_matches: list) -> list:
+        """Find eligible occurrence IDs for the catalog keys and analysis group."""
+
+        candidate_keys = sorted({match["sentenceKey"] for match in catalog_matches})
+        targets = []
+        for offset in range(0, len(candidate_keys), TERMS_BATCH_SIZE):
+            key_batch = candidate_keys[offset : offset + TERMS_BATCH_SIZE]
+            search_after = None
+            while True:
+                must_not = [{"ids": {"values": [source["globalId"]]}}]
+                if self.config.match_across_applications_only:
+                    must_not.append(
+                        {"term": {"applicationId": source["applicationId"]}}
+                    )
+                body = {
+                    "size": OCCURRENCE_PAGE_SIZE,
+                    "track_total_hits": False,
+                    "_source": [
+                        "globalId",
+                        "tspId",
+                        "applicationId",
+                        "sectionName",
+                        "analysisGroup",
+                    ],
+                    "sort": [{"globalId": "asc"}],
+                    "query": {
+                        "bool": {
+                            "filter": [
+                                {"terms": {"sentenceKey": key_batch}},
+                                {"term": {"analysisGroup": source["analysisGroup"]}},
+                                {"term": {"isTracer": False}},
+                                {"term": {"isFormLanguage": False}},
+                            ],
+                            "must_not": must_not,
+                        }
+                    },
+                }
+                if search_after:
+                    body["search_after"] = search_after
+                response = self.client.search(
+                    index=self.config.occurrence_alias,
+                    body=body,
+                )
+                hits = response["hits"]["hits"]
+                for hit in hits:
+                    targets.append(hit["_source"])
+                if len(hits) < OCCURRENCE_PAGE_SIZE:
+                    break
+                search_after = hits[-1]["sort"]
+        return targets
+
     def stats(self) -> dict:
         """Return both OpenSearch document counts and cluster health."""
 
@@ -454,6 +563,46 @@ class OpenSearchStore:
             },
         )
         return int(response.get("deleted", 0))
+
+    def deletion_catalog_keys(
+        self,
+        application_id: str | None = None,
+        tsp_id: str | None = None,
+    ) -> list:
+        """Return unique sentence keys before deleting occurrence documents."""
+
+        filters = []
+        if application_id is not None:
+            filters.append({"term": {"applicationId": application_id}})
+        if tsp_id is not None:
+            filters.append({"term": {"tspId": tsp_id}})
+        if not filters:
+            raise ValueError("applicationId or tspId is required for deletion")
+
+        keys = []
+        after_key = None
+        while True:
+            composite = {
+                "size": CATALOG_PAGE_SIZE,
+                "sources": [{"sentenceKey": {"terms": {"field": "sentenceKey"}}}],
+            }
+            if after_key:
+                composite["after"] = after_key
+            response = self.client.search(
+                index=self.config.occurrence_alias,
+                body={
+                    "size": 0,
+                    "track_total_hits": False,
+                    "query": {"bool": {"filter": filters}},
+                    "aggs": {"keys": {"composite": composite}},
+                },
+            )
+            result = response["aggregations"]["keys"]
+            keys.extend(bucket["key"]["sentenceKey"] for bucket in result["buckets"])
+            after_key = result.get("after_key")
+            if not after_key or not result["buckets"]:
+                break
+        return keys
 
     def delete_unused_catalog_keys(self, keys: list) -> int:
         """Delete catalog vectors only when no occurrence still uses them."""

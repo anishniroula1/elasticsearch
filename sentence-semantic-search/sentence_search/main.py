@@ -24,7 +24,7 @@ app = FastAPI(
     version="1.0.0",
     description=(
         "Sentence-level semantic matching with Amazon Titan, OpenSearch, "
-        "and prepared PostgreSQL relationship counts."
+        "and prepared PostgreSQL matching-ID lists."
     ),
     lifespan=lifespan,
 )

@@ -1,54 +1,44 @@
+import bisect
 import time
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import (
-    and_,
-    create_engine,
-    delete,
-    distinct,
-    func,
-    or_,
-    select,
-    union_all,
-    update,
-)
+from sqlalchemy import create_engine, delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import OperationalError, TimeoutError
 from sqlalchemy.orm import sessionmaker
 
 from sentence_search.config import Config
 from sentence_search.database_models import (
-    ApplicationSentenceSummary,
+    ApplicationMatchSummary,
     Base,
-    SentenceRecord,
-    SentenceRelationship,
+    SentenceMatch,
     model_values,
 )
 from sentence_search.matching_rules import is_matchable_sentence
-from sentence_search.search_utils import (
-    decode_id_token,
-    decode_page_token,
-    encode_id_token,
-    encode_page_token,
-)
+from sentence_search.search_utils import decode_id_token, encode_id_token
 
-MATCH_INSERT_BATCH_SIZE = 2_000  # Keeps PostgreSQL bulk statements manageable.
-APPLICATION_SCOPE = "application"
-ANALYSIS_SCOPE = "analysis"
-SECTION_SCOPE = "section"
-
-
-def _empty_match_counts() -> dict:
-    """Make counters for one sentence while match rows are being saved."""
-
-    return {"exact": 0, "semantic": 0}
+MATCH_WRITE_LOCK = 907_202_609  # Serializes connected-group array updates.
 
 
 def _now() -> datetime:
     """Return the current UTC time for worker locks and retries."""
 
     return datetime.now(UTC)
+
+
+def complete_match_lists(global_ids: set) -> dict:
+    """Build the symmetric match array for every ID in one connected group.
+
+    Input: global_ids={"1", "10", "40"}
+    Output: ID 1 has ["10", "40"], and every other ID gets the same group.
+    """
+
+    ordered_ids = sorted(global_ids)
+    return {
+        global_id: [item for item in ordered_ids if item != global_id]
+        for global_id in ordered_ids
+    }
 
 
 class PostgresStore:
@@ -86,54 +76,56 @@ class PostgresStore:
         self.engine.dispose()
 
     def init_schema(self):
-        """Create the three SQLAlchemy tables and their indexes."""
+        """Create the two simple PostgreSQL tables and their indexes."""
 
         Base.metadata.create_all(self.engine)
 
     def reset_data(self):
-        """Delete relationships, summaries, and sentence records."""
+        """Delete every saved match list and application summary."""
 
         with self.sessions.begin() as session:
-            session.execute(delete(SentenceRelationship))
-            session.execute(delete(ApplicationSentenceSummary))
-            session.execute(delete(SentenceRecord))
+            session.execute(delete(ApplicationMatchSummary))
+            session.execute(delete(SentenceMatch))
 
     def register_sentences(self, records: list, threshold: int) -> dict:
-        """Save sentences and leave new records pending for the worker."""
+        """Create one match-list row for each new global ID."""
 
         if not records:
             return {"registered": 0, "jobsQueued": 0}
 
-        input_records = records
         unique_records = {}
-        for record in input_records:
+        for record in records:
             unique_records[record["globalId"]] = record
         records = list(unique_records.values())
-        application_ids = sorted({record["applicationId"] for record in records})
 
         with self.sessions.begin() as session:
-            existing_ids = self._validate_sentence_identity(session, input_records)
-            record_insert = insert(SentenceRecord).values(
-                [self._record_values(record, threshold) for record in records]
+            existing_ids = self._validate_sentence_identity(session, records)
+            match_insert = insert(SentenceMatch).values(
+                [self._match_values(record, threshold) for record in records]
             )
             session.execute(
-                record_insert.on_conflict_do_update(
-                    index_elements=[SentenceRecord.globalId],
-                    set_={
-                        "tspId": record_insert.excluded.tspId,
-                        "documentId": record_insert.excluded.documentId,
-                        "sectionName": record_insert.excluded.sectionName,
-                        "analysisGroup": record_insert.excluded.analysisGroup,
-                        "sentIdLocal": record_insert.excluded.sentIdLocal,
-                        "sentenceContent": record_insert.excluded.sentenceContent,
-                        "isTracer": record_insert.excluded.isTracer,
-                        "isFormLanguage": record_insert.excluded.isFormLanguage,
-                        "sourceType": record_insert.excluded.sourceType,
-                        "updatedAt": record_insert.excluded.updatedAt,
-                    },
+                match_insert.on_conflict_do_update(
+                    index_elements=[SentenceMatch.globalId],
+                    set_={"updatedAt": match_insert.excluded.updatedAt},
                 )
             )
-            self._rebuild_application_summaries(session, application_ids)
+            summary_rows = {
+                (record["applicationId"], record["analysisGroup"]) for record in records
+            }
+            if summary_rows:
+                summary_insert = insert(ApplicationMatchSummary).values(
+                    [
+                        {
+                            "applicationId": application_id,
+                            "analysisGroup": analysis_group,
+                            "sectionMatchCounts": {},
+                            "totalMatching": 0,
+                            "updatedAt": _now(),
+                        }
+                        for application_id, analysis_group in sorted(summary_rows)
+                    ]
+                )
+                session.execute(summary_insert.on_conflict_do_nothing())
 
         jobs_queued = sum(
             record["globalId"] not in existing_ids and is_matchable_sentence(record)
@@ -142,34 +134,27 @@ class PostgresStore:
         return {"registered": len(records), "jobsQueued": jobs_queued}
 
     @staticmethod
-    def _record_values(record: dict, threshold: int) -> dict:
-        """Add worker defaults to one validated sentence record."""
+    def _match_values(record: dict, threshold: int) -> dict:
+        """Build one new match-list row from a validated sentence."""
 
+        status = "pending" if is_matchable_sentence(record) else "skipped"
         return {
             "globalId": record["globalId"],
-            "applicationId": record["applicationId"],
             "tspId": record["tspId"],
-            "documentId": record["documentId"],
+            "applicationId": record["applicationId"],
             "sectionName": record["sectionName"],
             "analysisGroup": record["analysisGroup"],
-            "sentIdLocal": record["sentIdLocal"],
-            "sentenceContent": record["sentenceContent"],
-            "sentenceKey": record["sentenceKey"],
-            "isTracer": record["isTracer"],
-            "isFormLanguage": record["isFormLanguage"],
-            "sourceType": record["sourceType"],
-            "exactMatchCount": 0,
-            "semanticMatchCount": 0,
-            "matchThreshold": threshold,
-            "matchStatus": ("pending" if is_matchable_sentence(record) else "skipped"),
+            "matchingGlobalIds": [],
+            "matchStatus": status,
             "matchAttempts": 0,
+            "matchThreshold": threshold,
             "matchAvailableAt": _now(),
             "createdAt": record["createdAt"],
             "updatedAt": record["updatedAt"],
         }
 
     def validate_sentence_identity(self, records: list):
-        """Reject matching identity changes before OpenSearch is updated."""
+        """Reject metadata changes before OpenSearch is updated."""
 
         if not records:
             return
@@ -178,70 +163,64 @@ class PostgresStore:
 
     @staticmethod
     def _validate_sentence_identity(session, records: list) -> set:
-        """Keep a global ID tied to one stable matching identity."""
+        """Keep one global ID tied to stable matching metadata."""
 
-        incoming_sentences = {}
+        incoming = {}
         for record in records:
             global_id = record["globalId"]
             identity = {
                 "applicationId": record["applicationId"],
-                "sentenceKey": record["sentenceKey"],
+                "tspId": record["tspId"],
+                "sectionName": record["sectionName"],
                 "analysisGroup": record["analysisGroup"],
-                "isTracer": record["isTracer"],
-                "isFormLanguage": record["isFormLanguage"],
+                "skipped": not is_matchable_sentence(record),
             }
-            previous_identity = incoming_sentences.get(global_id)
-            if previous_identity and previous_identity != identity:
+            previous = incoming.get(global_id)
+            if previous and previous != identity:
                 raise ValueError(
-                    "The same globalId has different matching identity values "
-                    f"in one batch: {global_id}"
+                    f"The same globalId has different metadata in one batch: {global_id}"
                 )
-            incoming_sentences[global_id] = identity
+            incoming[global_id] = identity
 
-        existing = session.execute(
+        rows = session.execute(
             select(
-                SentenceRecord.globalId,
-                SentenceRecord.applicationId,
-                SentenceRecord.sentenceKey,
-                SentenceRecord.analysisGroup,
-                SentenceRecord.isTracer,
-                SentenceRecord.isFormLanguage,
-            ).where(SentenceRecord.globalId.in_(incoming_sentences))
+                SentenceMatch.globalId,
+                SentenceMatch.applicationId,
+                SentenceMatch.tspId,
+                SentenceMatch.sectionName,
+                SentenceMatch.analysisGroup,
+                SentenceMatch.matchStatus,
+            ).where(SentenceMatch.globalId.in_(incoming))
         ).mappings()
         existing_ids = set()
-        for row in existing:
+        for row in rows:
             global_id = row["globalId"]
             existing_ids.add(global_id)
-            incoming = incoming_sentences[global_id]
-            if row["sentenceKey"] != incoming["sentenceKey"]:
+            expected = incoming[global_id]
+            actual = {
+                "applicationId": row["applicationId"],
+                "tspId": row["tspId"],
+                "sectionName": row["sectionName"],
+                "analysisGroup": row["analysisGroup"],
+                "skipped": row["matchStatus"] == "skipped",
+            }
+            if actual != expected:
                 raise ValueError(
-                    "globalId cannot be reused for different sentence content "
-                    f"without reset: {global_id}"
-                )
-            if row["applicationId"] != incoming["applicationId"]:
-                raise ValueError(
-                    "globalId cannot move to a different application without "
-                    f"reset: {global_id}"
-                )
-            matching_fields = ("analysisGroup", "isTracer", "isFormLanguage")
-            if any(row[field] != incoming[field] for field in matching_fields):
-                raise ValueError(
-                    "globalId cannot change analysisGroup, isTracer, or "
-                    f"isFormLanguage without reset: {global_id}"
+                    f"globalId cannot change matching metadata without reset: {global_id}"
                 )
         return existing_ids
 
     def claim_job(self) -> dict | None:
-        """Lock and return one pending sentence without blocking another worker."""
+        """Lock and return one pending sentence for the worker."""
 
         with self.sessions.begin() as session:
             global_id = session.execute(
-                select(SentenceRecord.globalId)
+                select(SentenceMatch.globalId)
                 .where(
-                    SentenceRecord.matchStatus == "pending",
-                    SentenceRecord.matchAvailableAt <= _now(),
+                    SentenceMatch.matchStatus == "pending",
+                    SentenceMatch.matchAvailableAt <= _now(),
                 )
-                .order_by(SentenceRecord.matchAvailableAt, SentenceRecord.globalId)
+                .order_by(SentenceMatch.matchAvailableAt, SentenceMatch.globalId)
                 .with_for_update(skip_locked=True)
                 .limit(1)
             ).scalar_one_or_none()
@@ -250,529 +229,217 @@ class PostgresStore:
 
             row = (
                 session.execute(
-                    update(SentenceRecord)
-                    .where(SentenceRecord.globalId == global_id)
+                    update(SentenceMatch)
+                    .where(SentenceMatch.globalId == global_id)
                     .values(
                         matchStatus="running",
-                        matchAttempts=SentenceRecord.matchAttempts + 1,
+                        matchAttempts=SentenceMatch.matchAttempts + 1,
                         matchLockedAt=_now(),
                         matchLastError=None,
                     )
-                    .returning(*SentenceRecord.__table__.columns)
+                    .returning(*SentenceMatch.__table__.columns)
                 )
                 .mappings()
                 .one()
             )
-            self._change_summary_job_status(session, row, "pending", "running")
             return dict(row)
 
     def requeue_stale_jobs(self):
-        """Return abandoned running records to the pending queue."""
+        """Return abandoned running rows to the pending queue."""
 
         stale_time = _now() - timedelta(minutes=10)
         with self.sessions.begin() as session:
-            stale_records = (
-                session.execute(
-                    select(SentenceRecord).where(
-                        SentenceRecord.matchStatus == "running",
-                        SentenceRecord.matchLockedAt < stale_time,
-                    )
+            session.execute(
+                update(SentenceMatch)
+                .where(
+                    SentenceMatch.matchStatus == "running",
+                    SentenceMatch.matchLockedAt < stale_time,
                 )
-                .scalars()
-                .all()
+                .values(
+                    matchStatus="pending",
+                    matchAvailableAt=_now(),
+                    matchLockedAt=None,
+                    matchLastError="Worker stopped before completing the job",
+                )
             )
-            for record in stale_records:
-                self._change_summary_job_status(
-                    session,
-                    model_values(record),
-                    "running",
-                    "pending",
-                )
-                record.matchStatus = "pending"
-                record.matchAvailableAt = _now()
-                record.matchLockedAt = None
-                record.matchLastError = "Worker stopped before completing the job"
 
     def complete_job(self, global_id: str):
-        """Mark one sentence's background matching work as successful."""
+        """Mark one sentence's background work as successful."""
 
         with self.sessions.begin() as session:
-            record = session.get(SentenceRecord, global_id, with_for_update=True)
-            if not record:
-                return
-            values = model_values(record)
-            self._change_summary_job_status(session, values, "running", "completed")
-            record.matchStatus = "completed"
-            record.matchAttempts = 0
-            record.matchLockedAt = None
-            record.matchLastError = None
-            record.matchCompletedAt = _now()
+            session.execute(
+                update(SentenceMatch)
+                .where(SentenceMatch.globalId == global_id)
+                .values(
+                    matchStatus="completed",
+                    matchAttempts=0,
+                    matchLockedAt=None,
+                    matchLastError=None,
+                    updatedAt=_now(),
+                )
+            )
 
     def retry_failed_jobs(self) -> int:
-        """Put stopped sentence records back in the worker queue."""
+        """Put stopped rows back in the worker queue."""
 
         with self.sessions.begin() as session:
-            failed_records = (
-                session.execute(
-                    select(SentenceRecord)
-                    .where(SentenceRecord.matchStatus == "failed")
-                    .with_for_update()
+            result = session.execute(
+                update(SentenceMatch)
+                .where(SentenceMatch.matchStatus == "failed")
+                .values(
+                    matchStatus="pending",
+                    matchAttempts=0,
+                    matchAvailableAt=_now(),
+                    matchLockedAt=None,
+                    matchLastError=None,
                 )
-                .scalars()
-                .all()
             )
-            for record in failed_records:
-                values = model_values(record)
-                self._change_summary_job_status(
-                    session,
-                    values,
-                    "failed",
-                    "pending",
-                )
-                record.matchStatus = "pending"
-                record.matchAttempts = 0
-                record.matchAvailableAt = _now()
-                record.matchLockedAt = None
-                record.matchLastError = None
-        return len(failed_records)
+        return result.rowcount or 0
 
     def fail_job(self, job: dict, error: Exception):
         """Retry one sentence or stop it after the configured limit."""
 
         final_failure = job["matchAttempts"] >= self.config.worker_max_attempts
-        next_status = "failed" if final_failure else "pending"
-        available_at = job["matchAvailableAt"]
+        status = "failed" if final_failure else "pending"
+        available_at = _now()
         if not final_failure:
-            available_at = _now() + timedelta(seconds=self.config.worker_retry_seconds)
+            available_at += timedelta(seconds=self.config.worker_retry_seconds)
+        with self.sessions.begin() as session:
+            session.execute(
+                update(SentenceMatch)
+                .where(SentenceMatch.globalId == job["globalId"])
+                .values(
+                    matchStatus=status,
+                    matchAvailableAt=available_at,
+                    matchLockedAt=None,
+                    matchLastError=str(error)[:4_000],
+                )
+            )
+
+    def save_match_group(self, source_global_id: str, target_global_ids: list) -> dict:
+        """Merge direct vector hits into one symmetric connected match group."""
+
+        direct_targets = set(target_global_ids)
+        direct_targets.discard(source_global_id)
+        if not direct_targets:
+            return {
+                "directMatchesFound": 0,
+                "matchGroupSize": 1,
+                "matchListsUpdated": 0,
+            }
 
         with self.sessions.begin() as session:
-            record = session.get(
-                SentenceRecord,
-                job["globalId"],
+            # Updating a connected group touches many rows. One transaction lock
+            # prevents two workers from partially overwriting the same arrays.
+            session.execute(select(func.pg_advisory_xact_lock(MATCH_WRITE_LOCK)))
+            member_ids = {source_global_id, *direct_targets}
+            rows_by_id = {}
+
+            while True:
+                rows = (
+                    session.execute(
+                        select(SentenceMatch)
+                        .where(
+                            SentenceMatch.globalId.in_(member_ids),
+                            SentenceMatch.matchStatus != "skipped",
+                        )
+                        .order_by(SentenceMatch.globalId)
+                        .with_for_update()
+                    )
+                    .scalars()
+                    .all()
+                )
+                rows_by_id = {row.globalId: row for row in rows}
+                expanded_ids = set(rows_by_id)
+                for row in rows:
+                    expanded_ids.update(row.matchingGlobalIds)
+                if expanded_ids == member_ids:
+                    break
+                member_ids = expanded_ids
+
+            if source_global_id not in rows_by_id:
+                raise RuntimeError(
+                    f"Match row does not exist for source: {source_global_id}"
+                )
+
+            cluster_ids = set(rows_by_id)
+            match_lists = complete_match_lists(cluster_ids)
+            summary_deltas = defaultdict(int)
+            updated_rows = 0
+            for row in rows_by_id.values():
+                new_matches = match_lists[row.globalId]
+                old_count = len(row.matchingGlobalIds)
+                if new_matches == row.matchingGlobalIds:
+                    continue
+                row.matchingGlobalIds = new_matches
+                row.updatedAt = _now()
+                updated_rows += 1
+                summary_deltas[
+                    (row.applicationId, row.analysisGroup, row.sectionName)
+                ] += len(new_matches) - old_count
+
+            self._apply_summary_deltas(session, summary_deltas)
+
+        return {
+            "directMatchesFound": len(direct_targets & cluster_ids),
+            "matchGroupSize": len(cluster_ids),
+            "matchListsUpdated": updated_rows,
+        }
+
+    @staticmethod
+    def _apply_summary_deltas(session, deltas: dict):
+        """Add match-list size changes to application and section totals."""
+
+        for key, delta in deltas.items():
+            if not delta:
+                continue
+            application_id, analysis_group, section_name = key
+            summary = session.get(
+                ApplicationMatchSummary,
+                (application_id, analysis_group),
                 with_for_update=True,
             )
-            if not record:
-                return
-            self._change_summary_job_status(
-                session,
-                model_values(record),
-                "running",
-                next_status,
-            )
-            record.matchStatus = next_status
-            record.matchAvailableAt = available_at
-            record.matchLockedAt = None
-            record.matchLastError = str(error)[:4_000]
-
-    def _change_summary_job_status(
-        self,
-        session,
-        record: dict,
-        old_status: str,
-        new_status: str,
-    ):
-        """Move one worker count in every prepared summary for the sentence."""
-
-        old_column = self._status_column(old_status)
-        new_column = self._status_column(new_status)
-        for scope, section_name, analysis_group in self._summary_keys(record):
-            session.execute(
-                update(ApplicationSentenceSummary)
-                .where(
-                    ApplicationSentenceSummary.applicationId == record["applicationId"],
-                    ApplicationSentenceSummary.summaryScope == scope,
-                    ApplicationSentenceSummary.sectionName == section_name,
-                    ApplicationSentenceSummary.analysisGroup == analysis_group,
-                )
-                .values(
-                    {
-                        old_column: func.greatest(old_column - 1, 0),
-                        new_column: new_column + 1,
-                        ApplicationSentenceSummary.updatedAt: _now(),
-                    }
-                )
-            )
-
-    @staticmethod
-    def _status_column(status: str):
-        """Return the summary column used by one worker status."""
-
-        columns = {
-            "pending": ApplicationSentenceSummary.pendingCount,
-            "running": ApplicationSentenceSummary.runningCount,
-            "completed": ApplicationSentenceSummary.completedCount,
-            "failed": ApplicationSentenceSummary.failedCount,
-        }
-        return columns[status]
-
-    @staticmethod
-    def _summary_keys(record: dict) -> list:
-        """Return application, analysis, and section keys for one sentence."""
-
-        return [
-            (APPLICATION_SCOPE, "", ""),
-            (ANALYSIS_SCOPE, "", record["analysisGroup"]),
-            (
-                SECTION_SCOPE,
-                record["sectionName"],
-                record["analysisGroup"],
-            ),
-        ]
-
-    def sentence(self, global_id: str) -> dict | None:
-        """Get one sentence record for the background worker."""
-
-        with self.sessions() as session:
-            record = session.get(SentenceRecord, global_id)
-            return model_values(record) if record else None
-
-    def save_matches(
-        self,
-        source: dict,
-        catalog_matches: list,
-        model_version: str,
-    ) -> dict:
-        """Save unique sentence relationships and update both sentence counts."""
-
-        if not is_matchable_sentence(source) or not catalog_matches:
-            return {"candidatesFound": 0, "relationshipsInserted": 0}
-
-        match_by_key = {match["sentenceKey"]: match for match in catalog_matches}
-        candidate_keys = list(match_by_key)
-        with self.sessions.begin() as session:
-            targets = session.execute(
-                select(
-                    SentenceRecord.globalId,
-                    SentenceRecord.applicationId,
-                    SentenceRecord.sentenceKey,
-                ).where(
-                    SentenceRecord.sentenceKey.in_(candidate_keys),
-                    SentenceRecord.globalId != source["globalId"],
-                    SentenceRecord.analysisGroup == source["analysisGroup"],
-                    SentenceRecord.isTracer.is_(False),
-                    SentenceRecord.isFormLanguage.is_(False),
-                )
-            ).mappings()
-
-            edges = []
-            for target in targets:
-                if (
-                    self.config.match_across_applications_only
-                    and target["applicationId"] == source["applicationId"]
-                ):
-                    continue
-                match = match_by_key[target["sentenceKey"]]
-                edges.append(self._edge(source, dict(target), match, model_version))
-
-            if not edges:
-                return {
-                    "candidatesFound": len(catalog_matches),
-                    "relationshipsInserted": 0,
-                }
-
-            inserted = []
-            for offset in range(0, len(edges), MATCH_INSERT_BATCH_SIZE):
-                batch = edges[offset : offset + MATCH_INSERT_BATCH_SIZE]
-                relationship_insert = insert(SentenceRelationship).values(batch)
-                rows = session.execute(
-                    relationship_insert.on_conflict_do_nothing().returning(
-                        SentenceRelationship.sentenceIdLow,
-                        SentenceRelationship.sentenceIdHigh,
-                        SentenceRelationship.matchType,
-                    )
-                ).mappings()
-                inserted.extend(dict(row) for row in rows)
-
-            if inserted:
-                deltas = defaultdict(_empty_match_counts)
-                for edge in inserted:
-                    match_type = edge["matchType"]
-                    deltas[edge["sentenceIdLow"]][match_type] += 1
-                    deltas[edge["sentenceIdHigh"]][match_type] += 1
-                self._apply_match_deltas(session, deltas)
-
-        return {
-            "candidatesFound": len(catalog_matches),
-            "relationshipsInserted": len(inserted),
-        }
-
-    def _apply_match_deltas(self, session, deltas: dict):
-        """Update sentence and prepared summary counts in one transaction."""
-
-        records = (
-            session.execute(
-                select(SentenceRecord)
-                .where(SentenceRecord.globalId.in_(deltas))
-                .order_by(SentenceRecord.globalId)
-                .with_for_update()
-            )
-            .scalars()
-            .all()
-        )
-
-        summary_deltas = defaultdict(_empty_match_counts)
-        matched_sentence_deltas = defaultdict(int)
-        for record in records:
-            counts = deltas[record.globalId]
-            was_unmatched = record.exactMatchCount + record.semanticMatchCount == 0
-            record.exactMatchCount += counts["exact"]
-            record.semanticMatchCount += counts["semantic"]
-            became_matched = was_unmatched and counts["exact"] + counts["semantic"] > 0
-
-            values = model_values(record)
-            for scope, section_name, analysis_group in self._summary_keys(values):
-                key = (
-                    record.applicationId,
-                    scope,
-                    section_name,
-                    analysis_group,
-                )
-                summary_deltas[key]["exact"] += counts["exact"]
-                summary_deltas[key]["semantic"] += counts["semantic"]
-                if became_matched:
-                    matched_sentence_deltas[key] += 1
-
-        for key, counts in summary_deltas.items():
-            application_id, scope, section_name, analysis_group = key
-            session.execute(
-                update(ApplicationSentenceSummary)
-                .where(
-                    ApplicationSentenceSummary.applicationId == application_id,
-                    ApplicationSentenceSummary.summaryScope == scope,
-                    ApplicationSentenceSummary.sectionName == section_name,
-                    ApplicationSentenceSummary.analysisGroup == analysis_group,
-                )
-                .values(
-                    exactMatchCount=(
-                        ApplicationSentenceSummary.exactMatchCount + counts["exact"]
-                    ),
-                    semanticMatchCount=(
-                        ApplicationSentenceSummary.semanticMatchCount
-                        + counts["semantic"]
-                    ),
-                    totalMatchCount=(
-                        ApplicationSentenceSummary.totalMatchCount
-                        + counts["exact"]
-                        + counts["semantic"]
-                    ),
-                    matchedSentences=(
-                        ApplicationSentenceSummary.matchedSentences
-                        + matched_sentence_deltas[key]
-                    ),
+            if summary is None:
+                summary = ApplicationMatchSummary(
+                    applicationId=application_id,
+                    analysisGroup=analysis_group,
+                    sectionMatchCounts={},
+                    totalMatching=0,
                     updatedAt=_now(),
                 )
+                session.add(summary)
+                session.flush()
+
+            section_counts = dict(summary.sectionMatchCounts)
+            section_counts[section_name] = max(
+                0,
+                int(section_counts.get(section_name, 0)) + delta,
             )
-
-    @staticmethod
-    def _edge(
-        source: dict,
-        target: dict,
-        match: dict,
-        model_version: str,
-    ) -> dict:
-        """Put the smaller global ID first so one pair has one row."""
-
-        if source["globalId"] < target["globalId"]:
-            low_id = source["globalId"]
-            high_id = target["globalId"]
-        else:
-            low_id = target["globalId"]
-            high_id = source["globalId"]
-        return {
-            "sentenceIdLow": low_id,
-            "sentenceIdHigh": high_id,
-            "similarityPercentage": match["similarityPercentage"],
-            "matchType": match["matchType"],
-            "modelVersion": model_version,
-        }
-
-    def _rebuild_application_summaries(self, session, application_ids: list):
-        """Rebuild prepared rows after sentence inserts or deletions."""
-
-        for application_id in application_ids:
-            session.execute(
-                delete(ApplicationSentenceSummary).where(
-                    ApplicationSentenceSummary.applicationId == application_id
-                )
-            )
-            records_exist = session.scalar(
-                select(func.count())
-                .select_from(SentenceRecord)
-                .where(
-                    SentenceRecord.applicationId == application_id,
-                    SentenceRecord.isTracer.is_(False),
-                    SentenceRecord.isFormLanguage.is_(False),
-                )
-            )
-            if not records_exist:
-                continue
-
-            overall = (
-                session.execute(
-                    self._summary_query(
-                        SentenceRecord.applicationId == application_id,
-                    )
-                )
-                .mappings()
-                .one()
-            )
-            rows = [
-                self._summary_values(
-                    application_id,
-                    APPLICATION_SCOPE,
-                    "",
-                    "",
-                    overall,
-                )
-            ]
-
-            analyses = session.execute(
-                self._summary_query(
-                    SentenceRecord.applicationId == application_id,
-                    SentenceRecord.analysisGroup,
-                ).group_by(SentenceRecord.analysisGroup)
-            ).mappings()
-            for analysis in analyses:
-                rows.append(
-                    self._summary_values(
-                        application_id,
-                        ANALYSIS_SCOPE,
-                        "",
-                        analysis["analysisGroup"],
-                        analysis,
-                    )
-                )
-
-            sections = session.execute(
-                self._summary_query(
-                    SentenceRecord.applicationId == application_id,
-                    SentenceRecord.sectionName,
-                    SentenceRecord.analysisGroup,
-                ).group_by(
-                    SentenceRecord.sectionName,
-                    SentenceRecord.analysisGroup,
-                )
-            ).mappings()
-            for section in sections:
-                rows.append(
-                    self._summary_values(
-                        application_id,
-                        SECTION_SCOPE,
-                        section["sectionName"],
-                        section["analysisGroup"],
-                        section,
-                    )
-                )
-            session.execute(insert(ApplicationSentenceSummary).values(rows))
-
-    @staticmethod
-    def _summary_query(condition, *group_columns):
-        """Build aggregate columns for matchable sentences only."""
-
-        total_matches = (
-            SentenceRecord.exactMatchCount + SentenceRecord.semanticMatchCount
-        )
-        return select(
-            *group_columns,
-            func.count(distinct(SentenceRecord.documentId)).label("totalDocuments"),
-            func.count(SentenceRecord.globalId).label("totalSentences"),
-            func.count(SentenceRecord.globalId)
-            .filter(total_matches > 0)
-            .label("matchedSentences"),
-            func.coalesce(func.sum(SentenceRecord.exactMatchCount), 0).label(
-                "exactMatchCount"
-            ),
-            func.coalesce(func.sum(SentenceRecord.semanticMatchCount), 0).label(
-                "semanticMatchCount"
-            ),
-            func.count(SentenceRecord.globalId)
-            .filter(SentenceRecord.matchStatus == "pending")
-            .label("pendingCount"),
-            func.count(SentenceRecord.globalId)
-            .filter(SentenceRecord.matchStatus == "running")
-            .label("runningCount"),
-            func.count(SentenceRecord.globalId)
-            .filter(SentenceRecord.matchStatus == "completed")
-            .label("completedCount"),
-            func.count(SentenceRecord.globalId)
-            .filter(SentenceRecord.matchStatus == "failed")
-            .label("failedCount"),
-        ).where(
-            condition,
-            SentenceRecord.isTracer.is_(False),
-            SentenceRecord.isFormLanguage.is_(False),
-        )
-
-    @staticmethod
-    def _summary_values(
-        application_id: str,
-        scope: str,
-        section_name: str,
-        analysis_group: str,
-        counts,
-    ) -> dict:
-        """Turn aggregate query values into one summary table row."""
-
-        exact_count = int(counts["exactMatchCount"])
-        semantic_count = int(counts["semanticMatchCount"])
-        return {
-            "applicationId": application_id,
-            "summaryScope": scope,
-            "sectionName": section_name,
-            "analysisGroup": analysis_group,
-            "totalDocuments": int(counts["totalDocuments"]),
-            "totalSentences": int(counts["totalSentences"]),
-            "matchedSentences": int(counts["matchedSentences"]),
-            "exactMatchCount": exact_count,
-            "semanticMatchCount": semantic_count,
-            "totalMatchCount": exact_count + semantic_count,
-            "pendingCount": int(counts["pendingCount"]),
-            "runningCount": int(counts["runningCount"]),
-            "completedCount": int(counts["completedCount"]),
-            "failedCount": int(counts["failedCount"]),
-            "updatedAt": _now(),
-        }
+            summary.sectionMatchCounts = section_counts
+            summary.totalMatching = max(0, summary.totalMatching + delta)
+            summary.updatedAt = _now()
 
     def application_summary(
         self,
         application_id: str,
         analysis_group: str,
     ) -> dict | None:
-        """Return prepared totals for one application and analysis group."""
+        """Return one ready-to-display application summary row."""
 
         with self.sessions() as session:
-            overall = session.get(
-                ApplicationSentenceSummary,
-                (application_id, ANALYSIS_SCOPE, "", analysis_group),
+            summary = session.get(
+                ApplicationMatchSummary,
+                (application_id, analysis_group),
             )
-            if not overall:
+            if summary is None:
                 return None
-            section_rows = session.execute(
-                select(ApplicationSentenceSummary)
-                .where(
-                    ApplicationSentenceSummary.applicationId == application_id,
-                    ApplicationSentenceSummary.summaryScope == SECTION_SCOPE,
-                    ApplicationSentenceSummary.analysisGroup == analysis_group,
-                )
-                .order_by(ApplicationSentenceSummary.sectionName)
-            ).scalars()
-            response = model_values(overall)
-            response.pop("summaryScope")
-            response.pop("sectionName")
-            response["sectionSummaries"] = []
-            for row in section_rows:
-                section = model_values(row)
-                section.pop("applicationId")
-                section.pop("summaryScope")
-                response["sectionSummaries"].append(section)
+            values = model_values(summary)
 
-        if response["pendingCount"] or response["runningCount"]:
-            response["status"] = "processing"
-        elif response["failedCount"]:
-            response["status"] = "completed_with_failures"
-        else:
-            response["status"] = "completed"
-        return response
+        values["sectionMatches"] = [
+            {"sectionName": section_name, "matchingCount": int(count)}
+            for section_name, count in sorted(values.pop("sectionMatchCounts").items())
+        ]
+        return values
 
     def application_sentences(
         self,
@@ -781,60 +448,47 @@ class PostgresStore:
         page_size: int,
         next_token: str | None,
     ) -> dict:
-        """List matchable sentences for one application and analysis group."""
+        """List sentence IDs and their prepared match-list counts."""
 
         after_global_id = decode_id_token(next_token) if next_token else ""
+        matching_count = func.cardinality(SentenceMatch.matchingGlobalIds).label(
+            "matchingCount"
+        )
         with self.sessions() as session:
             rows = (
                 session.execute(
                     select(
-                        SentenceRecord.globalId,
-                        SentenceRecord.tspId,
-                        SentenceRecord.documentId,
-                        SentenceRecord.sectionName,
-                        SentenceRecord.analysisGroup,
-                        SentenceRecord.sentIdLocal,
-                        SentenceRecord.sentenceContent,
-                        SentenceRecord.isTracer,
-                        SentenceRecord.isFormLanguage,
-                        SentenceRecord.sentenceKey,
-                        SentenceRecord.sourceType,
-                        SentenceRecord.exactMatchCount,
-                        SentenceRecord.semanticMatchCount,
-                        SentenceRecord.matchStatus,
+                        SentenceMatch.globalId,
+                        SentenceMatch.tspId,
+                        SentenceMatch.applicationId,
+                        SentenceMatch.sectionName,
+                        SentenceMatch.analysisGroup,
+                        matching_count,
+                        SentenceMatch.matchStatus,
                     )
                     .where(
-                        SentenceRecord.applicationId == application_id,
-                        SentenceRecord.analysisGroup == analysis_group,
-                        SentenceRecord.isTracer.is_(False),
-                        SentenceRecord.isFormLanguage.is_(False),
-                        SentenceRecord.globalId > after_global_id,
+                        SentenceMatch.applicationId == application_id,
+                        SentenceMatch.analysisGroup == analysis_group,
+                        SentenceMatch.matchStatus != "skipped",
+                        SentenceMatch.globalId > after_global_id,
                     )
-                    .order_by(SentenceRecord.globalId)
+                    .order_by(SentenceMatch.globalId)
                     .limit(page_size + 1)
                 )
                 .mappings()
                 .all()
             )
 
-        has_more = len(rows) > page_size
-        sentences = []
-        for row in rows[:page_size]:
-            item = dict(row)
-            item["totalMatchCount"] = int(item["exactMatchCount"]) + int(
-                item["semanticMatchCount"]
-            )
-            sentences.append(item)
-
-        new_token = None
-        if has_more and sentences:
-            new_token = encode_id_token(sentences[-1]["globalId"])
+        page = [dict(row) for row in rows[:page_size]]
+        next_page_token = None
+        if len(rows) > page_size and page:
+            next_page_token = encode_id_token(page[-1]["globalId"])
         return {
             "applicationId": application_id,
             "analysisGroup": analysis_group,
             "pageSize": page_size,
-            "sentences": sentences,
-            "nextToken": new_token,
+            "sentences": page,
+            "nextToken": next_page_token,
         }
 
     def sentence_matches(
@@ -843,260 +497,178 @@ class PostgresStore:
         page_size: int,
         next_token: str | None,
     ) -> dict | None:
-        """Read one sentence's prepared relationships with keyset pagination."""
+        """Return one sentence's stored match-list page."""
 
-        after_score = None
-        after_id = None
-        if next_token:
-            after_score, after_id = decode_page_token(next_token)
-
+        after_global_id = decode_id_token(next_token) if next_token else ""
         with self.sessions() as session:
-            source = session.get(SentenceRecord, global_id)
-            if not source:
+            source = session.get(SentenceMatch, global_id)
+            if source is None:
                 return None
-
-            directed = union_all(
+            all_matches = source.matchingGlobalIds
+            start = bisect.bisect_right(all_matches, after_global_id)
+            page_ids = all_matches[start : start + page_size]
+            has_more = start + page_size < len(all_matches)
+            target_rows = session.execute(
                 select(
-                    SentenceRelationship.sentenceIdHigh.label("matchedGlobalId"),
-                    SentenceRelationship.similarityPercentage,
-                    SentenceRelationship.matchType,
-                    SentenceRelationship.createdAt,
-                ).where(SentenceRelationship.sentenceIdLow == global_id),
-                select(
-                    SentenceRelationship.sentenceIdLow.label("matchedGlobalId"),
-                    SentenceRelationship.similarityPercentage,
-                    SentenceRelationship.matchType,
-                    SentenceRelationship.createdAt,
-                ).where(SentenceRelationship.sentenceIdHigh == global_id),
-            ).subquery()
-
-            page_query = (
-                select(
-                    directed,
-                    SentenceRecord.applicationId.label("matchedApplicationId"),
-                    SentenceRecord.sentenceKey.label("matchedSentenceKey"),
-                    SentenceRecord.sentenceContent,
-                    SentenceRecord.tspId,
-                    SentenceRecord.documentId,
-                    SentenceRecord.sectionName,
-                    SentenceRecord.analysisGroup,
-                    SentenceRecord.sentIdLocal,
-                    SentenceRecord.isTracer,
-                    SentenceRecord.isFormLanguage,
-                    SentenceRecord.sourceType,
-                )
-                .join(
-                    SentenceRecord,
-                    SentenceRecord.globalId == directed.c.matchedGlobalId,
-                )
-                .order_by(
-                    directed.c.similarityPercentage.desc(),
-                    directed.c.matchedGlobalId,
-                )
-                .limit(page_size + 1)
-            )
-            if after_score is not None:
-                page_query = page_query.where(
-                    or_(
-                        directed.c.similarityPercentage < after_score,
-                        and_(
-                            directed.c.similarityPercentage == after_score,
-                            directed.c.matchedGlobalId > after_id,
-                        ),
-                    )
-                )
-            rows = session.execute(page_query).mappings().all()
-
+                    SentenceMatch.globalId,
+                    SentenceMatch.tspId,
+                    SentenceMatch.applicationId,
+                    SentenceMatch.sectionName,
+                    SentenceMatch.analysisGroup,
+                ).where(SentenceMatch.globalId.in_(page_ids))
+            ).mappings()
+            target_by_id = {row["globalId"]: dict(row) for row in target_rows}
+            matches = [target_by_id[item] for item in page_ids if item in target_by_id]
             source_values = model_values(source)
 
-        has_more = len(rows) > page_size
-        page = [dict(row) for row in rows[:page_size]]
-        new_token = None
-        if has_more and page:
-            last = page[-1]
-            new_token = encode_page_token(
-                float(last["similarityPercentage"]),
-                last["matchedGlobalId"],
-            )
-
+        next_page_token = None
+        if has_more and page_ids:
+            next_page_token = encode_id_token(page_ids[-1])
         return {
             "globalId": source_values["globalId"],
+            "tspId": source_values["tspId"],
             "applicationId": source_values["applicationId"],
-            "sentenceKey": source_values["sentenceKey"],
-            "sentenceContent": source_values["sentenceContent"],
-            "exactMatchCount": source_values["exactMatchCount"],
-            "semanticMatchCount": source_values["semanticMatchCount"],
-            "totalMatchCount": (
-                source_values["exactMatchCount"] + source_values["semanticMatchCount"]
-            ),
+            "sectionName": source_values["sectionName"],
+            "analysisGroup": source_values["analysisGroup"],
+            "matchingCount": len(all_matches),
             "pageSize": page_size,
-            "matches": page,
-            "nextToken": new_token,
+            "matches": matches,
+            "nextToken": next_page_token,
         }
-
-    def deletion_catalog_keys(
-        self,
-        application_id: str | None = None,
-        tsp_id: str | None = None,
-    ) -> list:
-        """Return unique catalog keys before a scoped deletion starts."""
-
-        conditions = []
-        if application_id is not None:
-            conditions.append(SentenceRecord.applicationId == application_id)
-        if tsp_id is not None:
-            conditions.append(SentenceRecord.tspId == tsp_id)
-        if not conditions:
-            raise ValueError("applicationId or tspId is required for deletion")
-        with self.sessions() as session:
-            return list(
-                session.scalars(
-                    select(distinct(SentenceRecord.sentenceKey)).where(*conditions)
-                )
-            )
 
     def delete_sentences(
         self,
         application_id: str | None = None,
         tsp_id: str | None = None,
     ) -> dict:
-        """Delete one application scope and repair surviving sentence counts."""
+        """Delete scoped rows and remove their IDs from every surviving list."""
 
         conditions = []
         if application_id is not None:
-            conditions.append(SentenceRecord.applicationId == application_id)
+            conditions.append(SentenceMatch.applicationId == application_id)
         if tsp_id is not None:
-            conditions.append(SentenceRecord.tspId == tsp_id)
+            conditions.append(SentenceMatch.tspId == tsp_id)
         if not conditions:
             raise ValueError("applicationId or tspId is required for deletion")
 
         with self.sessions.begin() as session:
-            # Lock target rows first so a worker cannot create a new relationship
-            # while this transaction repairs the surviving sentence counts.
+            session.execute(select(func.pg_advisory_xact_lock(MATCH_WRITE_LOCK)))
             target_rows = (
                 session.execute(
-                    select(
-                        SentenceRecord.globalId,
-                        SentenceRecord.applicationId,
-                    )
-                    .where(*conditions)
-                    .order_by(SentenceRecord.globalId)
-                    .with_for_update()
+                    select(SentenceMatch).where(*conditions).with_for_update()
                 )
-                .mappings()
+                .scalars()
                 .all()
             )
-            target_ids = [row["globalId"] for row in target_rows]
+            target_ids = {row.globalId for row in target_rows}
             if not target_ids:
-                return {
-                    "sentencesDeleted": 0,
-                    "relationshipsDeleted": 0,
-                }
+                return {"sentencesDeleted": 0, "matchListsUpdated": 0}
 
-            low_target_survivors = (
-                select(
-                    SentenceRelationship.sentenceIdHigh.label("globalId"),
-                    SentenceRelationship.matchType,
-                    func.count().label("count"),
-                )
-                .where(
-                    SentenceRelationship.sentenceIdLow.in_(target_ids),
-                    SentenceRelationship.sentenceIdHigh.not_in(target_ids),
-                )
-                .group_by(
-                    SentenceRelationship.sentenceIdHigh,
-                    SentenceRelationship.matchType,
-                )
-            )
-            high_target_survivors = (
-                select(
-                    SentenceRelationship.sentenceIdLow.label("globalId"),
-                    SentenceRelationship.matchType,
-                    func.count().label("count"),
-                )
-                .where(
-                    SentenceRelationship.sentenceIdHigh.in_(target_ids),
-                    SentenceRelationship.sentenceIdLow.not_in(target_ids),
-                )
-                .group_by(
-                    SentenceRelationship.sentenceIdLow,
-                    SentenceRelationship.matchType,
-                )
-            )
-            survivor_rows = session.execute(
-                union_all(low_target_survivors, high_target_survivors)
-            ).mappings()
-            survivor_deltas = defaultdict(_empty_match_counts)
-            for row in survivor_rows:
-                survivor_deltas[row["globalId"]][row["matchType"]] += int(row["count"])
-
-            relationship_delete = session.execute(
-                delete(SentenceRelationship)
-                .where(
-                    or_(
-                        SentenceRelationship.sentenceIdLow.in_(target_ids),
-                        SentenceRelationship.sentenceIdHigh.in_(target_ids),
-                    )
-                )
-                .execution_options(synchronize_session=False)
-            )
-            relationships_deleted = relationship_delete.rowcount or 0
-
-            affected_applications = {row["applicationId"] for row in target_rows}
-            if survivor_deltas:
-                survivors = session.execute(
-                    select(SentenceRecord)
-                    .where(SentenceRecord.globalId.in_(survivor_deltas))
-                    .order_by(SentenceRecord.globalId)
+            affected_applications = {row.applicationId for row in target_rows}
+            survivors = (
+                session.execute(
+                    select(SentenceMatch)
+                    .where(SentenceMatch.matchingGlobalIds.overlap(list(target_ids)))
                     .with_for_update()
-                ).scalars()
-                for survivor in survivors:
-                    counts = survivor_deltas[survivor.globalId]
-                    survivor.exactMatchCount = max(
-                        0,
-                        survivor.exactMatchCount - counts["exact"],
-                    )
-                    survivor.semanticMatchCount = max(
-                        0,
-                        survivor.semanticMatchCount - counts["semantic"],
-                    )
+                )
+                .scalars()
+                .all()
+            )
+            survivor_updates = 0
+            for survivor in survivors:
+                if survivor.globalId in target_ids:
+                    continue
+                new_matches = [
+                    item
+                    for item in survivor.matchingGlobalIds
+                    if item not in target_ids
+                ]
+                if new_matches != survivor.matchingGlobalIds:
+                    survivor.matchingGlobalIds = new_matches
+                    survivor.updatedAt = _now()
+                    survivor_updates += 1
                     affected_applications.add(survivor.applicationId)
 
             session.execute(
-                delete(SentenceRecord).where(SentenceRecord.globalId.in_(target_ids))
+                delete(SentenceMatch).where(SentenceMatch.globalId.in_(target_ids))
             )
-            self._rebuild_application_summaries(
-                session,
-                sorted(affected_applications),
-            )
+            self._rebuild_summaries(session, affected_applications)
 
         return {
             "sentencesDeleted": len(target_ids),
-            "relationshipsDeleted": int(relationships_deleted),
+            "matchListsUpdated": survivor_updates,
         }
 
+    @staticmethod
+    def _rebuild_summaries(session, application_ids: set):
+        """Recalculate simple section totals after a deletion."""
+
+        if not application_ids:
+            return
+        session.execute(
+            delete(ApplicationMatchSummary).where(
+                ApplicationMatchSummary.applicationId.in_(application_ids)
+            )
+        )
+        rows = session.execute(
+            select(
+                SentenceMatch.applicationId,
+                SentenceMatch.analysisGroup,
+                SentenceMatch.sectionName,
+                func.sum(func.cardinality(SentenceMatch.matchingGlobalIds)).label(
+                    "matchingCount"
+                ),
+            )
+            .where(SentenceMatch.applicationId.in_(application_ids))
+            .group_by(
+                SentenceMatch.applicationId,
+                SentenceMatch.analysisGroup,
+                SentenceMatch.sectionName,
+            )
+        ).mappings()
+        summaries = {}
+        for row in rows:
+            key = (row["applicationId"], row["analysisGroup"])
+            summary = summaries.setdefault(
+                key,
+                {"sectionMatchCounts": {}, "totalMatching": 0},
+            )
+            count = int(row["matchingCount"] or 0)
+            summary["sectionMatchCounts"][row["sectionName"]] = count
+            summary["totalMatching"] += count
+
+        if summaries:
+            session.execute(
+                insert(ApplicationMatchSummary).values(
+                    [
+                        {
+                            "applicationId": key[0],
+                            "analysisGroup": key[1],
+                            "sectionMatchCounts": value["sectionMatchCounts"],
+                            "totalMatching": value["totalMatching"],
+                            "updatedAt": _now(),
+                        }
+                        for key, value in summaries.items()
+                    ]
+                )
+            )
+
     def stats(self) -> dict:
-        """Count the three PostgreSQL tables and worker states."""
+        """Count the two PostgreSQL tables and worker states."""
 
         with self.sessions() as session:
-            result = {
-                "sentenceRecords": session.scalar(
-                    select(func.count()).select_from(SentenceRecord)
-                ),
-                "sentenceRelationships": session.scalar(
-                    select(func.count()).select_from(SentenceRelationship)
-                ),
-                "applicationSummaryRows": session.scalar(
-                    select(func.count()).select_from(ApplicationSentenceSummary)
-                ),
-            }
             status_rows = session.execute(
                 select(
-                    SentenceRecord.matchStatus,
-                    func.count(SentenceRecord.globalId).label("count"),
-                ).group_by(SentenceRecord.matchStatus)
+                    SentenceMatch.matchStatus,
+                    func.count(SentenceMatch.globalId).label("count"),
+                ).group_by(SentenceMatch.matchStatus)
             ).mappings()
-            result["jobs"] = {
-                row["matchStatus"]: int(row["count"]) for row in status_rows
+            return {
+                "sentenceMatches": session.scalar(
+                    select(func.count()).select_from(SentenceMatch)
+                ),
+                "applicationSummaries": session.scalar(
+                    select(func.count()).select_from(ApplicationMatchSummary)
+                ),
+                "jobs": {row["matchStatus"]: int(row["count"]) for row in status_rows},
             }
-        return result
