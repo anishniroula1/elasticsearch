@@ -1,0 +1,31 @@
+SHELL := /bin/sh
+
+.PHONY: help setup test dev local down logs clean
+
+help:
+	@echo "make dev    Build and run API, worker, and PostgreSQL"
+	@echo "make local  Run only the API locally on port 8008"
+	@echo "make test   Install development packages and run tests"
+	@echo "make down   Stop Docker containers"
+	@echo "make logs   Follow API and worker logs"
+
+setup:
+	uv sync --extra dev
+
+test: setup
+	uv run pytest -q
+
+dev:
+	docker compose up --build
+
+local: setup
+	uv run uvicorn sentence_search.main:app --reload --host 0.0.0.0 --port 8008
+
+down:
+	docker compose down
+
+logs:
+	docker compose logs -f api worker
+
+clean:
+	docker compose down --volumes
