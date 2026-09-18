@@ -1,6 +1,8 @@
 import base64
 import binascii
+import logging
 import struct
+import threading
 import time
 
 from opensearchpy import NotFoundError, RequestError, TransportError, helpers
@@ -21,6 +23,8 @@ TERMS_BATCH_SIZE = 10_000  # Sentence keys sent in one terms filter.
 CATALOG_RETRY_ATTEMPTS = 10  # Remote embedding failures allowed per batch.
 CATALOG_RETRY_SECONDS = 5  # Pause before retrying a failed Titan batch.
 RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
+
+logger = logging.getLogger(__name__)
 
 
 def occurrence_index_definition(config: Config) -> dict:
@@ -89,6 +93,8 @@ class OpenSearchStore:
 
         self.config = config
         self.client = client or OpenSearchClient(config).create_client()
+        self._catalog_backoff_lock = threading.Lock()
+        self._catalog_cooldown_until = 0.0
 
     def wait_until_ready(self, attempts: int = 60):
         """Wait for OpenSearch during application startup."""
@@ -252,51 +258,110 @@ class OpenSearchStore:
         return len(actions)
 
     def _bulk_with_retry(self, actions: list, label: str):
-        """Retry a complete idempotent bulk batch after temporary failures."""
+        """Retry failed catalog records after a shared five-second pause."""
 
+        if not actions:
+            return
+        pending_actions = actions
         last_error = None
         for attempt in range(1, CATALOG_RETRY_ATTEMPTS + 1):
+            # If one worker sees a proxy failure, every catalog worker waits
+            # before sending more Titan requests through the same proxy.
+            self._wait_for_catalog_cooldown()
             try:
                 helpers.bulk(
                     self.client,
-                    actions,
+                    pending_actions,
                     chunk_size=self.config.seed_batch_size,
                     raise_on_error=True,
                 )
                 return
-            except BulkIndexError as error:
+            except (BulkIndexError, TransportError) as error:
                 last_error = error
-                statuses = self._bulk_error_statuses(error)
-                if not statuses or not statuses.issubset(RETRYABLE_STATUSES):
+                retry_actions = self._retryable_catalog_actions(
+                    error,
+                    pending_actions,
+                )
+                if retry_actions is None:
                     raise RuntimeError(
                         f"Non-retryable OpenSearch {label} bulk failure: {error}"
                     ) from error
-            except TransportError as error:
-                last_error = error
-                status = getattr(error, "status_code", None)
-                if status not in RETRYABLE_STATUSES:
-                    raise
 
-            if attempt == CATALOG_RETRY_ATTEMPTS:
-                break
-            time.sleep(CATALOG_RETRY_SECONDS)
+                if attempt == CATALOG_RETRY_ATTEMPTS:
+                    break
+                pending_actions = retry_actions
+                logger.warning(
+                    "Catalog batch attempt %s/%s failed; retrying %s "
+                    "document(s) after %s seconds",
+                    attempt,
+                    CATALOG_RETRY_ATTEMPTS,
+                    len(pending_actions),
+                    CATALOG_RETRY_SECONDS,
+                )
+                self._start_catalog_cooldown()
 
         raise RuntimeError(
             f"OpenSearch {label} bulk failed after "
             f"{CATALOG_RETRY_ATTEMPTS} attempts: {last_error}"
         ) from last_error
 
-    @staticmethod
-    def _bulk_error_statuses(error: BulkIndexError) -> set:
-        """Read HTTP statuses from a BulkIndexError."""
+    def _start_catalog_cooldown(self):
+        """Start one shared delay for all catalog workers."""
 
-        statuses = set()
+        with self._catalog_backoff_lock:
+            self._catalog_cooldown_until = max(
+                self._catalog_cooldown_until,
+                time.monotonic() + CATALOG_RETRY_SECONDS,
+            )
+        self._wait_for_catalog_cooldown()
+
+    def _wait_for_catalog_cooldown(self):
+        """Wait until catalog workers may call the embedding proxy again."""
+
+        while True:
+            with self._catalog_backoff_lock:
+                remaining = self._catalog_cooldown_until - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(remaining)
+
+    @staticmethod
+    def _retryable_catalog_actions(
+        error: BulkIndexError | TransportError,
+        actions: list,
+    ) -> list | None:
+        """Return only failed actions that are safe to send again."""
+
+        if isinstance(error, TransportError):
+            status = getattr(error, "status_code", None)
+            if status == "N/A":
+                return actions
+            try:
+                status = int(status)
+            except (TypeError, ValueError):
+                return None
+            return actions if status in RETRYABLE_STATUSES else None
+
+        failed_ids = set()
         for item in error.errors:
             operation = next(iter(item.values()))
             status = operation.get("status")
-            if status is not None:
-                statuses.add(int(status))
-        return statuses
+            failed_id = operation.get("_id")
+            try:
+                status = int(status)
+            except (TypeError, ValueError):
+                return None
+            if status not in RETRYABLE_STATUSES or failed_id is None:
+                return None
+            failed_ids.add(str(failed_id))
+
+        if not failed_ids:
+            return None
+        retry_actions = [
+            action for action in actions if str(action.get("_id")) in failed_ids
+        ]
+        retry_ids = {str(action.get("_id")) for action in retry_actions}
+        return retry_actions if retry_ids == failed_ids else None
 
     def refresh_indices(self):
         """Make newly indexed catalog and occurrence records searchable."""

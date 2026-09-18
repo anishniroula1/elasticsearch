@@ -1,5 +1,6 @@
 import csv
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from sentence_search.config import Config
@@ -125,6 +126,58 @@ class SeedService:
         self.match_service = match_service
         self.summary_service = summary_service
 
+    def _complete_wave(self, executor, pending_batches: list) -> dict:
+        """Finish one bounded group of catalog, occurrence, and match work.
+
+        Input: up to SEED_WORKERS batches whose Titan work is running.
+        Output: counts for records fully saved and matched in this wave.
+        """
+
+        occurrence_count = 0
+        catalog_count = 0
+        sources = []
+        matchable_keys = set()
+
+        # Futures are read in CSV order. This means an occurrence batch is
+        # saved only after its own catalog vectors have finished successfully.
+        for pending in pending_batches:
+            pending["catalogFuture"].result()
+            batch_sources = pending["sources"]
+            occurrence_count += self.opensearch.bulk_index_occurrences(batch_sources)
+            catalog_count += pending["catalogCount"]
+            sources.extend(batch_sources)
+            matchable_keys.update(pending["matchableKeys"])
+
+        # One refresh makes the entire wave visible. With 16 workers and the
+        # default batch size, this replaces 16 separate refresh operations.
+        self.opensearch.refresh_indices()
+        registration = self.postgres.register_sentence_keys(sources)
+
+        match_futures = []
+        for sentence_key in sorted(matchable_keys):
+            match_futures.append(
+                executor.submit(
+                    self.match_service.match_sentence_key,
+                    sentence_key,
+                    self.config.match_threshold,
+                )
+            )
+        for match_future in match_futures:
+            match_future.result()
+
+        summary_result = self.summary_service.refresh_affected_applications(
+            list(matchable_keys)
+        )
+        return {
+            "occurrencesIndexed": occurrence_count,
+            "catalogDocumentsIndexed": catalog_count,
+            "sentenceKeysRegistered": len(registration["newSentenceKeys"]),
+            "matchesCalculated": len(matchable_keys),
+            "applicationSummariesRefreshed": summary_result[
+                "applicationSummariesRefreshed"
+            ],
+        }
+
     def seed(
         self,
         path: Path,
@@ -148,59 +201,81 @@ class SeedService:
         matches_calculated = 0
         application_summaries_refreshed = 0
         completed_batches = 0
+        completed_waves = 0
         known_catalog_keys = set()
+        pending_batches = []
 
-        for batch in csv_batches(path, self.config.seed_batch_size):
-            sources = [record.model_dump(mode="json") for record in batch]
-            records_read += len(sources)
+        with ThreadPoolExecutor(
+            max_workers=self.config.seed_workers,
+            thread_name_prefix="sentence-seed",
+        ) as executor:
+            for batch in csv_batches(path, self.config.seed_batch_size):
+                sources = [record.model_dump(mode="json") for record in batch]
+                records_read += len(sources)
 
-            # Stop this batch before indexing if a global ID changed its text.
-            self.opensearch.validate_occurrence_identity(sources)
+                # Stop this batch before indexing if a global ID changed its text.
+                self.opensearch.validate_occurrence_identity(sources)
 
-            catalog_by_key = {}
-            for source in sources:
-                key = source["sentenceKey"]
-                if key not in known_catalog_keys:
-                    catalog_by_key.setdefault(
-                        key,
-                        self._catalog_source(source),
-                    )
+                catalog_by_key = {}
+                for source in sources:
+                    key = source["sentenceKey"]
+                    if key not in known_catalog_keys:
+                        catalog_by_key.setdefault(
+                            key,
+                            self._catalog_source(source),
+                        )
 
-            candidate_keys = list(catalog_by_key)
-            existing = self.opensearch.existing_catalog_keys(candidate_keys)
-            new_catalog_sources = [
-                catalog_by_key[key] for key in candidate_keys if key not in existing
-            ]
-            catalog_indexed += self.opensearch.bulk_index_catalog(new_catalog_sources)
-            catalog_reused += len(existing)
-            known_catalog_keys.update(candidate_keys)
+                candidate_keys = list(catalog_by_key)
+                existing = self.opensearch.existing_catalog_keys(candidate_keys)
+                new_catalog_sources = [
+                    catalog_by_key[key] for key in candidate_keys if key not in existing
+                ]
+                catalog_reused += len(existing)
+                known_catalog_keys.update(candidate_keys)
 
-            occurrences_indexed += self.opensearch.bulk_index_occurrences(sources)
-            # Titan vectors must be searchable before KNN matching starts.
-            self.opensearch.refresh_indices()
-            registration = self.postgres.register_sentence_keys(sources)
-            sentence_keys_registered += len(registration["newSentenceKeys"])
-
-            matchable_keys = sorted(
-                {
-                    source["sentenceKey"]
-                    for source in sources
-                    if is_matchable_sentence(source)
-                }
-            )
-            for sentence_key in matchable_keys:
-                self.match_service.match_sentence_key(
-                    sentence_key,
-                    self.config.match_threshold,
+                # Only catalog work runs here. The bounded pending list keeps
+                # at most SEED_WORKERS batches in memory at one time.
+                catalog_future = executor.submit(
+                    self.opensearch.bulk_index_catalog,
+                    new_catalog_sources,
                 )
-                matches_calculated += 1
-            summary_result = self.summary_service.refresh_affected_applications(
-                matchable_keys
-            )
-            application_summaries_refreshed += summary_result[
-                "applicationSummariesRefreshed"
-            ]
-            completed_batches += 1
+                pending_batches.append(
+                    {
+                        "catalogFuture": catalog_future,
+                        "catalogCount": len(new_catalog_sources),
+                        "sources": sources,
+                        "matchableKeys": {
+                            source["sentenceKey"]
+                            for source in sources
+                            if is_matchable_sentence(source)
+                        },
+                    }
+                )
+
+                if len(pending_batches) == self.config.seed_workers:
+                    result = self._complete_wave(executor, pending_batches)
+                    occurrences_indexed += result["occurrencesIndexed"]
+                    catalog_indexed += result["catalogDocumentsIndexed"]
+                    sentence_keys_registered += result["sentenceKeysRegistered"]
+                    matches_calculated += result["matchesCalculated"]
+                    application_summaries_refreshed += result[
+                        "applicationSummariesRefreshed"
+                    ]
+                    completed_batches += len(pending_batches)
+                    completed_waves += 1
+                    pending_batches = []
+
+            if pending_batches:
+                result = self._complete_wave(executor, pending_batches)
+                occurrences_indexed += result["occurrencesIndexed"]
+                catalog_indexed += result["catalogDocumentsIndexed"]
+                sentence_keys_registered += result["sentenceKeysRegistered"]
+                matches_calculated += result["matchesCalculated"]
+                application_summaries_refreshed += result[
+                    "applicationSummariesRefreshed"
+                ]
+                completed_batches += len(pending_batches)
+                completed_waves += 1
 
         return {
             "recordsRead": records_read,
@@ -211,6 +286,9 @@ class SeedService:
             "matchesCalculated": matches_calculated,
             "applicationSummariesRefreshed": application_summaries_refreshed,
             "completedBatches": completed_batches,
+            "completedWaves": completed_waves,
+            "seedBatchSize": self.config.seed_batch_size,
+            "seedWorkers": self.config.seed_workers,
             "threshold": self.config.match_threshold,
             "reset": reset,
             "matchProcessing": "duringSeed",

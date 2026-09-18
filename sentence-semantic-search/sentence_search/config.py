@@ -36,6 +36,7 @@ class Config:
     index_replicas: int
     vector_dimension: int
     seed_batch_size: int
+    seed_workers: int
     database_url: str
     match_threshold: int
 
@@ -80,6 +81,7 @@ class Config:
             index_replicas=_integer("INDEX_REPLICAS", 1, 0),
             vector_dimension=_integer("VECTOR_DIMENSION", 512),
             seed_batch_size=_integer("SEED_BATCH_SIZE", 100),
+            seed_workers=_integer("SEED_WORKERS", 4),
             database_url=os.getenv(
                 "DATABASE_URL",
                 "postgresql+psycopg://sentence:sentence@localhost:5432/sentence_matches",
@@ -106,6 +108,8 @@ class Config:
             raise ValueError("MATCH_THRESHOLD must be between 1 and 100")
         if self.vector_dimension != 512:
             raise ValueError("VECTOR_DIMENSION must be 512 for this Titan model setup")
+        if self.seed_workers > 16:
+            raise ValueError("SEED_WORKERS must be between 1 and 16")
 
 
 config = Config.from_environment()

@@ -1,6 +1,7 @@
 import json
 
 import pytest
+from opensearchpy.helpers.errors import BulkIndexError
 
 from sentence_search.config import config
 from sentence_search.opensearch_store import (
@@ -99,6 +100,22 @@ def test_catalog_mapping_uses_512_dimension_faiss_cosine():
     assert vector["method"]["engine"] == "faiss"
     assert vector["method"]["space_type"] == "cosinesimil"
     assert "parameters" not in vector["method"]
+
+
+def test_catalog_retry_keeps_only_temporary_failed_documents():
+    store = OpenSearchStore(config, EmptySearchClient())
+    actions = [
+        {"_id": "key-1", "_source": {"sentenceKey": "key-1"}},
+        {"_id": "key-2", "_source": {"sentenceKey": "key-2"}},
+    ]
+    error = BulkIndexError(
+        "one temporary failure",
+        [{"index": {"_id": "key-2", "status": 500}}],
+    )
+
+    retry_actions = store._retryable_catalog_actions(error, actions)
+
+    assert retry_actions == [actions[1]]
 
 
 def test_tsp_deletion_uses_camel_case_opensearch_fields():

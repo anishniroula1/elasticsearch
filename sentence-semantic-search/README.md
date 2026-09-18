@@ -129,6 +129,23 @@ For one matchable key, ingestion does this:
 5. Find applications using those keys.
 6. Calculate and save complete section and application totals.
 
+CSV seeding uses small parallel waves:
+
+```text
+SEED_BATCH_SIZE=100
+SEED_WORKERS=4
+```
+
+Each worker can send one 100-record catalog batch through the Titan pipeline.
+`SEED_WORKERS` can be set from 1 through 16. After one wave finishes, the API
+saves its occurrence records, refreshes OpenSearch once, matches its unique
+sentence keys with the same worker pool, and refreshes the affected application
+summaries.
+
+If Titan or the Lasso proxy returns a temporary 408, 429, or 5xx error, every
+catalog worker pauses for five seconds. Only failed catalog records are sent
+again, up to ten attempts. A permanent 400 error stops the seed immediately.
+
 The API returns only after matching and summary updates finish. If ingestion
 fails, send that sentence or seed request again. The relationship writes are
 safe to repeat.
@@ -314,6 +331,7 @@ OPENSEARCH_SEMANTIC_MODEL_ID
 AWS_ACCESS_KEY_ID
 AWS_SECRET_ACCESS_KEY
 AWS_SESSION_TOKEN
+SEED_WORKERS
 ```
 
 Leave AWS keys empty when the container receives an IAM role.
