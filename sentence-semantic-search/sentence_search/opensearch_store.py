@@ -283,20 +283,28 @@ class OpenSearchStore:
                     pending_actions,
                 )
                 if retry_actions is None:
+                    logger.exception(
+                        "Catalog batch stopped because the failure is not retryable"
+                    )
                     raise RuntimeError(
                         f"Non-retryable OpenSearch {label} bulk failure: {error}"
                     ) from error
 
                 if attempt == CATALOG_RETRY_ATTEMPTS:
+                    logger.exception(
+                        "Catalog batch stopped after %s attempts",
+                        CATALOG_RETRY_ATTEMPTS,
+                    )
                     break
                 pending_actions = retry_actions
                 logger.warning(
                     "Catalog batch attempt %s/%s failed; retrying %s "
-                    "document(s) after %s seconds",
+                    "document(s) after %s seconds. Error: %s",
                     attempt,
                     CATALOG_RETRY_ATTEMPTS,
                     len(pending_actions),
                     CATALOG_RETRY_SECONDS,
+                    error,
                 )
                 self._start_catalog_cooldown()
 

@@ -1,3 +1,4 @@
+import logging
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
@@ -20,6 +21,7 @@ from sentence_search.models import SeedRequest, SentenceOccurrence
 
 router = APIRouter()
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+logger = logging.getLogger(__name__)
 
 
 class IndexSelection(StrEnum):
@@ -140,8 +142,10 @@ def seed(request: SeedRequest):
             request.reset,
         )
     except ValueError as error:
+        logger.warning("Sentence seed rejected: %s", error)
         raise HTTPException(status_code=400, detail=str(error)) from error
     except (OpenSearchException, SQLAlchemyError, RuntimeError) as error:
+        logger.exception("Sentence seed failed")
         raise HTTPException(status_code=503, detail=str(error)) from error
 
 

@@ -145,6 +145,9 @@ summaries.
 If Titan or the Lasso proxy returns a temporary 408, 429, or 5xx error, every
 catalog worker pauses for five seconds. Only failed catalog records are sent
 again, up to ten attempts. A permanent 400 error stops the seed immediately.
+Every retry is printed as a warning with its attempt number, failed document
+count, wait time, and error. A permanent or final failure prints its full error
+before the seed endpoint returns the failure response.
 
 The API returns only after matching and summary updates finish. If ingestion
 fails, send that sentence or seed request again. The relationship writes are
