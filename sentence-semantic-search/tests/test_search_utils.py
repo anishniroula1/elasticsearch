@@ -2,8 +2,8 @@ import pytest
 
 from sentence_search.search_utils import (
     cosine_percentage,
-    decode_id_token,
-    encode_id_token,
+    decode_page_token,
+    encode_page_token,
     minimum_opensearch_score,
 )
 
@@ -16,8 +16,13 @@ def test_ninety_percent_uses_faiss_cosine_score():
 
 
 def test_application_page_token_round_trip():
-    token = encode_id_token("SENT-22")
-    assert decode_id_token(token) == "SENT-22"
+    state = {
+        "type": "summary",
+        "afterGlobalId": "SENT-22",
+        "totalSentences": 120,
+    }
+    token = encode_page_token(state)
+    assert decode_page_token(token) == state
 
 
 def test_invalid_threshold_is_rejected():

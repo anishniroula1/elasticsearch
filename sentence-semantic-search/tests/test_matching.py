@@ -1,80 +1,29 @@
-from sentence_search.postgres_store import PostgresStore, complete_match_lists
+from sentence_search.postgres_store import add_direct_key_matches
 
 
-class ConnectionThatMustNotRun:
-    def execute(self, statement):
-        raise AssertionError("Duplicate batch should fail before PostgreSQL query")
+def test_new_match_is_saved_in_both_directions():
+    result = add_direct_key_matches(
+        {"A": ["B"], "B": ["A"], "D": []},
+        "D",
+        ["A"],
+    )
+
+    assert result["D"] == ["A"]
+    assert result["A"] == ["B", "D"]
 
 
-class ExistingSentenceConnection:
-    def execute(self, statement):
-        return self
+def test_direct_key_matching_does_not_create_transitive_matches():
+    result = add_direct_key_matches(
+        {"A": ["B"], "B": ["A"], "D": []},
+        "D",
+        ["A"],
+    )
 
-    def mappings(self):
-        return self
-
-    def __iter__(self):
-        return iter(
-            [
-                {
-                    "globalId": "1",
-                    "applicationId": "A1",
-                    "tspId": "T1",
-                    "sectionName": "Affidavit",
-                    "analysisGroup": "Asylee",
-                    "matchStatus": "completed",
-                }
-            ]
-        )
+    assert "D" not in result["B"]
+    assert "B" not in result["D"]
 
 
-def test_connected_group_is_saved_on_every_global_id():
-    lists = complete_match_lists({"1", "10", "40", "78"})
+def test_source_key_is_not_added_to_its_own_match_list():
+    result = add_direct_key_matches({"A": []}, "A", ["A"])
 
-    assert lists["1"] == ["10", "40", "78"]
-    assert lists["10"] == ["1", "40", "78"]
-    assert lists["40"] == ["1", "10", "78"]
-    assert lists["78"] == ["1", "10", "40"]
-
-
-def test_same_global_id_cannot_have_different_metadata_in_one_batch():
-    first = _record()
-    second = _record()
-    second["sectionName"] = "B1"
-
-    try:
-        PostgresStore._validate_sentence_identity(
-            ConnectionThatMustNotRun(),
-            [first, second],
-        )
-    except ValueError as error:
-        assert "different metadata" in str(error)
-    else:
-        raise AssertionError("Expected duplicate globalId validation error")
-
-
-def test_global_id_cannot_change_matching_metadata():
-    record = _record()
-    record["applicationId"] = "A2"
-
-    try:
-        PostgresStore._validate_sentence_identity(
-            ExistingSentenceConnection(),
-            [record],
-        )
-    except ValueError as error:
-        assert "cannot change matching metadata" in str(error)
-    else:
-        raise AssertionError("Expected matching metadata validation error")
-
-
-def _record() -> dict:
-    return {
-        "globalId": "1",
-        "applicationId": "A1",
-        "tspId": "T1",
-        "sectionName": "Affidavit",
-        "analysisGroup": "Asylee",
-        "isTracer": False,
-        "isFormLanguage": False,
-    }
+    assert result == {"A": []}

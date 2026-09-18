@@ -41,19 +41,5 @@ services:
       retries: 20
     restart: unless-stopped
 
-  worker:
-    build: .
-    command: ["python", "-m", "sentence_search.worker"]
-    env_file:
-      - .env
-    environment:
-      DATABASE_URL: postgresql+psycopg://sentence:sentence@postgres:5432/sentence_matches
-    depends_on:
-      postgres:
-        condition: service_healthy
-      api:
-        condition: service_healthy
-    restart: unless-stopped
-
 volumes:
   sentence-postgres-data:

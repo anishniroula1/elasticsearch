@@ -16,7 +16,7 @@ from sentence_search.search_utils import (
 SEMANTIC_TEXT_FIELD = "sentenceContent"
 VECTOR_FIELD = "sentenceContentVector"
 CATALOG_PAGE_SIZE = 1_000  # Catalog matches read from one aggregation page.
-OCCURRENCE_PAGE_SIZE = 5_000  # Occurrence candidates read per search page.
+SUMMARY_BUCKET_PAGE_SIZE = 1_000  # Summary buckets read per composite page.
 TERMS_BATCH_SIZE = 10_000  # Sentence keys sent in one terms filter.
 CATALOG_RETRY_ATTEMPTS = 10  # Remote embedding failures allowed per batch.
 CATALOG_RETRY_SECONDS = 5  # Pause before retrying a failed Titan batch.
@@ -36,7 +36,6 @@ def occurrence_index_definition(config: Config) -> dict:
             "properties": {
                 "applicationId": {"type": "keyword"},
                 "tspId": {"type": "keyword"},
-                "documentId": {"type": "keyword"},
                 "sectionName": {"type": "keyword"},
                 "globalId": {"type": "keyword"},
                 "sentIdLocal": {"type": "long"},
@@ -74,10 +73,6 @@ def catalog_index_definition(config: Config) -> dict:
                         "name": "hnsw",
                         "space_type": "cosinesimil",
                         "engine": "faiss",
-                        "parameters": {
-                            "ef_construction": 100,
-                            "m": 16,
-                        },
                     },
                 },
                 "sentenceKey": {"type": "keyword"},
@@ -125,7 +120,7 @@ class OpenSearchStore:
             try:
                 self.client.indices.create(index=index, body=definition)
             except RequestError:
-                # The API and worker can start together. Continue only when
+                # The API can start while another process creates storage. Continue when
                 # the other process successfully created this same index.
                 if not self.client.indices.exists(index=index):
                     raise
@@ -445,68 +440,303 @@ class OpenSearchStore:
                 break
         return matches
 
-    def occurrence(self, global_id: str) -> dict | None:
-        """Return one occurrence document by its global ID."""
+    def application_occurrence_page(
+        self,
+        application_id: str,
+        analysis_group: str,
+        page_size: int,
+        after_global_id: str | None,
+        include_total: bool,
+    ) -> dict:
+        """Return one eligible application-sentence page in global-ID order."""
 
-        try:
-            response = self.client.get(
+        body = {
+            "size": page_size + 1,
+            "track_total_hits": include_total,
+            "_source": [
+                "applicationId",
+                "tspId",
+                "sectionName",
+                "globalId",
+                "sentIdLocal",
+                "sentenceContent",
+                "sentenceKey",
+                "sourceType",
+                "analysisGroup",
+            ],
+            "sort": [{"globalId": "asc"}],
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"term": {"applicationId": application_id}},
+                        {"term": {"analysisGroup": analysis_group}},
+                        {"term": {"isTracer": False}},
+                        {"term": {"isFormLanguage": False}},
+                    ]
+                }
+            },
+        }
+        if after_global_id:
+            body["search_after"] = [after_global_id]
+        response = self.client.search(
+            index=self.config.occurrence_alias,
+            body=body,
+        )
+        hits = response["hits"]["hits"]
+        page_hits = hits[:page_size]
+        total = None
+        if include_total:
+            total = int(response["hits"]["total"]["value"])
+        next_after = None
+        if len(hits) > page_size and page_hits:
+            next_after = str(page_hits[-1]["sort"][0])
+        return {
+            "sentences": [hit["_source"] for hit in page_hits],
+            "nextAfterGlobalId": next_after,
+            "totalSentences": total,
+        }
+
+    def application_groups_for_keys(self, sentence_keys: list) -> list:
+        """Find applications and analysis groups affected by sentence keys."""
+
+        groups = set()
+        unique_keys = sorted(set(sentence_keys))
+        for offset in range(0, len(unique_keys), TERMS_BATCH_SIZE):
+            batch = unique_keys[offset : offset + TERMS_BATCH_SIZE]
+            filters = [
+                {"terms": {"sentenceKey": batch}},
+                {"term": {"isTracer": False}},
+                {"term": {"isFormLanguage": False}},
+            ]
+            groups.update(self._application_groups(filters))
+        return [
+            {"applicationId": application_id, "analysisGroup": analysis_group}
+            for application_id, analysis_group in sorted(groups)
+        ]
+
+    def deletion_application_groups(
+        self,
+        application_id: str | None = None,
+        tsp_id: str | None = None,
+    ) -> list:
+        """Find summary rows touched by an application or TSP deletion."""
+
+        filters = [
+            {"term": {"isTracer": False}},
+            {"term": {"isFormLanguage": False}},
+        ]
+        if application_id is not None:
+            filters.append({"term": {"applicationId": application_id}})
+        if tsp_id is not None:
+            filters.append({"term": {"tspId": tsp_id}})
+        if application_id is None and tsp_id is None:
+            raise ValueError("applicationId or tspId is required for deletion")
+        groups = self._application_groups(filters)
+        return [
+            {"applicationId": item[0], "analysisGroup": item[1]}
+            for item in sorted(groups)
+        ]
+
+    def _application_groups(self, filters: list) -> set:
+        """Read unique application and analysis-group pairs by composite pages."""
+
+        groups = set()
+        after_key = None
+        while True:
+            composite = {
+                "size": SUMMARY_BUCKET_PAGE_SIZE,
+                "sources": [
+                    {"applicationId": {"terms": {"field": "applicationId"}}},
+                    {"analysisGroup": {"terms": {"field": "analysisGroup"}}},
+                ],
+            }
+            if after_key:
+                composite["after"] = after_key
+            response = self.client.search(
                 index=self.config.occurrence_alias,
-                id=global_id,
-            )
-        except NotFoundError:
-            return None
-        return response["_source"]
-
-    def matching_occurrences(self, source: dict, catalog_matches: list) -> list:
-        """Find eligible occurrence IDs for the catalog keys and analysis group."""
-
-        candidate_keys = sorted({match["sentenceKey"] for match in catalog_matches})
-        targets = []
-        for offset in range(0, len(candidate_keys), TERMS_BATCH_SIZE):
-            key_batch = candidate_keys[offset : offset + TERMS_BATCH_SIZE]
-            search_after = None
-            while True:
-                must_not = [{"ids": {"values": [source["globalId"]]}}]
-                if self.config.match_across_applications_only:
-                    must_not.append(
-                        {"term": {"applicationId": source["applicationId"]}}
-                    )
-                body = {
-                    "size": OCCURRENCE_PAGE_SIZE,
+                body={
+                    "size": 0,
                     "track_total_hits": False,
-                    "_source": [
-                        "globalId",
-                        "tspId",
-                        "applicationId",
-                        "sectionName",
-                        "analysisGroup",
-                    ],
-                    "sort": [{"globalId": "asc"}],
+                    "query": {"bool": {"filter": filters}},
+                    "aggs": {"applicationGroups": {"composite": composite}},
+                },
+            )
+            result = response["aggregations"]["applicationGroups"]
+            for bucket in result["buckets"]:
+                groups.add(
+                    (
+                        str(bucket["key"]["applicationId"]),
+                        str(bucket["key"]["analysisGroup"]),
+                    )
+                )
+            after_key = result.get("after_key")
+            if not after_key or not result["buckets"]:
+                break
+        return groups
+
+    def application_key_section_counts(
+        self,
+        application_id: str,
+        analysis_group: str,
+    ) -> list:
+        """Count eligible application occurrences by section and sentence key."""
+
+        counts = []
+        after_key = None
+        while True:
+            composite = {
+                "size": SUMMARY_BUCKET_PAGE_SIZE,
+                "sources": [
+                    {"sectionName": {"terms": {"field": "sectionName"}}},
+                    {"sentenceKey": {"terms": {"field": "sentenceKey"}}},
+                ],
+            }
+            if after_key:
+                composite["after"] = after_key
+            response = self.client.search(
+                index=self.config.occurrence_alias,
+                body={
+                    "size": 0,
+                    "track_total_hits": False,
                     "query": {
                         "bool": {
                             "filter": [
-                                {"terms": {"sentenceKey": key_batch}},
-                                {"term": {"analysisGroup": source["analysisGroup"]}},
+                                {"term": {"applicationId": application_id}},
+                                {"term": {"analysisGroup": analysis_group}},
+                                {"term": {"isTracer": False}},
+                                {"term": {"isFormLanguage": False}},
+                            ]
+                        }
+                    },
+                    "aggs": {"keySections": {"composite": composite}},
+                },
+            )
+            result = response["aggregations"]["keySections"]
+            for bucket in result["buckets"]:
+                counts.append(
+                    {
+                        "sectionName": str(bucket["key"]["sectionName"]),
+                        "sentenceKey": str(bucket["key"]["sentenceKey"]),
+                        "occurrenceCount": int(bucket["doc_count"]),
+                    }
+                )
+            after_key = result.get("after_key")
+            if not after_key or not result["buckets"]:
+                break
+        return counts
+
+    def occurrence_counts_by_key(
+        self,
+        sentence_keys: list,
+        excluded_application_id: str,
+        analysis_group: str,
+    ) -> dict:
+        """Count eligible outside-application occurrences for each key."""
+
+        counts = {}
+        unique_keys = sorted(set(sentence_keys))
+        for offset in range(0, len(unique_keys), TERMS_BATCH_SIZE):
+            batch = unique_keys[offset : offset + TERMS_BATCH_SIZE]
+            response = self.client.search(
+                index=self.config.occurrence_alias,
+                body={
+                    "size": 0,
+                    "track_total_hits": False,
+                    "query": {
+                        "bool": {
+                            "filter": [
+                                {"terms": {"sentenceKey": batch}},
+                                {"term": {"analysisGroup": analysis_group}},
                                 {"term": {"isTracer": False}},
                                 {"term": {"isFormLanguage": False}},
                             ],
-                            "must_not": must_not,
+                            "must_not": [
+                                {"term": {"applicationId": excluded_application_id}}
+                            ],
                         }
                     },
+                    "aggs": {
+                        "keyCounts": {
+                            "terms": {
+                                "field": "sentenceKey",
+                                "size": len(batch),
+                            }
+                        }
+                    },
+                },
+            )
+            for bucket in response["aggregations"]["keyCounts"]["buckets"]:
+                counts[str(bucket["key"])] = int(bucket["doc_count"])
+        return counts
+
+    def matching_occurrence_page(
+        self,
+        sentence_keys: list,
+        excluded_application_id: str,
+        analysis_group: str,
+        page_size: int,
+        after_global_id: str | None,
+        include_total: bool,
+    ) -> dict:
+        """Return a page found by normal key filters, without vector search."""
+
+        key_filters = []
+        unique_keys = sorted(set(sentence_keys))
+        for offset in range(0, len(unique_keys), TERMS_BATCH_SIZE):
+            batch = unique_keys[offset : offset + TERMS_BATCH_SIZE]
+            key_filters.append({"terms": {"sentenceKey": batch}})
+
+        body = {
+            "size": page_size + 1,
+            "track_total_hits": include_total,
+            "_source": [
+                "applicationId",
+                "tspId",
+                "sectionName",
+                "globalId",
+                "sentIdLocal",
+                "sentenceContent",
+                "sentenceKey",
+                "sourceType",
+                "analysisGroup",
+            ],
+            "sort": [{"globalId": "asc"}],
+            "query": {
+                "bool": {
+                    "filter": [
+                        {
+                            "bool": {
+                                "should": key_filters,
+                                "minimum_should_match": 1,
+                            }
+                        },
+                        {"term": {"analysisGroup": analysis_group}},
+                        {"term": {"isTracer": False}},
+                        {"term": {"isFormLanguage": False}},
+                    ],
+                    "must_not": [{"term": {"applicationId": excluded_application_id}}],
                 }
-                if search_after:
-                    body["search_after"] = search_after
-                response = self.client.search(
-                    index=self.config.occurrence_alias,
-                    body=body,
-                )
-                hits = response["hits"]["hits"]
-                for hit in hits:
-                    targets.append(hit["_source"])
-                if len(hits) < OCCURRENCE_PAGE_SIZE:
-                    break
-                search_after = hits[-1]["sort"]
-        return targets
+            },
+        }
+        if after_global_id:
+            body["search_after"] = [after_global_id]
+        response = self.client.search(
+            index=self.config.occurrence_alias,
+            body=body,
+        )
+        hits = response["hits"]["hits"]
+        page_hits = hits[:page_size]
+        total = None
+        if include_total:
+            total = int(response["hits"]["total"]["value"])
+        next_after = None
+        if len(hits) > page_size and page_hits:
+            next_after = str(page_hits[-1]["sort"][0])
+        return {
+            "matches": [hit["_source"] for hit in page_hits],
+            "nextAfterGlobalId": next_after,
+            "totalMatches": total,
+        }
 
     def stats(self) -> dict:
         """Return both OpenSearch document counts and cluster health."""
@@ -604,10 +834,11 @@ class OpenSearchStore:
                 break
         return keys
 
-    def delete_unused_catalog_keys(self, keys: list) -> int:
-        """Delete catalog vectors only when no occurrence still uses them."""
+    def delete_unused_catalog_keys(self, keys: list) -> dict:
+        """Delete unused vectors and return the keys removed with them."""
 
         deleted = 0
+        deleted_keys = []
         for offset in range(0, len(keys), 1_000):
             batch = keys[offset : offset + 1_000]
             response = self.client.search(
@@ -643,4 +874,5 @@ class OpenSearchStore:
                 },
             )
             deleted += int(delete_response.get("deleted", 0))
-        return deleted
+            deleted_keys.extend(unused_keys)
+        return {"deleted": deleted, "sentenceKeys": deleted_keys}

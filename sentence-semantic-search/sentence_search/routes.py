@@ -11,7 +11,9 @@ from sentence_search.components import (
     opensearch_store,
     postgres_store,
     seed_service,
+    sentence_key_search_service,
     sentence_service,
+    sentence_summary_service,
 )
 from sentence_search.config import config
 from sentence_search.models import SeedRequest, SentenceOccurrence
@@ -50,7 +52,7 @@ def health():
 
 @router.get("/stats", tags=["System"])
 def stats():
-    """Show OpenSearch, PostgreSQL, and worker record counts."""
+    """Show OpenSearch and PostgreSQL record counts."""
 
     try:
         return {
@@ -82,7 +84,7 @@ def index_documents(
 
 @router.post("/admin/init", tags=["Admin"])
 def initialize_storage():
-    """Create the two indexes, aliases, and PostgreSQL tables."""
+    """Create two OpenSearch indexes and two PostgreSQL tables."""
 
     try:
         opensearch_store.ensure_indices()
@@ -93,6 +95,10 @@ def initialize_storage():
         "message": "Sentence semantic-search storage is ready",
         "occurrenceIndex": config.occurrence_index,
         "catalogIndex": config.catalog_index,
+        "postgresTables": [
+            "sentence_key_matches",
+            "application_match_summary",
+        ],
     }
 
 
@@ -123,7 +129,7 @@ def delete_storage(
 
 @router.post("/admin/seed", tags=["Admin"])
 def seed(request: SeedRequest):
-    """Load the CSV in its existing order and queue match jobs."""
+    """Load the CSV in its existing order and calculate matches."""
 
     path = Path(request.csvPath).expanduser()
     if not path.is_absolute():
@@ -139,20 +145,9 @@ def seed(request: SeedRequest):
         raise HTTPException(status_code=503, detail=str(error)) from error
 
 
-@router.post("/admin/jobs/retry-failed", tags=["Admin"])
-def retry_failed_jobs():
-    """Retry jobs that reached the ten-attempt failure limit."""
-
-    try:
-        count = postgres_store.retry_failed_jobs()
-    except SQLAlchemyError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
-    return {"jobsRequeued": count}
-
-
 @router.post("/sentences", tags=["Sentences"])
 def add_sentence(sentence: SentenceOccurrence):
-    """Add one sentence and queue its background matching job."""
+    """Add one sentence and calculate its matches."""
 
     try:
         return sentence_service.add_sentence(sentence)
@@ -170,7 +165,7 @@ def delete_application(
         Query(description="Must be true to delete the application sentences."),
     ] = False,
 ):
-    """Delete one application's sentences, match lists, and summary."""
+    """Delete one application's sentences and unused key relationships."""
 
     if not confirm:
         raise HTTPException(status_code=400, detail="Set confirm=true to delete.")
@@ -195,7 +190,7 @@ def delete_tsp_document(
         Query(description="Must be true to delete the TSP document sentences."),
     ] = False,
 ):
-    """Delete one TSP document and remove its IDs from saved match lists."""
+    """Delete one TSP document and its unused key relationships."""
 
     if not confirm:
         raise HTTPException(status_code=400, detail="Set confirm=true to delete.")
@@ -208,41 +203,19 @@ def delete_tsp_document(
 
 
 @router.get(
-    "/applications/{applicationId}/summary",
+    "/applications/{applicationId}/sentences/semantic-summary",
     tags=["Sentence matches"],
 )
-def application_sentence_summary(
-    applicationId: str,
-    analysisGroup: Annotated[str, Query(min_length=1)] = "Asylee",
-):
-    """Return simple section and total matching counts."""
-
-    try:
-        result = postgres_store.application_summary(applicationId, analysisGroup)
-    except SQLAlchemyError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
-    if result is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Application and analysis group not found",
-        )
-    return result
-
-
-@router.get(
-    "/applications/{applicationId}/sentences",
-    tags=["Sentence matches"],
-)
-def application_sentences(
+def application_semantic_summary(
     applicationId: str,
     analysisGroup: Annotated[str, Query(min_length=1)] = "Asylee",
     pageSize: Annotated[int, Query(ge=1, le=100)] = 100,
     nextToken: str | None = None,
 ):
-    """Return 100 application sentence IDs and their match-list counts."""
+    """Get 100 application sentences and each sentence's match counts."""
 
     try:
-        return postgres_store.application_sentences(
+        return sentence_summary_service.application_summary(
             applicationId,
             analysisGroup,
             pageSize,
@@ -250,31 +223,39 @@ def application_sentences(
         )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    except SQLAlchemyError as error:
+    except (OpenSearchException, SQLAlchemyError, RuntimeError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
 
 
 @router.get(
-    "/sentences/{globalId}/matches",
+    "/applications/{applicationId}/sentences/semantic-search",
     tags=["Sentence matches"],
 )
-def sentence_matches(
-    globalId: str,
+def sentence_key_semantic_search(
+    applicationId: str,
+    sentenceKey: Annotated[
+        str,
+        Query(
+            min_length=64,
+            max_length=64,
+            description="SHA-256 sentenceKey already saved during ingestion.",
+        ),
+    ],
+    analysisGroup: Annotated[str, Query(min_length=1)] = "Asylee",
     pageSize: Annotated[int, Query(ge=1, le=100)] = 100,
     nextToken: str | None = None,
 ):
-    """Return one sentence's stored matching-global-ID list."""
+    """Find exact and similar sentences by key without running neural search."""
 
     try:
-        result = postgres_store.sentence_matches(
-            globalId,
+        return sentence_key_search_service.search(
+            applicationId,
+            sentenceKey,
+            analysisGroup,
             pageSize,
             nextToken,
         )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    except SQLAlchemyError as error:
+    except (OpenSearchException, SQLAlchemyError, RuntimeError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
-    if result is None:
-        raise HTTPException(status_code=404, detail="Sentence not found")
-    return result

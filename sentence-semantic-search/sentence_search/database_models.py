@@ -5,7 +5,6 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     Index,
-    SmallInteger,
     Text,
     func,
     text,
@@ -18,54 +17,35 @@ class Base(DeclarativeBase):
     pass
 
 
-class SentenceMatch(Base):
-    __tablename__ = "sentence_matches"
+class SentenceKeyMatch(Base):
+    __tablename__ = "sentence_key_matches"
 
-    globalId: Mapped[str] = mapped_column(Text, primary_key=True)
-    tspId: Mapped[str] = mapped_column(Text, nullable=False)
-    applicationId: Mapped[str] = mapped_column(Text, nullable=False)
-    sectionName: Mapped[str] = mapped_column(Text, nullable=False)
-    analysisGroup: Mapped[str] = mapped_column(Text, nullable=False)
-    matchingGlobalIds: Mapped[list] = mapped_column(
+    sentenceKey: Mapped[str] = mapped_column(Text, primary_key=True)
+    matchingSentenceKeys: Mapped[list] = mapped_column(
         ARRAY(Text),
         default=list,
         server_default=text("'{}'::text[]"),
         nullable=False,
     )
 
-    # These fields let the separate worker resume after a restart. They live on
-    # this same row so a third queue table is not needed.
-    matchStatus: Mapped[str] = mapped_column(Text, default="pending", nullable=False)
-    matchAttempts: Mapped[int] = mapped_column(SmallInteger, default=0, nullable=False)
-    matchThreshold: Mapped[int] = mapped_column(SmallInteger, nullable=False)
-    matchAvailableAt: Mapped[datetime] = mapped_column(
+    createdAt: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
     )
-    matchLockedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    matchLastError: Mapped[str | None] = mapped_column(Text)
-    createdAt: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    updatedAt: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updatedAt: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
 
     __table_args__ = (
-        CheckConstraint('"matchThreshold" BETWEEN 1 AND 100'),
-        CheckConstraint(
-            '"matchStatus" IN '
-            "('pending', 'running', 'completed', 'failed', 'skipped')"
-        ),
+        # Deletion asks which arrays contain a removed key. GIN avoids scanning
+        # the complete table for that overlap lookup.
         Index(
-            "sentence_matches_application_idx",
-            "applicationId",
-            "analysisGroup",
-            "globalId",
-        ),
-        Index("sentence_matches_tsp_idx", "applicationId", "tspId", "globalId"),
-        Index(
-            "sentence_matches_job_idx",
-            "matchStatus",
-            "matchAvailableAt",
-            "globalId",
+            "sentence_key_matches_keys_gin_idx",
+            "matchingSentenceKeys",
+            postgresql_using="gin",
         ),
     )
 
@@ -81,7 +61,12 @@ class ApplicationMatchSummary(Base):
         server_default=text("'{}'::jsonb"),
         nullable=False,
     )
-    totalMatching: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    totalMatching: Mapped[int] = mapped_column(
+        BigInteger,
+        default=0,
+        server_default=text("0"),
+        nullable=False,
+    )
     updatedAt: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -89,11 +74,3 @@ class ApplicationMatchSummary(Base):
     )
 
     __table_args__ = (CheckConstraint('"totalMatching" >= 0'),)
-
-
-def model_values(model) -> dict:
-    """Return one SQLAlchemy model as a plain API dictionary."""
-
-    return {
-        column.name: getattr(model, column.name) for column in model.__table__.columns
-    }

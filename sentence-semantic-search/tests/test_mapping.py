@@ -1,4 +1,4 @@
-from dataclasses import replace
+import json
 
 import pytest
 
@@ -19,13 +19,13 @@ class DeleteByQueryClient:
         return {"deleted": 3}
 
 
-class CandidateSearchClient:
+class EmptySearchClient:
     def __init__(self):
         self.request = None
 
     def search(self, **request):
         self.request = request
-        return {"hits": {"hits": []}}
+        return {"hits": {"total": {"value": 0}, "hits": []}}
 
 
 class ClientThatMustNotRun:
@@ -33,12 +33,51 @@ class ClientThatMustNotRun:
         raise AssertionError("Duplicate input should fail before OpenSearch")
 
 
+class SummaryAggregationClient:
+    def __init__(self):
+        self.requests = []
+
+    def search(self, **request):
+        self.requests.append(request)
+        aggregations = request["body"]["aggs"]
+        if "applicationGroups" in aggregations:
+            return {
+                "aggregations": {
+                    "applicationGroups": {
+                        "buckets": [
+                            {
+                                "key": {
+                                    "applicationId": "A1",
+                                    "analysisGroup": "Asylee",
+                                },
+                                "doc_count": 2,
+                            }
+                        ]
+                    }
+                }
+            }
+        return {
+            "aggregations": {
+                "keySections": {
+                    "buckets": [
+                        {
+                            "key": {
+                                "sectionName": "Affidavit",
+                                "sentenceKey": "key-1",
+                            },
+                            "doc_count": 3,
+                        }
+                    ]
+                }
+            }
+        }
+
+
 def test_occurrence_mapping_has_requested_sentence_fields():
     properties = occurrence_index_definition(config)["mappings"]["properties"]
     assert set(properties) == {
         "applicationId",
         "tspId",
-        "documentId",
         "sectionName",
         "globalId",
         "sentIdLocal",
@@ -59,14 +98,12 @@ def test_catalog_mapping_uses_512_dimension_faiss_cosine():
     assert vector["dimension"] == 512
     assert vector["method"]["engine"] == "faiss"
     assert vector["method"]["space_type"] == "cosinesimil"
+    assert "parameters" not in vector["method"]
 
 
 def test_tsp_deletion_uses_camel_case_opensearch_fields():
     client = DeleteByQueryClient()
-    store = OpenSearchStore(
-        replace(config, match_across_applications_only=True),
-        client,
-    )
+    store = OpenSearchStore(config, client)
 
     deleted = store.delete_occurrences("A1", "TSP-1")
 
@@ -78,30 +115,72 @@ def test_tsp_deletion_uses_camel_case_opensearch_fields():
     assert deleted == 3
 
 
-def test_occurrence_candidates_exclude_tracer_form_and_other_analysis_groups():
-    client = CandidateSearchClient()
-    store = OpenSearchStore(
-        replace(config, match_across_applications_only=True),
-        client,
-    )
-    source = {
-        "globalId": "S1",
-        "applicationId": "A1",
-        "analysisGroup": "Asylee",
-    }
+def test_application_page_excludes_tracer_and_form_language():
+    client = EmptySearchClient()
+    store = OpenSearchStore(config, client)
 
-    targets = store.matching_occurrences(
-        source,
-        [{"sentenceKey": "key-1"}],
+    result = store.application_occurrence_page(
+        "A1",
+        "Asylee",
+        100,
+        None,
+        True,
     )
 
-    query = client.request["body"]["query"]["bool"]
-    assert targets == []
-    assert {"term": {"analysisGroup": "Asylee"}} in query["filter"]
-    assert {"term": {"isTracer": False}} in query["filter"]
-    assert {"term": {"isFormLanguage": False}} in query["filter"]
-    assert {"ids": {"values": ["S1"]}} in query["must_not"]
-    assert {"term": {"applicationId": "A1"}} in query["must_not"]
+    filters = client.request["body"]["query"]["bool"]["filter"]
+    assert result["sentences"] == []
+    assert {"term": {"applicationId": "A1"}} in filters
+    assert {"term": {"analysisGroup": "Asylee"}} in filters
+    assert {"term": {"isTracer": False}} in filters
+    assert {"term": {"isFormLanguage": False}} in filters
+
+
+def test_sentence_key_search_uses_terms_and_never_knn():
+    client = EmptySearchClient()
+    store = OpenSearchStore(config, client)
+
+    store.matching_occurrence_page(
+        ["key-1", "key-2"],
+        "A1",
+        "Asylee",
+        100,
+        None,
+        False,
+    )
+
+    body = client.request["body"]
+    query_text = json.dumps(body["query"])
+    assert '"terms": {"sentenceKey": ["key-1", "key-2"]}' in query_text
+    assert '"knn"' not in query_text
+    assert {"term": {"applicationId": "A1"}} in body["query"]["bool"]["must_not"]
+
+
+def test_summary_refresh_finds_affected_application_groups():
+    client = SummaryAggregationClient()
+    store = OpenSearchStore(config, client)
+
+    groups = store.application_groups_for_keys(["key-1"])
+
+    filters = client.requests[0]["body"]["query"]["bool"]["filter"]
+    assert groups == [{"applicationId": "A1", "analysisGroup": "Asylee"}]
+    assert {"terms": {"sentenceKey": ["key-1"]}} in filters
+    assert {"term": {"isTracer": False}} in filters
+    assert {"term": {"isFormLanguage": False}} in filters
+
+
+def test_summary_refresh_groups_source_counts_by_section_and_key():
+    client = SummaryAggregationClient()
+    store = OpenSearchStore(config, client)
+
+    counts = store.application_key_section_counts("A1", "Asylee")
+
+    assert counts == [
+        {
+            "sectionName": "Affidavit",
+            "sentenceKey": "key-1",
+            "occurrenceCount": 3,
+        }
+    ]
 
 
 def test_duplicate_global_id_cannot_have_different_sentence_keys():

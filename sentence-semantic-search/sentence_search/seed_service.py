@@ -3,10 +3,12 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from sentence_search.config import Config
+from sentence_search.match_service import SentenceMatchService
+from sentence_search.matching_rules import is_matchable_sentence
 from sentence_search.models import SentenceOccurrence
 from sentence_search.opensearch_store import OpenSearchStore
 from sentence_search.postgres_store import PostgresStore
-from sentence_search.sentence_service import SentenceService
+from sentence_search.sentence_summary_service import SentenceSummaryService
 
 REQUIRED_COLUMNS = {
     "applicationId",
@@ -27,7 +29,6 @@ HEADER_ALIASES = {
     "application_Id": "applicationId",
     "application_id": "applicationId",
     "tsp_id": "tspId",
-    "document_id": "documentId",
     "section_name": "sectionName",
     "global_id": "globalId",
     "local_globa_id": "sentIdLocal",
@@ -113,19 +114,23 @@ class SeedService:
         config: Config,
         opensearch: OpenSearchStore,
         postgres: PostgresStore,
+        match_service: SentenceMatchService,
+        summary_service: SentenceSummaryService,
     ):
         """Save the stores used by CSV seeding."""
 
         self.config = config
         self.opensearch = opensearch
         self.postgres = postgres
+        self.match_service = match_service
+        self.summary_service = summary_service
 
     def seed(
         self,
         path: Path,
         reset: bool,
     ) -> dict:
-        """Index the CSV in order and queue one job per new global ID."""
+        """Index the CSV in order and calculate its sentence matches."""
 
         if not path.is_file():
             raise ValueError(f"CSV file does not exist: {path}")
@@ -139,21 +144,17 @@ class SeedService:
         occurrences_indexed = 0
         catalog_indexed = 0
         catalog_reused = 0
-        jobs_queued = 0
+        sentence_keys_registered = 0
+        matches_calculated = 0
+        application_summaries_refreshed = 0
         completed_batches = 0
         known_catalog_keys = set()
 
-        sentence_service = SentenceService(
-            self.config,
-            self.opensearch,
-            self.postgres,
-        )
         for batch in csv_batches(path, self.config.seed_batch_size):
             sources = [record.model_dump(mode="json") for record in batch]
             records_read += len(sources)
 
             # Stop this batch before indexing if a global ID changed its text.
-            self.postgres.validate_sentence_identity(sources)
             self.opensearch.validate_occurrence_identity(sources)
 
             catalog_by_key = {}
@@ -162,7 +163,7 @@ class SeedService:
                 if key not in known_catalog_keys:
                     catalog_by_key.setdefault(
                         key,
-                        sentence_service._catalog_source(source),
+                        self._catalog_source(source),
                     )
 
             candidate_keys = list(catalog_by_key)
@@ -175,13 +176,30 @@ class SeedService:
             known_catalog_keys.update(candidate_keys)
 
             occurrences_indexed += self.opensearch.bulk_index_occurrences(sources)
-            # Jobs are inserted only after their vectors are searchable.
+            # Titan vectors must be searchable before KNN matching starts.
             self.opensearch.refresh_indices()
-            registration = self.postgres.register_sentences(
-                sources,
-                self.config.match_threshold,
+            registration = self.postgres.register_sentence_keys(sources)
+            sentence_keys_registered += len(registration["newSentenceKeys"])
+
+            matchable_keys = sorted(
+                {
+                    source["sentenceKey"]
+                    for source in sources
+                    if is_matchable_sentence(source)
+                }
             )
-            jobs_queued += registration["jobsQueued"]
+            for sentence_key in matchable_keys:
+                self.match_service.match_sentence_key(
+                    sentence_key,
+                    self.config.match_threshold,
+                )
+                matches_calculated += 1
+            summary_result = self.summary_service.refresh_affected_applications(
+                matchable_keys
+            )
+            application_summaries_refreshed += summary_result[
+                "applicationSummariesRefreshed"
+            ]
             completed_batches += 1
 
         return {
@@ -189,9 +207,22 @@ class SeedService:
             "occurrencesIndexed": occurrences_indexed,
             "catalogDocumentsIndexed": catalog_indexed,
             "catalogDocumentsReused": catalog_reused,
-            "matchJobsQueued": jobs_queued,
+            "sentenceKeysRegistered": sentence_keys_registered,
+            "matchesCalculated": matches_calculated,
+            "applicationSummariesRefreshed": application_summaries_refreshed,
             "completedBatches": completed_batches,
             "threshold": self.config.match_threshold,
             "reset": reset,
-            "matchProcessing": "background",
+            "matchProcessing": "duringSeed",
+        }
+
+    @staticmethod
+    def _catalog_source(source: dict) -> dict:
+        """Keep only fields allowed by the strict catalog mapping."""
+
+        return {
+            "sentenceContent": source["sentenceContent"],
+            "sentenceKey": source["sentenceKey"],
+            "createdAt": source["createdAt"],
+            "updatedAt": source["updatedAt"],
         }

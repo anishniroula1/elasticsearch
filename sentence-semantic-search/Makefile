@@ -3,11 +3,11 @@ SHELL := /bin/sh
 .PHONY: help setup test dev local down logs clean
 
 help:
-	@echo "make dev    Build and run API, worker, and PostgreSQL"
+	@echo "make dev    Build and run API and PostgreSQL"
 	@echo "make local  Run only the API locally on port 8008"
 	@echo "make test   Install development packages and run tests"
 	@echo "make down   Stop Docker containers"
-	@echo "make logs   Follow API and worker logs"
+	@echo "make logs   Follow API logs"
 
 setup:
 	uv sync --extra dev
@@ -25,7 +25,7 @@ down:
 	docker compose down
 
 logs:
-	docker compose logs -f api worker
+	docker compose logs -f api
 
 clean:
 	docker compose down --volumes

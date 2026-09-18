@@ -16,7 +16,6 @@ class SentenceOccurrence(BaseModel):
 
     applicationId: str
     tspId: str
-    documentId: str | None = None
     sectionName: str
     globalId: str
     sentIdLocal: int
@@ -45,7 +44,6 @@ class SentenceOccurrence(BaseModel):
                 "the application will generate it"
             )
         self.sentenceKey = generated_key
-        self.documentId = self.documentId or self.tspId
         current_time = utc_now()
         self.createdAt = self.createdAt or current_time
         self.updatedAt = self.updatedAt or current_time

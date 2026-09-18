@@ -1,5 +1,3 @@
-from sentence_search.config import Config
-from sentence_search.matching_rules import is_matchable_sentence
 from sentence_search.opensearch_store import OpenSearchStore
 from sentence_search.postgres_store import PostgresStore
 
@@ -7,52 +5,39 @@ from sentence_search.postgres_store import PostgresStore
 class SentenceMatchService:
     def __init__(
         self,
-        config: Config,
         opensearch: OpenSearchStore,
         postgres: PostgresStore,
     ):
-        """Save the stores used by the background match worker."""
+        """Save the stores used to calculate sentence matches."""
 
-        self.config = config
         self.opensearch = opensearch
         self.postgres = postgres
 
-    def process_job(self, job: dict) -> dict:
-        """Find direct vector hits and merge their connected match groups."""
+    def match_sentence_key(self, sentence_key: str, threshold: int) -> dict:
+        """Find vector hits and save both sides of each relationship.
 
-        source = self.opensearch.occurrence(job["globalId"])
-        if not source:
-            raise RuntimeError(
-                f"OpenSearch occurrence does not exist: {job['globalId']}"
-            )
-        if not is_matchable_sentence(source):
-            return {
-                "globalId": source["globalId"],
-                "threshold": int(job["matchThreshold"]),
-                "catalogMatchesFound": 0,
-                "directMatchesFound": 0,
-                "matchGroupSize": 1,
-                "matchListsUpdated": 0,
-                "status": "skipped",
-            }
+        Input: one saved sentence key and threshold 90.
+        Output: direct matches added to that key and every matching key.
+        """
 
-        vector = self.opensearch.catalog_vector(source["sentenceKey"])
+        vector = self.opensearch.catalog_vector(sentence_key)
         catalog_matches = self.opensearch.catalog_matches(
-            source["sentenceKey"],
+            sentence_key,
             vector,
-            int(job["matchThreshold"]),
+            threshold,
         )
-        occurrences = self.opensearch.matching_occurrences(
-            source,
-            catalog_matches,
-        )
-        result = self.postgres.save_match_group(
-            source["globalId"],
-            [occurrence["globalId"] for occurrence in occurrences],
+        target_keys = [
+            match["sentenceKey"]
+            for match in catalog_matches
+            if match["sentenceKey"] != sentence_key
+        ]
+        result = self.postgres.save_key_matches(
+            sentence_key,
+            target_keys,
         )
         return {
-            "globalId": source["globalId"],
-            "threshold": int(job["matchThreshold"]),
-            "catalogMatchesFound": len(catalog_matches),
+            "sentenceKey": sentence_key,
+            "threshold": threshold,
+            "catalogMatchesFound": len(target_keys),
             **result,
         }

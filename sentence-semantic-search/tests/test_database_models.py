@@ -4,43 +4,50 @@ from sqlalchemy.schema import CreateTable
 from sentence_search.database_models import (
     ApplicationMatchSummary,
     Base,
-    SentenceMatch,
+    SentenceKeyMatch,
 )
-from sentence_search.postgres_store import PostgresStore
 
 
-def test_sqlalchemy_defines_only_two_matching_tables():
+def test_sqlalchemy_defines_two_matching_tables():
     assert set(Base.metadata.tables) == {
-        "sentence_matches",
+        "sentence_key_matches",
         "application_match_summary",
     }
 
 
-def test_sentence_match_has_metadata_and_one_matching_list():
-    columns = set(SentenceMatch.__table__.columns.keys())
+def test_key_row_has_only_direct_match_list_and_timestamps():
+    columns = set(SentenceKeyMatch.__table__.columns.keys())
 
-    assert {
-        "globalId",
-        "tspId",
-        "applicationId",
-        "sectionName",
-        "analysisGroup",
-        "matchingGlobalIds",
-    }.issubset(columns)
-    assert "sentenceKey" not in columns
-    assert "sentenceContent" not in columns
+    assert columns == {
+        "sentenceKey",
+        "matchingSentenceKeys",
+        "createdAt",
+        "updatedAt",
+    }
+    assert "globalId" not in columns
+    assert "applicationId" not in columns
 
 
-def test_sentence_match_uses_postgresql_text_array():
+def test_matching_sentence_keys_uses_postgresql_text_array():
     statement = str(
-        CreateTable(SentenceMatch.__table__).compile(dialect=postgresql.dialect())
+        CreateTable(SentenceKeyMatch.__table__).compile(dialect=postgresql.dialect())
     )
 
-    assert '"matchingGlobalIds" TEXT[]' in statement
-    assert "'skipped'" in statement
+    assert '"matchingSentenceKeys" TEXT[]' in statement
 
 
-def test_application_summary_uses_one_json_section_map():
+def test_matching_key_array_has_a_gin_index_for_deletion():
+    indexes = {index.name: index for index in SentenceKeyMatch.__table__.indexes}
+
+    assert (
+        indexes["sentence_key_matches_keys_gin_idx"].dialect_options["postgresql"][
+            "using"
+        ]
+        == "gin"
+    )
+
+
+def test_application_summary_has_section_and_total_counts():
     columns = set(ApplicationMatchSummary.__table__.columns.keys())
     statement = str(
         CreateTable(ApplicationMatchSummary.__table__).compile(
@@ -56,34 +63,4 @@ def test_application_summary_uses_one_json_section_map():
         "updatedAt",
     }
     assert '"sectionMatchCounts" JSONB' in statement
-
-
-def test_regular_sentence_is_pending():
-    values = PostgresStore._match_values(_sentence(), 90)
-
-    assert values["matchStatus"] == "pending"
-    assert values["matchingGlobalIds"] == []
-
-
-def test_tracer_or_form_sentence_is_skipped():
-    tracer = _sentence()
-    tracer["isTracer"] = True
-    form_language = _sentence()
-    form_language["isFormLanguage"] = True
-
-    assert PostgresStore._match_values(tracer, 90)["matchStatus"] == "skipped"
-    assert PostgresStore._match_values(form_language, 90)["matchStatus"] == "skipped"
-
-
-def _sentence() -> dict:
-    return {
-        "globalId": "S1",
-        "applicationId": "A1",
-        "tspId": "T1",
-        "sectionName": "Affidavit",
-        "analysisGroup": "Asylee",
-        "isTracer": False,
-        "isFormLanguage": False,
-        "createdAt": "2026-09-17T00:00:00Z",
-        "updatedAt": "2026-09-17T00:00:00Z",
-    }
+    assert '"totalMatching" BIGINT' in statement

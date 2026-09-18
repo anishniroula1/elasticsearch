@@ -26,7 +26,6 @@ def sentence_values():
 def test_sentence_generates_key_and_dates():
     sentence = SentenceOccurrence.model_validate(sentence_values())
     assert sentence.sentenceKey == sentence_key(sentence.sentenceContent)
-    assert sentence.documentId == sentence.tspId
     assert sentence.createdAt is not None
     assert sentence.updatedAt is not None
     assert "sentIdLocal" in sentence.model_dump()

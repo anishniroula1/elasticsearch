@@ -1,5 +1,6 @@
 import base64
 import binascii
+import json
 
 
 def minimum_opensearch_score(threshold: int) -> float:
@@ -34,19 +35,26 @@ def cosine_percentage(opensearch_score: float) -> float:
     return round(max(0.0, cosine_similarity) * 100.0, 2)
 
 
-def encode_id_token(global_id: str) -> str:
-    """Create a cursor for an application sentence page."""
+def encode_page_token(state: dict) -> str:
+    """Put the OpenSearch cursor and first-page totals into one token."""
 
-    return base64.urlsafe_b64encode(global_id.encode("utf-8")).decode("ascii")
+    payload = json.dumps(state, separators=(",", ":"), sort_keys=True)
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
 
 
-def decode_id_token(token: str) -> str:
-    """Read an application sentence cursor."""
+def decode_page_token(token: str) -> dict:
+    """Read a pagination token and reject broken values."""
 
     try:
-        value = base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8")
-    except (ValueError, UnicodeDecodeError, binascii.Error) as error:
+        payload = base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8")
+        state = json.loads(payload)
+    except (
+        ValueError,
+        UnicodeDecodeError,
+        binascii.Error,
+        json.JSONDecodeError,
+    ) as error:
         raise ValueError("Invalid nextToken") from error
-    if not value:
+    if not isinstance(state, dict) or not state.get("afterGlobalId"):
         raise ValueError("Invalid nextToken")
-    return value
+    return state

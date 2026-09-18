@@ -19,17 +19,6 @@ def _integer(name: str, default: int, minimum: int = 1) -> int:
     return value
 
 
-def _boolean(name: str, default: bool) -> bool:
-    """Read true or false from the environment."""
-
-    raw_value = os.getenv(name, str(default)).strip().lower()
-    if raw_value in {"true", "1", "yes"}:
-        return True
-    if raw_value in {"false", "0", "no"}:
-        return False
-    raise ValueError(f"{name} must be true or false")
-
-
 @dataclass(frozen=True)
 class Config:
     aws_region: str
@@ -49,10 +38,6 @@ class Config:
     seed_batch_size: int
     database_url: str
     match_threshold: int
-    match_across_applications_only: bool
-    worker_poll_seconds: int
-    worker_max_attempts: int
-    worker_retry_seconds: int
 
     @classmethod
     def from_environment(cls):
@@ -100,13 +85,6 @@ class Config:
                 "postgresql+psycopg://sentence:sentence@localhost:5432/sentence_matches",
             ).strip(),
             match_threshold=_integer("MATCH_THRESHOLD", 90),
-            match_across_applications_only=_boolean(
-                "MATCH_ACROSS_APPLICATIONS_ONLY",
-                True,
-            ),
-            worker_poll_seconds=_integer("WORKER_POLL_SECONDS", 2),
-            worker_max_attempts=_integer("WORKER_MAX_ATTEMPTS", 10),
-            worker_retry_seconds=_integer("WORKER_RETRY_SECONDS", 5),
         )
         config.validate()
         return config
