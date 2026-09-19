@@ -829,17 +829,31 @@ class OpenSearchStore:
             return 0
 
     def preview(self, index: str, size: int) -> dict:
-        """Return unfiltered documents without returning catalog vectors."""
+        """Return unfiltered documents and include catalog vectors."""
 
         body = {"size": size, "query": {"match_all": {}}}
         if index == self.config.catalog_alias:
             body["_source"] = {"excludes": [VECTOR_FIELD]}
+            body["docvalue_fields"] = [
+                {
+                    "field": VECTOR_FIELD,
+                    "format": "binary",
+                }
+            ]
         response = self.client.search(index=index, body=body)
+        documents = []
+        for hit in response["hits"]["hits"]:
+            document = {"id": hit["_id"], **hit["_source"]}
+            if index == self.config.catalog_alias:
+                encoded_vector = hit.get("fields", {}).get(VECTOR_FIELD)
+                if encoded_vector:
+                    document[VECTOR_FIELD] = self._decode_binary_vector(
+                        encoded_vector[0]
+                    )
+            documents.append(document)
         return {
-            "count": len(response["hits"]["hits"]),
-            "documents": [
-                {"id": hit["_id"], **hit["_source"]} for hit in response["hits"]["hits"]
-            ],
+            "count": len(documents),
+            "documents": documents,
         }
 
     def delete_occurrences(

@@ -345,6 +345,12 @@ Run the API and PostgreSQL:
 make dev
 ```
 
+Run only PostgreSQL in Docker:
+
+```text
+make postgres
+```
+
 Swagger:
 
 ```text
@@ -362,12 +368,8 @@ removing the old worker and queue columns.
 
 Seed from Swagger:
 
-```json
-POST /admin/seed
-{
-  "csvPath": "data/seed.csv",
-  "reset": false
-}
+```text
+POST /admin/seed?reset=false&csvPath=data%2Fseed.csv
 ```
 
 `reset=false` keeps old data and reuses existing keys. `reset=true` deletes the
@@ -430,6 +432,9 @@ GET  /health
 GET  /stats
 GET  /index-documents?index=sentence_occurrences&count=10
 ```
+
+Choose the catalog alias in `/index-documents` to include the complete
+512-number `sentenceContentVector` list for each returned catalog record.
 
 Run tests:
 

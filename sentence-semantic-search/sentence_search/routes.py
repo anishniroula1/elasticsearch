@@ -17,7 +17,7 @@ from sentence_search.components import (
     sentence_summary_service,
 )
 from sentence_search.config import config
-from sentence_search.models import SeedRequest, SentenceOccurrence
+from sentence_search.models import SentenceOccurrence
 
 router = APIRouter()
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -73,7 +73,7 @@ def index_documents(
     ],
     count: Annotated[int, Query(ge=1, le=100)] = 10,
 ):
-    """Preview unfiltered OpenSearch documents without catalog vectors."""
+    """Preview unfiltered documents, including catalog embeddings."""
 
     try:
         return {
@@ -130,16 +130,33 @@ def delete_storage(
 
 
 @router.post("/admin/seed", tags=["Admin"])
-def seed(request: SeedRequest):
+def seed(
+    reset: Annotated[
+        bool,
+        Query(
+            description=(
+                "true recreates all storage; false keeps existing data and "
+                "only creates missing catalog vectors."
+            ),
+        ),
+    ],
+    csvPath: Annotated[
+        str,
+        Query(
+            min_length=1,
+            description="Absolute CSV path or a path relative to this project.",
+        ),
+    ] = "data/seed.csv",
+):
     """Load the CSV in its existing order and calculate matches."""
 
-    path = Path(request.csvPath).expanduser()
+    path = Path(csvPath).expanduser()
     if not path.is_absolute():
         path = PROJECT_ROOT / path
     try:
         return seed_service.seed(
             path,
-            request.reset,
+            reset,
         )
     except ValueError as error:
         logger.warning("Sentence seed rejected: %s", error)

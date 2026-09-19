@@ -1,4 +1,6 @@
+import base64
 import json
+import struct
 
 import pytest
 from opensearchpy.helpers.errors import BulkIndexError
@@ -74,6 +76,33 @@ class SummaryAggregationClient:
         }
 
 
+class CatalogPreviewClient:
+    def __init__(self):
+        self.request = None
+
+    def search(self, **request):
+        self.request = request
+        vector_bytes = struct.pack("<512f", *([0.25] * 512))
+        return {
+            "hits": {
+                "hits": [
+                    {
+                        "_id": "key-1",
+                        "_source": {
+                            "sentenceKey": "key-1",
+                            "sentenceContent": "A sentence",
+                        },
+                        "fields": {
+                            "sentenceContentVector": [
+                                base64.b64encode(vector_bytes).decode("ascii")
+                            ]
+                        },
+                    }
+                ]
+            }
+        }
+
+
 def test_occurrence_mapping_has_requested_sentence_fields():
     properties = occurrence_index_definition(config)["mappings"]["properties"]
     assert set(properties) == {
@@ -116,6 +145,20 @@ def test_catalog_retry_keeps_only_temporary_failed_documents():
     retry_actions = store._retryable_catalog_actions(error, actions)
 
     assert retry_actions == [actions[1]]
+
+
+def test_catalog_preview_returns_the_decoded_embedding_list():
+    client = CatalogPreviewClient()
+    store = OpenSearchStore(config, client)
+
+    result = store.preview(config.catalog_alias, 10)
+
+    document = result["documents"][0]
+    assert client.request["body"]["docvalue_fields"] == [
+        {"field": "sentenceContentVector", "format": "binary"}
+    ]
+    assert len(document["sentenceContentVector"]) == 512
+    assert document["sentenceContentVector"][0] == pytest.approx(0.25)
 
 
 def test_tsp_deletion_uses_camel_case_opensearch_fields():

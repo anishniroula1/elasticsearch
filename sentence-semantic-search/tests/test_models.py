@@ -1,6 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
+from sentence_search.main import app
 from sentence_search.models import SentenceOccurrence
 from sentence_search.text import sentence_key
 
@@ -37,3 +38,13 @@ def test_wrong_supplied_key_is_rejected():
     values["sentenceKey"] = "wrong"
     with pytest.raises(ValidationError):
         SentenceOccurrence.model_validate(values)
+
+
+def test_seed_swagger_uses_query_inputs_instead_of_a_json_body():
+    operation = app.openapi()["paths"]["/admin/seed"]["post"]
+    parameters = {item["name"]: item for item in operation["parameters"]}
+
+    assert "requestBody" not in operation
+    assert parameters["reset"]["in"] == "query"
+    assert parameters["reset"]["required"] is True
+    assert parameters["csvPath"]["schema"]["default"] == "data/seed.csv"

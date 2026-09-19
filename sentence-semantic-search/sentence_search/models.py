@@ -48,10 +48,3 @@ class SentenceOccurrence(BaseModel):
         self.createdAt = self.createdAt or current_time
         self.updatedAt = self.updatedAt or current_time
         return self
-
-
-class SeedRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-
-    csvPath: str = "data/seed.csv"
-    reset: bool = False
