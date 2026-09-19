@@ -4,6 +4,9 @@ from pydantic import BaseModel, ConfigDict, model_validator
 
 from sentence_search.text import sentence_key
 
+OPENSEARCH_LONG_MIN = -(2**63)
+OPENSEARCH_LONG_MAX = (2**63) - 1
+
 
 def utc_now() -> datetime:
     """Return the current UTC time."""
@@ -17,7 +20,7 @@ class SentenceOccurrence(BaseModel):
     applicationId: str
     tspId: str
     sectionName: str
-    globalId: str
+    globalId: int
     sentIdLocal: int
     sentenceContent: str
     isTracer: bool = False
@@ -34,6 +37,8 @@ class SentenceOccurrence(BaseModel):
 
         if not self.sentenceContent:
             raise ValueError("sentenceContent cannot be empty")
+        if not OPENSEARCH_LONG_MIN <= self.globalId <= OPENSEARCH_LONG_MAX:
+            raise ValueError("globalId must fit in an OpenSearch signed 64-bit long")
         if self.sentIdLocal < 0:
             raise ValueError("sentIdLocal cannot be negative")
 

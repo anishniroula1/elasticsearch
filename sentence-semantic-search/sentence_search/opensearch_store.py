@@ -43,7 +43,7 @@ def occurrence_index_definition(config: Config) -> dict:
                 "applicationId": {"type": "keyword"},
                 "tspId": {"type": "keyword"},
                 "sectionName": {"type": "keyword"},
-                "globalId": {"type": "keyword"},
+                "globalId": {"type": "long"},
                 "sentIdLocal": {"type": "long"},
                 "sentenceContent": {"type": "text"},
                 "isTracer": {"type": "boolean"},
@@ -188,7 +188,9 @@ class OpenSearchStore:
             "isFormLanguage",
         )
         for record in records:
-            global_id = record["globalId"]
+            # OpenSearch metadata IDs are strings even though globalId is a
+            # numeric long inside the document source.
+            global_id = str(record["globalId"])
             identity = {field: record[field] for field in identity_fields}
             previous = incoming.get(global_id)
             if previous and previous != identity:
@@ -247,7 +249,7 @@ class OpenSearchStore:
                 {
                     "_op_type": "index",
                     "_index": self.config.occurrence_alias,
-                    "_id": document["globalId"],
+                    "_id": str(document["globalId"]),
                     "_source": document,
                 }
             )
@@ -531,7 +533,7 @@ class OpenSearchStore:
         application_id: str,
         analysis_group: str,
         page_size: int,
-        after_global_id: str | None,
+        after_global_id: int | None,
         include_total: bool,
     ) -> dict:
         """Return one eligible application-sentence page in global-ID order."""
@@ -562,7 +564,7 @@ class OpenSearchStore:
                 }
             },
         }
-        if after_global_id:
+        if after_global_id is not None:
             body["search_after"] = [after_global_id]
         response = self.client.search(
             index=self.config.occurrence_alias,
@@ -575,90 +577,12 @@ class OpenSearchStore:
             total = int(response["hits"]["total"]["value"])
         next_after = None
         if len(hits) > page_size and page_hits:
-            next_after = str(page_hits[-1]["sort"][0])
+            next_after = int(page_hits[-1]["sort"][0])
         return {
             "sentences": [hit["_source"] for hit in page_hits],
             "nextAfterGlobalId": next_after,
             "totalSentences": total,
         }
-
-    def application_groups_for_keys(self, sentence_keys: list) -> list:
-        """Find applications and analysis groups affected by sentence keys."""
-
-        groups = set()
-        unique_keys = sorted(set(sentence_keys))
-        for offset in range(0, len(unique_keys), TERMS_BATCH_SIZE):
-            batch = unique_keys[offset : offset + TERMS_BATCH_SIZE]
-            filters = [
-                {"terms": {"sentenceKey": batch}},
-                {"term": {"isTracer": False}},
-                {"term": {"isFormLanguage": False}},
-            ]
-            groups.update(self._application_groups(filters))
-        return [
-            {"applicationId": application_id, "analysisGroup": analysis_group}
-            for application_id, analysis_group in sorted(groups)
-        ]
-
-    def deletion_application_groups(
-        self,
-        application_id: str | None = None,
-        tsp_id: str | None = None,
-    ) -> list:
-        """Find summary rows touched by an application or TSP deletion."""
-
-        filters = [
-            {"term": {"isTracer": False}},
-            {"term": {"isFormLanguage": False}},
-        ]
-        if application_id is not None:
-            filters.append({"term": {"applicationId": application_id}})
-        if tsp_id is not None:
-            filters.append({"term": {"tspId": tsp_id}})
-        if application_id is None and tsp_id is None:
-            raise ValueError("applicationId or tspId is required for deletion")
-        groups = self._application_groups(filters)
-        return [
-            {"applicationId": item[0], "analysisGroup": item[1]}
-            for item in sorted(groups)
-        ]
-
-    def _application_groups(self, filters: list) -> set:
-        """Read unique application and analysis-group pairs by composite pages."""
-
-        groups = set()
-        after_key = None
-        while True:
-            composite = {
-                "size": SUMMARY_BUCKET_PAGE_SIZE,
-                "sources": [
-                    {"applicationId": {"terms": {"field": "applicationId"}}},
-                    {"analysisGroup": {"terms": {"field": "analysisGroup"}}},
-                ],
-            }
-            if after_key:
-                composite["after"] = after_key
-            response = self.client.search(
-                index=self.config.occurrence_alias,
-                body={
-                    "size": 0,
-                    "track_total_hits": False,
-                    "query": {"bool": {"filter": filters}},
-                    "aggs": {"applicationGroups": {"composite": composite}},
-                },
-            )
-            result = response["aggregations"]["applicationGroups"]
-            for bucket in result["buckets"]:
-                groups.add(
-                    (
-                        str(bucket["key"]["applicationId"]),
-                        str(bucket["key"]["analysisGroup"]),
-                    )
-                )
-            after_key = result.get("after_key")
-            if not after_key or not result["buckets"]:
-                break
-        return groups
 
     def application_key_section_counts(
         self,
@@ -761,7 +685,7 @@ class OpenSearchStore:
         excluded_application_id: str,
         analysis_group: str,
         page_size: int,
-        after_global_id: str | None,
+        after_global_id: int | None,
         include_total: bool,
     ) -> dict:
         """Return a page found by normal key filters, without vector search."""
@@ -804,7 +728,7 @@ class OpenSearchStore:
                 }
             },
         }
-        if after_global_id:
+        if after_global_id is not None:
             body["search_after"] = [after_global_id]
         response = self.client.search(
             index=self.config.occurrence_alias,
@@ -817,7 +741,7 @@ class OpenSearchStore:
             total = int(response["hits"]["total"]["value"])
         next_after = None
         if len(hits) > page_size and page_hits:
-            next_after = str(page_hits[-1]["sort"][0])
+            next_after = int(page_hits[-1]["sort"][0])
         return {
             "matches": [hit["_source"] for hit in page_hits],
             "nextAfterGlobalId": next_after,

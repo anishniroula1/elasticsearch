@@ -11,7 +11,7 @@ def sentence_values():
         "applicationId": "A0001",
         "tspId": "TSP-1",
         "sectionName": "Written Statement",
-        "globalId": "SENT-1",
+        "globalId": 1,
         "sentIdLocal": 1,
         "sentenceContent": "The United States Government issued a notice.",
         "isTracer": False,
@@ -29,8 +29,26 @@ def test_sentence_generates_key_and_dates():
     assert sentence.sentenceKey == sentence_key(sentence.sentenceContent)
     assert sentence.createdAt is not None
     assert sentence.updatedAt is not None
+    assert sentence.globalId == 1
     assert "sentIdLocal" in sentence.model_dump()
     assert "local_global_id" not in sentence.model_dump()
+
+
+def test_numeric_string_global_id_is_saved_as_an_integer():
+    values = sentence_values()
+    values["globalId"] = "123"
+
+    sentence = SentenceOccurrence.model_validate(values)
+
+    assert sentence.globalId == 123
+
+
+def test_global_id_must_fit_in_opensearch_long():
+    values = sentence_values()
+    values["globalId"] = 2**63
+
+    with pytest.raises(ValidationError, match="signed 64-bit long"):
+        SentenceOccurrence.model_validate(values)
 
 
 def test_wrong_supplied_key_is_rejected():

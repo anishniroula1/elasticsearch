@@ -1,28 +1,15 @@
 from collections import defaultdict
 from math import ceil
 
-from sentence_search.config import Config
 from sentence_search.opensearch_store import OpenSearchStore
-from sentence_search.postgres_store import PostgresStore
-from sentence_search.search_utils import (
-    decode_page_token,
-    encode_page_token,
-    vector_cosine_percentage,
-)
+from sentence_search.search_utils import decode_page_token, encode_page_token
 
 
 class SentenceSummaryService:
-    def __init__(
-        self,
-        config: Config,
-        opensearch: OpenSearchStore,
-        postgres: PostgresStore,
-    ):
-        """Save the settings and stores used by the application summary."""
+    def __init__(self, opensearch: OpenSearchStore):
+        """Save the OpenSearch store used by the application summary."""
 
-        self.config = config
         self.opensearch = opensearch
-        self.postgres = postgres
 
     def application_summary(
         self,
@@ -57,7 +44,6 @@ class SentenceSummaryService:
             summary = {
                 "totalMatching": int(state["totalMatching"]),
                 "sectionMatches": state["sectionMatches"],
-                "updatedAt": state["summaryUpdatedAt"],
             }
             include_total = False
         else:
@@ -65,27 +51,18 @@ class SentenceSummaryService:
             total_sentences = 0
             returned_before = 0
             include_total = True
-            if threshold == self.config.match_threshold:
-                summary = self.postgres.application_summary(
-                    application_id,
-                    analysis_group,
-                )
-            else:
-                calculated = self._calculate_application_summary(
-                    application_id,
-                    analysis_group,
-                    threshold,
-                )
-                summary = {
-                    "totalMatching": calculated["totalMatching"],
-                    "sectionMatches": calculated["sectionMatches"],
-                    "updatedAt": None,
-                }
-                all_similar_keys = calculated["similarKeysBySource"]
-
-        summary_updated_at = summary["updatedAt"]
-        if hasattr(summary_updated_at, "isoformat"):
-            summary_updated_at = summary_updated_at.isoformat()
+            calculated = self._calculate_application_summary(
+                application_id,
+                analysis_group,
+                threshold,
+            )
+            summary = {
+                "totalMatching": calculated["totalMatching"],
+                "sectionMatches": calculated["sectionMatches"],
+            }
+            # The first page already searched every source key. Reuse that work
+            # instead of running the same vector searches for its 100 rows.
+            all_similar_keys = calculated["similarKeysBySource"]
 
         result = self.opensearch.application_occurrence_page(
             application_id,
@@ -98,23 +75,20 @@ class SentenceSummaryService:
             total_sentences = int(result["totalSentences"] or 0)
 
         sentences = result["sentences"]
-        key_rows = self.postgres.matching_keys(
-            [sentence["sentenceKey"] for sentence in sentences]
-        )
+        source_keys = sorted({sentence["sentenceKey"] for sentence in sentences})
         if all_similar_keys is None:
             similar_keys_by_source = self._similar_keys_at_threshold(
-                key_rows,
+                source_keys,
                 threshold,
             )
         else:
             similar_keys_by_source = {
                 source_key: all_similar_keys.get(source_key, [])
-                for source_key in key_rows
+                for source_key in source_keys
             }
-        candidate_keys = set()
-        for sentence in sentences:
-            source_key = sentence["sentenceKey"]
-            candidate_keys.add(source_key)
+
+        candidate_keys = set(source_keys)
+        for source_key in source_keys:
             candidate_keys.update(similar_keys_by_source[source_key])
         counts = self.opensearch.occurrence_counts_by_key(
             list(candidate_keys),
@@ -154,7 +128,6 @@ class SentenceSummaryService:
                     "returnedSentences": returned_after,
                     "totalMatching": summary["totalMatching"],
                     "sectionMatches": summary["sectionMatches"],
-                    "summaryUpdatedAt": summary_updated_at,
                 }
             )
 
@@ -165,7 +138,6 @@ class SentenceSummaryService:
             "thresholdPercentage": threshold,
             "totalMatching": summary["totalMatching"],
             "sectionMatches": summary["sectionMatches"],
-            "summaryUpdatedAt": summary_updated_at,
             "totalSentences": total_sentences,
             "returnedSentences": len(response_sentences),
             "pageMatchingSentences": sum(
@@ -186,85 +158,21 @@ class SentenceSummaryService:
             "neuralSearchUsed": False,
         }
 
-    def refresh_affected_applications(self, sentence_keys: list) -> dict:
-        """Refresh every application touched by the given sentence keys.
-
-        Input: one new or changed sentence key.
-        Output: finished summaries saved for all affected applications.
-        """
-
-        source_keys = sorted(set(sentence_keys))
-        key_rows = self.postgres.matching_keys(source_keys)
-        affected_keys = set(source_keys)
-        for source_key in source_keys:
-            affected_keys.update(key_rows[source_key]["matchingSentenceKeys"])
-        application_groups = self.opensearch.application_groups_for_keys(
-            list(affected_keys)
-        )
-        refreshed = self.refresh_application_groups(application_groups)
-        return {
-            "affectedSentenceKeys": len(affected_keys),
-            "applicationSummariesRefreshed": refreshed,
-        }
-
-    def refresh_application_groups(self, application_groups: list) -> int:
-        """Calculate each unique application and analysis-group summary.
-
-        Input: repeated application/group records found in OpenSearch.
-        Output: the number of unique summaries saved in PostgreSQL.
-        """
-
-        unique_groups = {
-            (item["applicationId"], item["analysisGroup"])
-            for item in application_groups
-        }
-        for application_id, analysis_group in sorted(unique_groups):
-            self.refresh_application_summary(application_id, analysis_group)
-        return len(unique_groups)
-
-    def refresh_application_summary(
-        self,
-        application_id: str,
-        analysis_group: str,
-    ) -> dict:
-        """Calculate and save one complete application summary."""
-
-        calculated = self._calculate_application_summary(
-            application_id,
-            analysis_group,
-            self.config.match_threshold,
-        )
-        saved_counts = calculated["sectionMatchCounts"]
-        total_matching = calculated["totalMatching"]
-        self.postgres.save_application_summary(
-            application_id,
-            analysis_group,
-            saved_counts,
-            total_matching,
-        )
-        return {
-            "applicationId": application_id,
-            "analysisGroup": analysis_group,
-            "sectionMatchCounts": saved_counts,
-            "totalMatching": total_matching,
-        }
-
     def _calculate_application_summary(
         self,
         application_id: str,
         analysis_group: str,
         threshold: int,
     ) -> dict:
-        """Calculate complete counts for one application and threshold."""
+        """Calculate complete section totals live from both OpenSearch indexes."""
 
         source_buckets = self.opensearch.application_key_section_counts(
             application_id,
             analysis_group,
         )
         source_keys = sorted({bucket["sentenceKey"] for bucket in source_buckets})
-        key_rows = self.postgres.matching_keys(source_keys)
         similar_keys_by_source = self._similar_keys_at_threshold(
-            key_rows,
+            source_keys,
             threshold,
         )
 
@@ -280,19 +188,17 @@ class SentenceSummaryService:
         section_counts = defaultdict(int)
         for bucket in source_buckets:
             source_key = bucket["sentenceKey"]
-            similar_keys = similar_keys_by_source[source_key]
             matches_per_sentence = outside_counts.get(source_key, 0)
             matches_per_sentence += sum(
-                outside_counts.get(key, 0) for key in similar_keys
+                outside_counts.get(key, 0)
+                for key in similar_keys_by_source[source_key]
             )
             section_counts[bucket["sectionName"]] += (
                 bucket["occurrenceCount"] * matches_per_sentence
             )
 
         saved_counts = dict(sorted(section_counts.items()))
-        total_matching = sum(saved_counts.values())
         return {
-            "sectionMatchCounts": saved_counts,
             "sectionMatches": [
                 {
                     "sectionName": section_name,
@@ -300,77 +206,36 @@ class SentenceSummaryService:
                 }
                 for section_name, count in saved_counts.items()
             ],
-            "totalMatching": total_matching,
+            "totalMatching": sum(saved_counts.values()),
             "similarKeysBySource": similar_keys_by_source,
         }
 
     def _similar_keys_at_threshold(
         self,
-        key_rows: dict,
+        source_keys: list,
         threshold: int,
     ) -> dict:
-        """Keep only saved relationships that still pass the cosine threshold.
+        """Run live catalog vector searches for the requested source keys."""
 
-        Input: source keys with their saved direct matching-key lists.
-        Output: matching-key lists with old or low-score relationships removed.
-        """
-
-        candidate_keys = set(key_rows)
-        for source_key, row in key_rows.items():
-            candidate_keys.update(
-                key for key in row["matchingSentenceKeys"] if key != source_key
-            )
-        if not candidate_keys:
+        if not source_keys:
             return {}
-
-        if threshold < self.config.match_threshold:
-            vectors = self.opensearch.catalog_vectors(list(key_rows))
-            qualified = {}
-            for source_key in key_rows:
-                if source_key not in vectors:
-                    raise RuntimeError(
-                        f"Catalog vector does not exist for {source_key}"
-                    )
-                matches = self.opensearch.catalog_matches(
-                    source_key,
-                    vectors[source_key],
-                    threshold,
-                )
-                qualified[source_key] = sorted(
-                    {
-                        match["sentenceKey"]
-                        for match in matches
-                        if match["sentenceKey"] != source_key
-                    }
-                )
-            return qualified
-
-        vectors = self.opensearch.catalog_vectors(list(candidate_keys))
+        vectors = self.opensearch.catalog_vectors(source_keys)
         qualified = {}
-        for source_key, row in key_rows.items():
-            similar_keys = [
-                key for key in row["matchingSentenceKeys"] if key != source_key
-            ]
-            if not similar_keys:
-                qualified[source_key] = []
-                continue
+        for source_key in source_keys:
             if source_key not in vectors:
                 raise RuntimeError(f"Catalog vector does not exist for {source_key}")
-
-            source_vector = vectors[source_key]
-            source_matches = []
-            for similar_key in similar_keys:
-                if similar_key not in vectors:
-                    raise RuntimeError(
-                        f"Catalog vector does not exist for saved key: {similar_key}"
-                    )
-                percentage = vector_cosine_percentage(
-                    source_vector,
-                    vectors[similar_key],
-                )
-                if percentage >= threshold:
-                    source_matches.append(similar_key)
-            qualified[source_key] = source_matches
+            matches = self.opensearch.catalog_matches(
+                source_key,
+                vectors[source_key],
+                threshold,
+            )
+            qualified[source_key] = sorted(
+                {
+                    match["sentenceKey"]
+                    for match in matches
+                    if match["sentenceKey"] != source_key
+                }
+            )
         return qualified
 
     @staticmethod
@@ -398,7 +263,6 @@ class SentenceSummaryService:
             "returnedSentences",
             "totalMatching",
             "sectionMatches",
-            "summaryUpdatedAt",
         }
         if not required.issubset(state):
             raise ValueError("Invalid nextToken")

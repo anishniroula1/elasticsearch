@@ -1,25 +1,15 @@
 import re
 
-from sentence_search.config import Config
 from sentence_search.opensearch_store import OpenSearchStore
-from sentence_search.postgres_store import PostgresStore
-from sentence_search.search_utils import vector_cosine_percentage
 
 SENTENCE_KEY_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 class SentenceKeySearchService:
-    def __init__(
-        self,
-        config: Config,
-        opensearch: OpenSearchStore,
-        postgres: PostgresStore,
-    ):
-        """Save the settings and stores used by sentence-key search."""
+    def __init__(self, opensearch: OpenSearchStore):
+        """Save the OpenSearch store used by sentence-key search."""
 
-        self.config = config
         self.opensearch = opensearch
-        self.postgres = postgres
 
     def search(
         self,
@@ -28,7 +18,7 @@ class SentenceKeySearchService:
         analysis_group: str,
         threshold: int,
     ) -> dict:
-        """Return all exact and saved similar sentences with their scores.
+        """Return all exact and similar sentences with their scores.
 
         Input: one SHA-256 sentence key and application A1.
         Output: every matching sentence outside A1 with exact or similar type.
@@ -40,55 +30,31 @@ class SentenceKeySearchService:
         if not 1 <= threshold <= 100:
             raise ValueError("threshold must be between 1 and 100")
 
-        if threshold < self.config.match_threshold:
-            source_vector = self.opensearch.catalog_vector(sentence_key)
-            catalog_matches = self.opensearch.catalog_matches(
-                sentence_key,
-                source_vector,
-                threshold,
-            )
-            similar_keys = sorted(
-                {
-                    match["sentenceKey"]
-                    for match in catalog_matches
-                    if match["sentenceKey"] != sentence_key
-                }
-            )
-            vectors = {sentence_key: source_vector}
-            vectors.update(self.opensearch.catalog_vectors(similar_keys))
-        else:
-            key_row = self.postgres.matching_keys([sentence_key])[sentence_key]
-            similar_keys = [
-                key for key in key_row["matchingSentenceKeys"] if key != sentence_key
-            ]
-            candidate_keys = [sentence_key, *similar_keys]
-            vectors = self.opensearch.catalog_vectors(candidate_keys)
-            if sentence_key not in vectors:
-                raise ValueError(f"sentenceKey does not exist: {sentence_key}")
-            source_vector = vectors[sentence_key]
+        source_vector = self.opensearch.catalog_vector(sentence_key)
+        catalog_matches = self.opensearch.catalog_matches(
+            sentence_key,
+            source_vector,
+            threshold,
+        )
         score_by_key = {sentence_key: 100.0}
-        qualified_similar_keys = []
-        for similar_key in similar_keys:
-            if similar_key not in vectors:
-                raise RuntimeError(
-                    f"Catalog vector does not exist for saved key: {similar_key}"
-                )
-            match_percentage = vector_cosine_percentage(
-                source_vector,
-                vectors[similar_key],
-            )
-            if match_percentage < threshold:
+        similar_keys = []
+        for match in catalog_matches:
+            matching_key = match["sentenceKey"]
+            if matching_key == sentence_key:
                 continue
-            qualified_similar_keys.append(similar_key)
-            score_by_key[similar_key] = match_percentage
+            percentage = float(match["similarityPercentage"])
+            if percentage < threshold:
+                continue
+            similar_keys.append(matching_key)
+            score_by_key[matching_key] = percentage
 
-        search_keys = [sentence_key, *qualified_similar_keys]
-
+        search_keys = [sentence_key, *sorted(set(similar_keys))]
         occurrences = self.opensearch.matching_occurrences(
             search_keys,
             application_id,
             analysis_group,
         )
+
         matches = []
         exact_count = 0
         similar_count = 0
@@ -113,7 +79,7 @@ class SentenceKeySearchService:
             "analysisGroup": analysis_group,
             "sentenceKey": sentence_key,
             "thresholdPercentage": threshold,
-            "directMatchingKeyCount": len(qualified_similar_keys),
+            "directMatchingKeyCount": len(search_keys) - 1,
             "exactMatchCount": exact_count,
             "similarMatchCount": similar_count,
             "totalMatches": len(matches),

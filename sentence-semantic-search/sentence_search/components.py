@@ -1,45 +1,17 @@
 from sentence_search.config import config
 from sentence_search.deletion_service import SentenceDeletionService
-from sentence_search.match_service import SentenceMatchService
 from sentence_search.opensearch_store import OpenSearchStore
-from sentence_search.postgres_store import PostgresStore
 from sentence_search.seed_service import SeedService
 from sentence_search.sentence_key_search_service import SentenceKeySearchService
 from sentence_search.sentence_service import SentenceService
 from sentence_search.sentence_summary_service import SentenceSummaryService
 
 opensearch_store = OpenSearchStore(config)
-postgres_store = PostgresStore(config)
-match_service = SentenceMatchService(
-    opensearch_store,
-    postgres_store,
-)
-sentence_summary_service = SentenceSummaryService(
-    config,
-    opensearch_store,
-    postgres_store,
-)
-sentence_service = SentenceService(
-    config,
-    opensearch_store,
-    postgres_store,
-    match_service,
-    sentence_summary_service,
-)
+sentence_summary_service = SentenceSummaryService(opensearch_store)
+sentence_service = SentenceService(opensearch_store)
 seed_service = SeedService(
     config,
     opensearch_store,
-    postgres_store,
-    match_service,
-    sentence_summary_service,
 )
-deletion_service = SentenceDeletionService(
-    opensearch_store,
-    postgres_store,
-    sentence_summary_service,
-)
-sentence_key_search_service = SentenceKeySearchService(
-    config,
-    opensearch_store,
-    postgres_store,
-)
+deletion_service = SentenceDeletionService(opensearch_store)
+sentence_key_search_service = SentenceKeySearchService(opensearch_store)

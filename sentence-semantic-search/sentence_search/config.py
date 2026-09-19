@@ -37,7 +37,6 @@ class Config:
     vector_dimension: int
     seed_batch_size: int
     seed_workers: int
-    database_url: str
     match_threshold: int
 
     @classmethod
@@ -82,10 +81,6 @@ class Config:
             vector_dimension=_integer("VECTOR_DIMENSION", 512),
             seed_batch_size=_integer("SEED_BATCH_SIZE", 100),
             seed_workers=_integer("SEED_WORKERS", 4),
-            database_url=os.getenv(
-                "DATABASE_URL",
-                "postgresql+psycopg://sentence:sentence@localhost:5432/sentence_matches",
-            ).strip(),
             match_threshold=_integer("MATCH_THRESHOLD", 90),
         )
         config.validate()

@@ -4,12 +4,10 @@ from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query
 from opensearchpy.exceptions import OpenSearchException
-from sqlalchemy.exc import SQLAlchemyError
 
 from sentence_search.components import (
     deletion_service,
     opensearch_store,
-    postgres_store,
     seed_service,
     sentence_key_search_service,
     sentence_service,
@@ -29,11 +27,10 @@ class IndexSelection(StrEnum):
 
 @router.get("/health", tags=["System"])
 def health():
-    """Check OpenSearch and PostgreSQL without calling Titan."""
+    """Check OpenSearch without calling Titan."""
 
     try:
         opensearch_ready = opensearch_store.client.ping()
-        postgres_stats = postgres_store.stats()
     except Exception as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     return {
@@ -45,21 +42,17 @@ def health():
         "catalogAlias": config.catalog_alias,
         "semanticModelId": config.semantic_model_id,
         "ingestPipeline": config.ingest_pipeline,
-        "postgres": postgres_stats,
         "modelInvoked": False,
     }
 
 
 @router.get("/stats", tags=["System"])
 def stats():
-    """Show OpenSearch and PostgreSQL record counts."""
+    """Show the occurrence and catalog record counts."""
 
     try:
-        return {
-            "opensearch": opensearch_store.stats(),
-            "postgres": postgres_store.stats(),
-        }
-    except (OpenSearchException, SQLAlchemyError, RuntimeError) as error:
+        return opensearch_store.stats()
+    except (OpenSearchException, RuntimeError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
 
 
@@ -84,21 +77,16 @@ def index_documents(
 
 @router.post("/admin/init", tags=["Admin"])
 def initialize_storage():
-    """Create two OpenSearch indexes and two PostgreSQL tables."""
+    """Create the two OpenSearch indexes and aliases."""
 
     try:
         opensearch_store.ensure_indices()
-        postgres_store.init_schema()
-    except (OpenSearchException, SQLAlchemyError, RuntimeError) as error:
+    except (OpenSearchException, RuntimeError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     return {
         "message": "Sentence semantic-search storage is ready",
         "occurrenceIndex": config.occurrence_index,
         "catalogIndex": config.catalog_index,
-        "postgresTables": [
-            "sentence_key_matches",
-            "application_match_summary",
-        ],
     }
 
 
@@ -109,7 +97,7 @@ def delete_storage(
         Query(description="Must be true to delete all project data."),
     ] = False,
 ):
-    """Delete both OpenSearch indexes and all PostgreSQL project rows."""
+    """Delete both OpenSearch indexes and their aliases."""
 
     if not confirm:
         raise HTTPException(
@@ -118,11 +106,10 @@ def delete_storage(
         )
     try:
         deleted = opensearch_store.delete_indices()
-        postgres_store.reset_data()
-    except (OpenSearchException, SQLAlchemyError, RuntimeError) as error:
+    except (OpenSearchException, RuntimeError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     return {
-        "message": "OpenSearch and PostgreSQL sentence data were deleted",
+        "message": "OpenSearch sentence data was deleted",
         **deleted,
     }
 
@@ -146,7 +133,7 @@ def seed(
         ),
     ] = "data/seed.csv",
 ):
-    """Load the CSV in its existing order and calculate matches."""
+    """Load the CSV in its existing order into both OpenSearch indexes."""
 
     path = Path(csvPath).expanduser()
     if not path.is_absolute():
@@ -158,19 +145,19 @@ def seed(
         )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    except (OpenSearchException, SQLAlchemyError, RuntimeError) as error:
+    except (OpenSearchException, RuntimeError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
 
 
 @router.post("/sentences", tags=["Sentences"])
 def add_sentence(sentence: SentenceOccurrence):
-    """Add one sentence and calculate its matches."""
+    """Add one occurrence and create its catalog vector when needed."""
 
     try:
         return sentence_service.add_sentence(sentence)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    except (OpenSearchException, SQLAlchemyError, RuntimeError) as error:
+    except (OpenSearchException, RuntimeError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
 
 
@@ -182,13 +169,13 @@ def delete_application(
         Query(description="Must be true to delete the application sentences."),
     ] = False,
 ):
-    """Delete one application's sentences and unused key relationships."""
+    """Delete one application's occurrences and unused catalog vectors."""
 
     if not confirm:
         raise HTTPException(status_code=400, detail="Set confirm=true to delete.")
     try:
         return deletion_service.delete_application(applicationId)
-    except (OpenSearchException, SQLAlchemyError, RuntimeError) as error:
+    except (OpenSearchException, RuntimeError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
 
 
@@ -207,7 +194,7 @@ def delete_tsp_document(
         Query(description="Must be true to delete the TSP document sentences."),
     ] = False,
 ):
-    """Delete one TSP document and its unused key relationships."""
+    """Delete one TSP document and its unused catalog vectors."""
 
     if not confirm:
         raise HTTPException(status_code=400, detail="Set confirm=true to delete.")
@@ -215,7 +202,7 @@ def delete_tsp_document(
         return deletion_service.delete_tsp(tspId, applicationId)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    except (OpenSearchException, SQLAlchemyError, RuntimeError) as error:
+    except (OpenSearchException, RuntimeError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
 
 
@@ -242,7 +229,7 @@ def application_semantic_summary(
         )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    except (OpenSearchException, SQLAlchemyError, RuntimeError) as error:
+    except (OpenSearchException, RuntimeError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
 
 
@@ -281,5 +268,5 @@ def sentence_key_semantic_search(
         )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    except (OpenSearchException, SQLAlchemyError, RuntimeError) as error:
+    except (OpenSearchException, RuntimeError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from error

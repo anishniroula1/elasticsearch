@@ -1,6 +1,8 @@
 from threading import Barrier, Lock
 from types import SimpleNamespace
 
+import pytest
+
 from sentence_search.seed_service import (
     SeedService,
     _canonical_headers,
@@ -20,8 +22,8 @@ def test_sample_csv_loads_without_sorting(tmp_path):
         "applicationId,tspId,sectionName,globalId,sentIdLocal,"
         "sentenceContent,isTracer,isFormLanguage,sentenceKey,"
         "sourceType,createdAt,updatedAt,analysisGroup\n"
-        "A1,T1,Statement,SENT-9,9,Last sentence,false,false,,document,,,G1\n"
-        "A1,T1,Statement,SENT-2,2,Earlier ID,false,false,,document,,,G1\n",
+        "A1,T1,Statement,9,9,Last sentence,false,false,,document,,,G1\n"
+        "A1,T1,Statement,2,2,Earlier ID,false,false,,document,,,G1\n",
         encoding="utf-8",
     )
 
@@ -29,7 +31,21 @@ def test_sample_csv_loads_without_sorting(tmp_path):
     for batch in csv_batches(csv_file, 1):
         records.extend(batch)
 
-    assert [record.globalId for record in records] == ["SENT-9", "SENT-2"]
+    assert [record.globalId for record in records] == [9, 2]
+
+
+def test_csv_rejects_non_numeric_global_id_with_row_number(tmp_path):
+    csv_file = tmp_path / "bad-global-id.csv"
+    csv_file.write_text(
+        "applicationId,tspId,sectionName,globalId,sentIdLocal,"
+        "sentenceContent,isTracer,isFormLanguage,sentenceKey,"
+        "sourceType,createdAt,updatedAt,analysisGroup\n"
+        "A1,T1,Statement,SENT-9,9,Sentence,false,false,,document,,,G1\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Invalid CSV row 2"):
+        list(csv_batches(csv_file, 1))
 
 
 class FakeParallelOpenSearchStore:
@@ -82,64 +98,16 @@ class FakeParallelOpenSearchStore:
         self.refresh_calls += 1
 
 
-class FakePostgresStore:
-    def reset_data(self):
-        return None
-
-    def register_sentence_keys(self, sources):
-        return {
-            "registered": len(sources),
-            "newSentenceKeys": list({source["sentenceKey"] for source in sources}),
-        }
-
-
-class FakeParallelMatchService:
-    def __init__(self, workers, opensearch):
-        self.opensearch = opensearch
-        self._workers = workers
-        self._first_wave = Barrier(workers)
-        self._calls = 0
-        self._active_calls = 0
-        self.max_active_calls = 0
-        self._lock = Lock()
-
-    def match_sentence_key(self, sentence_key, threshold):
-        assert sentence_key in self.opensearch.catalog_keys
-        assert threshold == 90
-        with self._lock:
-            self._calls += 1
-            call_number = self._calls
-            self._active_calls += 1
-            self.max_active_calls = max(
-                self.max_active_calls,
-                self._active_calls,
-            )
-        if call_number <= self._workers:
-            self._first_wave.wait(timeout=2)
-        with self._lock:
-            self._active_calls -= 1
-        return {"affectedSentenceKeys": [sentence_key]}
-
-
-class FakeSummaryService:
-    def __init__(self):
-        self.keys = []
-
-    def refresh_affected_applications(self, keys):
-        self.keys.extend(keys)
-        return {"applicationSummariesRefreshed": 1}
-
-
-def test_seed_runs_bounded_catalog_and_match_workers(tmp_path):
+def test_seed_runs_bounded_catalog_workers_without_matching(tmp_path):
     workers = 3
     csv_file = tmp_path / "parallel-sentences.csv"
     rows = [
-        "A1,T1,Statement,SENT-1,1,Sentence one,false,false,,document,,,Asylee",
-        "A1,T1,Statement,SENT-2,2,Sentence two,false,false,,document,,,Asylee",
-        "A1,T1,Statement,SENT-3,3,Sentence three,false,false,,document,,,Asylee",
-        "A1,T1,Statement,SENT-4,4,Sentence four,false,false,,document,,,Asylee",
-        "A1,T1,Statement,SENT-5,5,Sentence five,false,false,,document,,,Asylee",
-        "A1,T1,Statement,SENT-6,6,Sentence six,false,false,,document,,,Asylee",
+        "A1,T1,Statement,1,1,Sentence one,false,false,,document,,,Asylee",
+        "A1,T1,Statement,2,2,Sentence two,false,false,,document,,,Asylee",
+        "A1,T1,Statement,3,3,Sentence three,false,false,,document,,,Asylee",
+        "A1,T1,Statement,4,4,Sentence four,false,false,,document,,,Asylee",
+        "A1,T1,Statement,5,5,Sentence five,false,false,,document,,,Asylee",
+        "A1,T1,Statement,6,6,Sentence six,false,false,,document,,,Asylee",
     ]
     csv_file.write_text(
         "applicationId,tspId,sectionName,globalId,sentIdLocal,"
@@ -148,28 +116,19 @@ def test_seed_runs_bounded_catalog_and_match_workers(tmp_path):
         encoding="utf-8",
     )
     opensearch = FakeParallelOpenSearchStore(workers)
-    match_service = FakeParallelMatchService(workers, opensearch)
-    summary_service = FakeSummaryService()
     service = SeedService(
-        SimpleNamespace(
-            seed_batch_size=2,
-            seed_workers=workers,
-            match_threshold=90,
-        ),
+        SimpleNamespace(seed_batch_size=2, seed_workers=workers),
         opensearch,
-        FakePostgresStore(),
-        match_service,
-        summary_service,
     )
 
     result = service.seed(csv_file, reset=True)
 
-    assert opensearch.occurrence_ids == [f"SENT-{number}" for number in range(1, 7)]
+    assert opensearch.occurrence_ids == list(range(1, 7))
     assert opensearch.max_active_catalog_calls == workers
-    assert match_service.max_active_calls == workers
     assert opensearch.refresh_calls == 1
-    assert len(summary_service.keys) == 6
     assert result["completedBatches"] == 3
     assert result["completedWaves"] == 1
     assert result["seedBatchSize"] == 2
     assert result["seedWorkers"] == workers
+    assert result["matchProcessing"] == "searchTime"
+    assert "matchesCalculated" not in result

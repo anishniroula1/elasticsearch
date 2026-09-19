@@ -36,29 +36,34 @@ class ClientThatMustNotRun:
         raise AssertionError("Duplicate input should fail before OpenSearch")
 
 
+class ExistingOccurrenceClient:
+    def mget(self, **request):
+        assert request["body"]["ids"] == ["1"]
+        return {
+            "docs": [
+                {
+                    "_id": "1",
+                    "found": True,
+                    "_source": {
+                        "applicationId": "A1",
+                        "tspId": "T1",
+                        "sectionName": "Affidavit",
+                        "analysisGroup": "Asylee",
+                        "sentenceKey": "key-1",
+                        "isTracer": False,
+                        "isFormLanguage": False,
+                    },
+                }
+            ]
+        }
+
+
 class SummaryAggregationClient:
     def __init__(self):
         self.requests = []
 
     def search(self, **request):
         self.requests.append(request)
-        aggregations = request["body"]["aggs"]
-        if "applicationGroups" in aggregations:
-            return {
-                "aggregations": {
-                    "applicationGroups": {
-                        "buckets": [
-                            {
-                                "key": {
-                                    "applicationId": "A1",
-                                    "analysisGroup": "Asylee",
-                                },
-                                "doc_count": 2,
-                            }
-                        ]
-                    }
-                }
-            }
         return {
             "aggregations": {
                 "keySections": {
@@ -143,6 +148,7 @@ def test_occurrence_mapping_has_requested_sentence_fields():
         "updatedAt",
         "analysisGroup",
     }
+    assert properties["globalId"] == {"type": "long"}
 
 
 def test_catalog_mapping_uses_512_dimension_faiss_cosine():
@@ -252,19 +258,6 @@ def test_sentence_key_search_uses_terms_and_never_knn():
     assert {"term": {"applicationId": "A1"}} in body["query"]["bool"]["must_not"]
 
 
-def test_summary_refresh_finds_affected_application_groups():
-    client = SummaryAggregationClient()
-    store = OpenSearchStore(config, client)
-
-    groups = store.application_groups_for_keys(["key-1"])
-
-    filters = client.requests[0]["body"]["query"]["bool"]["filter"]
-    assert groups == [{"applicationId": "A1", "analysisGroup": "Asylee"}]
-    assert {"terms": {"sentenceKey": ["key-1"]}} in filters
-    assert {"term": {"isTracer": False}} in filters
-    assert {"term": {"isFormLanguage": False}} in filters
-
-
 def test_summary_refresh_groups_source_counts_by_section_and_key():
     client = SummaryAggregationClient()
     store = OpenSearchStore(config, client)
@@ -289,9 +282,15 @@ def test_duplicate_global_id_cannot_have_different_sentence_keys():
         store.validate_occurrence_identity([first, second])
 
 
+def test_numeric_global_id_uses_string_document_id_for_mget():
+    store = OpenSearchStore(config, ExistingOccurrenceClient())
+
+    store.validate_occurrence_identity([_occurrence_identity("key-1")])
+
+
 def _occurrence_identity(sentence_key):
     return {
-        "globalId": "S1",
+        "globalId": 1,
         "applicationId": "A1",
         "tspId": "T1",
         "sectionName": "Affidavit",

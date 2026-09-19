@@ -5,16 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "semantic-sentence-matching"
 version = "0.1.0"
-description = "Sentence semantic matching with OpenSearch, Titan, and PostgreSQL"
+description = "Sentence semantic matching with OpenSearch and Amazon Titan"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "boto3>=1.40,<2",
   "fastapi>=0.115,<1",
   "opensearch-py>=2.8,<4",
-  "psycopg[binary]>=3.2,<4",
   "python-dotenv>=1.0,<2",
-  "sqlalchemy>=2.0,<3",
   "uvicorn[standard]>=0.30,<1",
 ]
 

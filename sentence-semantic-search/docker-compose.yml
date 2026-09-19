@@ -1,33 +1,12 @@
 services:
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: sentence_matches
-      POSTGRES_USER: sentence
-      POSTGRES_PASSWORD: sentence
-    ports:
-      - "5434:5432"
-    volumes:
-      - sentence-postgres-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U sentence -d sentence_matches"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
-
   api:
     build: .
     env_file:
       - .env
-    environment:
-      DATABASE_URL: postgresql+psycopg://sentence:sentence@postgres:5432/sentence_matches
     ports:
       - "8008:8000"
     volumes:
       - ./data:/app/data:ro
-    depends_on:
-      postgres:
-        condition: service_healthy
     healthcheck:
       test:
         - CMD
@@ -40,6 +19,3 @@ services:
       timeout: 5s
       retries: 20
     restart: unless-stopped
-
-volumes:
-  sentence-postgres-data:

@@ -4,12 +4,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from sentence_search.config import Config
-from sentence_search.match_service import SentenceMatchService
-from sentence_search.matching_rules import is_matchable_sentence
 from sentence_search.models import SentenceOccurrence
 from sentence_search.opensearch_store import OpenSearchStore
-from sentence_search.postgres_store import PostgresStore
-from sentence_search.sentence_summary_service import SentenceSummaryService
 
 REQUIRED_COLUMNS = {
     "applicationId",
@@ -67,13 +63,14 @@ def _sentence(row: dict, line_number: int) -> SentenceOccurrence:
     """Convert one canonical CSV row into a validated sentence."""
 
     values = dict(row)
-    values["sentIdLocal"] = int(values["sentIdLocal"])
-    values["isTracer"] = _as_bool(values["isTracer"])
-    values["isFormLanguage"] = _as_bool(values["isFormLanguage"])
-    values["sentenceKey"] = values.get("sentenceKey") or None
-    values["createdAt"] = values.get("createdAt") or None
-    values["updatedAt"] = values.get("updatedAt") or None
     try:
+        values["globalId"] = int(values["globalId"])
+        values["sentIdLocal"] = int(values["sentIdLocal"])
+        values["isTracer"] = _as_bool(values["isTracer"])
+        values["isFormLanguage"] = _as_bool(values["isFormLanguage"])
+        values["sentenceKey"] = values.get("sentenceKey") or None
+        values["createdAt"] = values.get("createdAt") or None
+        values["updatedAt"] = values.get("updatedAt") or None
         return SentenceOccurrence.model_validate(values)
     except ValueError as error:
         raise ValueError(f"Invalid CSV row {line_number}: {error}") from error
@@ -114,29 +111,21 @@ class SeedService:
         self,
         config: Config,
         opensearch: OpenSearchStore,
-        postgres: PostgresStore,
-        match_service: SentenceMatchService,
-        summary_service: SentenceSummaryService,
     ):
         """Save the stores used by CSV seeding."""
 
         self.config = config
         self.opensearch = opensearch
-        self.postgres = postgres
-        self.match_service = match_service
-        self.summary_service = summary_service
 
-    def _complete_wave(self, executor, pending_batches: list) -> dict:
-        """Finish one bounded group of catalog, occurrence, and match work.
+    def _complete_wave(self, pending_batches: list) -> dict:
+        """Finish one bounded group of catalog and occurrence work.
 
         Input: up to SEED_WORKERS batches whose Titan work is running.
-        Output: counts for records fully saved and matched in this wave.
+        Output: counts for records fully saved in this wave.
         """
 
         occurrence_count = 0
         catalog_count = 0
-        sources = []
-        matchable_keys = set()
 
         # Futures are read in CSV order. This means an occurrence batch is
         # saved only after its own catalog vectors have finished successfully.
@@ -145,39 +134,13 @@ class SeedService:
             batch_sources = pending["sources"]
             occurrence_count += self.opensearch.bulk_index_occurrences(batch_sources)
             catalog_count += pending["catalogCount"]
-            sources.extend(batch_sources)
-            matchable_keys.update(pending["matchableKeys"])
 
         # One refresh makes the entire wave visible. With 16 workers and the
         # default batch size, this replaces 16 separate refresh operations.
         self.opensearch.refresh_indices()
-        registration = self.postgres.register_sentence_keys(sources)
-
-        match_futures = []
-        for sentence_key in sorted(matchable_keys):
-            match_futures.append(
-                executor.submit(
-                    self.match_service.match_sentence_key,
-                    sentence_key,
-                    self.config.match_threshold,
-                )
-            )
-        affected_keys = set()
-        for match_future in match_futures:
-            match_result = match_future.result()
-            affected_keys.update(match_result["affectedSentenceKeys"])
-
-        summary_result = self.summary_service.refresh_affected_applications(
-            list(affected_keys)
-        )
         return {
             "occurrencesIndexed": occurrence_count,
             "catalogDocumentsIndexed": catalog_count,
-            "sentenceKeysRegistered": len(registration["newSentenceKeys"]),
-            "matchesCalculated": len(matchable_keys),
-            "applicationSummariesRefreshed": summary_result[
-                "applicationSummariesRefreshed"
-            ],
         }
 
     def seed(
@@ -185,13 +148,12 @@ class SeedService:
         path: Path,
         reset: bool,
     ) -> dict:
-        """Index the CSV in order and calculate its sentence matches."""
+        """Index the CSV in order without running sentence matching."""
 
         if not path.is_file():
             raise ValueError(f"CSV file does not exist: {path}")
         if reset:
             self.opensearch.recreate_indices()
-            self.postgres.reset_data()
         else:
             self.opensearch.ensure_indices()
 
@@ -199,9 +161,6 @@ class SeedService:
         occurrences_indexed = 0
         catalog_indexed = 0
         catalog_reused = 0
-        sentence_keys_registered = 0
-        matches_calculated = 0
-        application_summaries_refreshed = 0
         completed_batches = 0
         completed_waves = 0
         known_catalog_keys = set()
@@ -246,36 +205,21 @@ class SeedService:
                         "catalogFuture": catalog_future,
                         "catalogCount": len(new_catalog_sources),
                         "sources": sources,
-                        "matchableKeys": {
-                            source["sentenceKey"]
-                            for source in sources
-                            if is_matchable_sentence(source)
-                        },
                     }
                 )
 
                 if len(pending_batches) == self.config.seed_workers:
-                    result = self._complete_wave(executor, pending_batches)
+                    result = self._complete_wave(pending_batches)
                     occurrences_indexed += result["occurrencesIndexed"]
                     catalog_indexed += result["catalogDocumentsIndexed"]
-                    sentence_keys_registered += result["sentenceKeysRegistered"]
-                    matches_calculated += result["matchesCalculated"]
-                    application_summaries_refreshed += result[
-                        "applicationSummariesRefreshed"
-                    ]
                     completed_batches += len(pending_batches)
                     completed_waves += 1
                     pending_batches = []
 
             if pending_batches:
-                result = self._complete_wave(executor, pending_batches)
+                result = self._complete_wave(pending_batches)
                 occurrences_indexed += result["occurrencesIndexed"]
                 catalog_indexed += result["catalogDocumentsIndexed"]
-                sentence_keys_registered += result["sentenceKeysRegistered"]
-                matches_calculated += result["matchesCalculated"]
-                application_summaries_refreshed += result[
-                    "applicationSummariesRefreshed"
-                ]
                 completed_batches += len(pending_batches)
                 completed_waves += 1
 
@@ -284,16 +228,12 @@ class SeedService:
             "occurrencesIndexed": occurrences_indexed,
             "catalogDocumentsIndexed": catalog_indexed,
             "catalogDocumentsReused": catalog_reused,
-            "sentenceKeysRegistered": sentence_keys_registered,
-            "matchesCalculated": matches_calculated,
-            "applicationSummariesRefreshed": application_summaries_refreshed,
             "completedBatches": completed_batches,
             "completedWaves": completed_waves,
             "seedBatchSize": self.config.seed_batch_size,
             "seedWorkers": self.config.seed_workers,
-            "threshold": self.config.match_threshold,
             "reset": reset,
-            "matchProcessing": "duringSeed",
+            "matchProcessing": "searchTime",
         }
 
     @staticmethod

@@ -1,471 +1,201 @@
-# Semantic Sentence Matching
+# Semantic sentence search
 
-This folder is one complete application. It does not import code from another
-project.
+This API saves sentences in OpenSearch and uses Amazon Titan vectors to find
+sentences with the same or similar meaning.
 
-The job is simple:
+The project currently uses OpenSearch only. There is no PostgreSQL connection,
+table, background matching job, or saved match list. This makes seeding much
+simpler and faster. Matches are calculated when a search endpoint is called.
 
-1. Save every sentence in OpenSearch.
-2. Create one Titan vector for each new sentence text.
-3. Find direct sentence-key matches during ingestion.
-4. Save both directions in PostgreSQL.
-5. Save application and section totals in PostgreSQL.
-6. Let the UI read totals immediately and page through sentence details.
+If saved matching lists and saved application totals are needed later, read
+[POSTGRES_MATCHING_RESTORE_GUIDE.md](POSTGRES_MATCHING_RESTORE_GUIDE.md). That
+file contains the table design, matching rules, and a ready-to-use prompt for
+adding the database flow back.
 
-Titan and KNN are used only while adding data. The two UI search endpoints do
-not call Titan and do not run KNN.
+## What is stored
 
-## Storage
+The project creates two OpenSearch indexes.
 
-The project has two OpenSearch indexes and two PostgreSQL tables.
+### Sentence occurrences
 
-### OpenSearch occurrence index
+Index: sentence_occurrences-v1  
+Alias: sentence_occurrences
 
-`sentence_occurrences` stores every sentence record:
+This index stores every sentence occurrence. It contains the application,
+document, section, global ID, sentence text, flags, analysis group, and
+sentenceKey.
 
-```text
-applicationId, tspId, sectionName, globalId, sentIdLocal,
-sentenceContent, isTracer, isFormLanguage, sentenceKey, sourceType,
-createdAt, updatedAt, analysisGroup
-```
+globalId is stored as an OpenSearch long, so its value must be numeric. The
+internal OpenSearch document _id is the string form of that same number. Values
+with letters are rejected, and leading zeros are not preserved.
 
-The `globalId` is the OpenSearch document ID.
+The sentenceKey is a SHA-256 value made from normalized sentence text. The same
+sentence text always gets the same key.
 
-### OpenSearch catalog index
+### Semantic catalog
 
-`sentence_semantic_catalog` stores one record for each unique `sentenceKey`:
+Index: sentence_semantic_catalog-v1  
+Alias: sentence_semantic_catalog
 
-```text
-sentenceContent, sentenceContentVector, sentenceKey, createdAt, updatedAt
-```
+This index stores one record for each unique sentenceKey. It contains the
+sentence text and its 512-dimension Titan vector. The vector uses FAISS with
+cosine similarity.
 
-The vector is 512 dimensions. The mapping uses Faiss, HNSW, and cosine
-similarity.
+If the same sentence appears in many documents, its vector is created only
+once. All occurrence records use the same sentenceKey.
 
-### PostgreSQL table 1: `sentence_key_matches`
+## Seeding flow
 
-This table stores the direct key graph:
+1. Read the CSV from top to bottom. The file is not sorted.
+2. Validate every sentence and create its sentenceKey.
+3. Check which sentence keys already exist in the catalog.
+4. Send only new catalog records through the OpenSearch ingest pipeline. The
+   pipeline calls Titan and creates the 512-dimension vector.
+5. Save the occurrence records after their catalog batch succeeds.
+6. Refresh both indexes once per worker wave.
 
-```text
-sentenceKey
-matchingSentenceKeys
-createdAt
-updatedAt
-```
+The seed flow does not search for matches. It does not build summaries. The
+SEED_WORKERS setting controls how many catalog batches can call the ingest
+pipeline at the same time.
 
-The matching-key array has a PostgreSQL GIN index so deleting a key does not
-need a full table scan.
-
-PostgreSQL does not copy sentence records. Those records stay in OpenSearch.
-
-### PostgreSQL table 2: `application_match_summary`
-
-This table stores the answer the UI needs immediately:
+Input CSV columns:
 
 ```text
-applicationId
-analysisGroup
-sectionMatchCounts
-totalMatching
-updatedAt
+applicationId,tspId,sectionName,globalId,sentIdLocal,sentenceContent,isTracer,isFormLanguage,sentenceKey,sourceType,createdAt,updatedAt,analysisGroup
 ```
 
-Example:
+sentenceKey, createdAt, and updatedAt may be empty. The API creates the key and
+fills missing dates. globalId must contain a number that fits in an OpenSearch
+signed 64-bit long.
+
+## Search flow
+
+Tracer and form-language sentences still get vectors and occurrence records.
+They are left out of semantic matching results.
+
+The default analysis group is Asylee. The caller can send another analysis
+group. The caller can also send any threshold from 1 through 100.
+
+### Search by sentence key
 
 ```text
-Affidavit -> 10 matches
-B1        -> 30 matches
-Total     -> 40 matches
+GET /applications/A1/sentences/semantic-search
+    ?sentenceKey=<64-character SHA-256 key>
+    &analysisGroup=Asylee
+    &threshold=90
 ```
 
-This is only a saved result table. It does not contain worker or queue fields.
+The API:
 
-## Why we save sentence keys, not global IDs
+1. Reads the saved vector for sentenceKey.
+2. Runs a live vector search in the catalog.
+3. Keeps catalog results at or above the requested cosine percentage.
+4. Reads matching occurrences outside the provided application.
+5. Returns every result with matchType exact or similar and matchPercentage.
 
-The same sentence text can exist under many `globalId` values. Its normalized
-text always creates the same SHA-256 `sentenceKey`.
+No Titan call is made during this search because the vector already exists.
 
-If the key already exists, the application reuses its vector. Updating the
-same direct relationship is safe because duplicate keys are removed.
-
-Example:
+### Application summary
 
 ```text
-key D directly matches key A and key B
-
-D -> [A, B]
-A -> [D]
-B -> [D]
+GET /applications/A1/sentences/semantic-summary
+    ?analysisGroup=Asylee
+    &threshold=90
+    &pageSize=100
 ```
 
-The save is bidirectional. If D stores A, A also stores D.
+The first request searches every unique eligible sentence key in the
+application. This is needed to return the complete totalMatching and
+sectionMatches values. The response token carries those totals to later pages,
+so later pages only calculate matches for that page.
 
-The code saves direct matches only. It does not make a false connected group.
-If A matches B and A matches D, that alone does not say B matches D.
+Because totals are no longer saved in a database, the first summary request can
+take longer for applications with many unique sentences. This is the expected
+tradeoff for faster seeding and no database.
 
-## Ingestion flow
-
-```mermaid
-flowchart LR
-    A[CSV or POST sentence] --> B[Occurrence index]
-    A --> C{sentenceKey already in catalog?}
-    C -->|No| D[Titan creates 512 vector]
-    C -->|Yes| E[Reuse saved vector]
-    D --> F[Create simple key row]
-    E --> G[Reuse simple key row]
-    F --> H[KNN search now]
-    G --> H
-    H --> I[Save direct keys both ways]
-    I --> J[Find affected applications]
-    J --> K[Save section and total counts]
-```
-
-For one matchable key, ingestion does this:
-
-1. Read the saved vector from the catalog.
-2. KNN search the catalog at the configured threshold.
-3. Keep direct keys that pass the threshold.
-4. Update the source key and reverse key lists in one PostgreSQL transaction.
-5. Find applications using those keys.
-6. Calculate and save complete section and application totals.
-
-CSV seeding uses small parallel waves:
+Use nextToken exactly as returned:
 
 ```text
+GET /applications/A1/sentences/semantic-summary
+    ?analysisGroup=Asylee
+    &threshold=90
+    &pageSize=100
+    &nextToken=<returned token>
+```
+
+## Other endpoints
+
+```text
+GET    /health
+GET    /stats
+GET    /index-documents?index=sentence_occurrences&count=10
+GET    /index-documents?index=sentence_semantic_catalog&count=10
+POST   /admin/init
+POST   /admin/seed?reset=false&csvPath=data/seed.csv
+POST   /sentences
+DELETE /applications/{applicationId}?confirm=true
+DELETE /documents/{tspId}?applicationId=A1&confirm=true
+DELETE /admin/storage?confirm=true
+```
+
+The catalog preview includes the decoded embedding list. Deleting an
+application or document also deletes catalog vectors that are no longer used by
+any occurrence.
+
+## Environment setup
+
+Copy .env.example to .env and fill in the AWS and OpenSearch values.
+
+Important values:
+
+```text
+OPENSEARCH_HOST=search-your-domain.us-east-1.es.amazonaws.com
+OPENSEARCH_SEMANTIC_MODEL_ID=<deployed OpenSearch model ID>
+OPENSEARCH_INGEST_PIPELINE=sentence_bedrock_embedding_pipeline
+VECTOR_DIMENSION=512
 SEED_BATCH_SIZE=100
 SEED_WORKERS=4
+MATCH_THRESHOLD=90
 ```
 
-Each worker can send one 100-record catalog batch through the Titan pipeline.
-`SEED_WORKERS` can be set from 1 through 16. After one wave finishes, the API
-saves its occurrence records, refreshes OpenSearch once, matches its unique
-sentence keys with the same worker pool, and refreshes the affected application
-summaries.
+The deployed model, ingest pipeline, and catalog mapping must all use dimension
+512. A different dimension causes indexing to fail.
 
-If Titan or the Lasso proxy returns a temporary 408, 429, or 5xx error, every
-catalog worker pauses for five seconds. Only failed catalog records are sent
-again, up to ten attempts. A permanent 400 error stops the seed immediately.
-Every retry prints one short warning with its attempt number, failed document
-count, and wait time. It does not print the full bulk error or stack trace. The
-seed endpoint response still contains the final error.
+## Run the API
 
-The API returns only after matching and summary updates finish. If ingestion
-fails, send that sentence or seed request again. The relationship writes are
-safe to repeat.
+Run in Docker:
 
-Tracer and form-language sentences are still indexed and still receive a
-vector. They are not used for matching. Read queries always filter both flags
-to false.
-
-The saved key relationship is not tied to an analysis group. The read query
-filters occurrences to the requested `analysisGroup`, which defaults to
-`Asylee`.
-
-## Application semantic summary
-
-Request:
-
-```text
-GET /applications/A0001/sentences/semantic-summary?analysisGroup=Asylee&threshold=90&pageSize=100
-```
-
-This returns up to 100 eligible application sentences. Each sentence has:
-
-```text
-exactMatchCount
-similarMatchCount
-totalMatchCount
-directMatchingKeyCount
-```
-
-`exactMatchCount` means the same `sentenceKey` exists outside the supplied
-application. `similarMatchCount` means an occurrence uses one of the saved
-direct matching keys. Both counts use the same analysis group and ignore tracer
-and form-language records. The summary reads the saved vectors again and drops
-any old relationship below `MATCH_THRESHOLD` before counting it.
-
-At the configured threshold, the top of the response comes directly from
-`application_match_summary`:
-
-```text
-totalMatching
-sectionMatches
-summaryUpdatedAt
-```
-
-Example response:
-
-```json
-{
-  "applicationId": "A0001",
-  "analysisGroup": "Asylee",
-  "thresholdPercentage": 90,
-  "totalMatching": 4512,
-  "sectionMatches": [
-    {"sectionName": "Affidavit", "matchingCount": 1812},
-    {"sectionName": "B1", "matchingCount": 2700}
-  ],
-  "summaryUpdatedAt": "2026-09-18T14:30:00Z",
-  "totalSentences": 1530,
-  "returnedSentences": 100,
-  "pageMatchingSentences": 82,
-  "pageTotalMatches": 421,
-  "pagination": {
-    "page": 1,
-    "pageSize": 100,
-    "totalPages": 16,
-    "hasPreviousPage": false,
-    "hasNextPage": true
-  },
-  "nextToken": "TOKEN_FROM_THE_API",
-  "sentences": [
-    {
-      "globalId": "SENT-1",
-      "sentenceKey": "SHA256_KEY",
-      "sentenceContent": "The government issued the notice.",
-      "exactMatchCount": 2,
-      "similarMatchCount": 4,
-      "totalMatchCount": 6,
-      "directMatchingKeyCount": 3
-    }
-  ],
-  "neuralSearchUsed": false
-}
-```
-
-`totalMatching` is ready before sentence pagination starts. It is the sum of
-all exact and direct semantic occurrence matches outside the application.
-`sectionMatches` splits the same number by section.
-
-`threshold` can be any whole number from 1 through 100. At the configured
-`MATCH_THRESHOLD`, the API uses the fast summary already saved in PostgreSQL.
-At a different threshold, the first page calculates the complete application
-summary live. The next-page token carries those totals so later pages do not
-calculate the complete summary again. A lower threshold can take longer
-because it may find many more sentence keys and occurrences.
-
-The first page gets `totalSentences` from OpenSearch. Later pages carry that
-number inside `nextToken`, so OpenSearch does not recount it. Per-sentence
-counts are calculated only for the 100 sentences on the current page.
-
-Use the returned token without changing `applicationId`, `analysisGroup`,
-`threshold`, or `pageSize`:
-
-```text
-GET /applications/A0001/sentences/semantic-summary?analysisGroup=Asylee&threshold=90&pageSize=100&nextToken=TOKEN_FROM_THE_API
-```
-
-## Search by sentence key
-
-Request:
-
-```text
-GET /applications/A0001/sentences/semantic-search?sentenceKey=SHA256_KEY&analysisGroup=Asylee&threshold=90
-```
-
-This endpoint does not turn text into a vector. The caller sends a
-`sentenceKey` that already exists.
-
-The API reads that key's direct matching keys from PostgreSQL. It reads the
-saved catalog vectors and calculates a percentage for each matching key. It
-then sends a normal OpenSearch `terms` query for the source key plus those
-direct keys. The current application is left out.
-
-Example response:
-
-```json
-{
-  "applicationId": "A0001",
-  "analysisGroup": "Asylee",
-  "sentenceKey": "SHA256_KEY",
-  "thresholdPercentage": 90,
-  "directMatchingKeyCount": 3,
-  "exactMatchCount": 2,
-  "similarMatchCount": 4,
-  "totalMatches": 6,
-  "returnedMatches": 6,
-  "matches": [
-    {
-      "applicationId": "A0002",
-      "globalId": "SENT-99",
-      "sentenceKey": "SHA256_KEY",
-      "sentenceContent": "The government issued the notice.",
-      "matchPercentage": 100.0,
-      "matchType": "exact"
-    },
-    {
-      "applicationId": "A0003",
-      "globalId": "SENT-100",
-      "sentenceKey": "ANOTHER_SHA256_KEY",
-      "sentenceContent": "A notice was issued by the government.",
-      "matchPercentage": 92.35,
-      "matchType": "similar"
-    }
-  ],
-  "neuralSearchUsed": false
-}
-```
-
-The endpoint returns every result in one API response. It does not return a
-pagination token. OpenSearch is still read in internal batches, so one very
-large result does not have to be loaded from OpenSearch in one request.
-
-An exact match always has `matchPercentage` 100. A similar match gets its
-percentage by comparing the two vectors already saved in the catalog. This
-does not call Titan. A result is returned only when `matchPercentage` is at
-least the requested `threshold`.
-
-The query threshold can be any whole number from 1 through 100. The default is
-the configured `MATCH_THRESHOLD`, normally 90. When the requested value is
-lower than that setting, the API performs a live catalog vector search because
-those lower-score relationships were not saved in PostgreSQL during ingestion.
-At the configured threshold or higher, it uses the saved relationship list and
-does not need a new KNN search.
-
-Older versions converted the OpenSearch cosine score incorrectly. A 90 query
-could save results around 82 or 83. After updating the code, run the same seed
-file once with `reset=false`. Existing vectors are reused. The old low-score
-relationships are removed from both sides, and application summaries are
-calculated again.
-
-## Titan pipeline
-
-The deployed OpenSearch model must return 512 values.
-
-```json
-PUT /_ingest/pipeline/sentence_bedrock_embedding_pipeline
-{
-  "description": "Create a Titan embedding for sentence content",
-  "processors": [
-    {
-      "text_embedding": {
-        "model_id": "YOUR_DEPLOYED_MODEL_ID",
-        "field_map": {
-          "sentenceContent": "sentenceContentVector"
-        }
-      }
-    }
-  ]
-}
-```
-
-The Titan connector, registered model, ingest pipeline, and index mapping must
-all agree on 512 dimensions.
-
-## Configure and run
-
-Copy `.env.example` to `.env`, then fill these values:
-
-```text
-OPENSEARCH_HOST
-OPENSEARCH_SEMANTIC_MODEL_ID
-AWS_ACCESS_KEY_ID
-AWS_SECRET_ACCESS_KEY
-AWS_SESSION_TOKEN
-SEED_WORKERS
-```
-
-Leave AWS keys empty when the container receives an IAM role.
-
-Run the API and PostgreSQL:
-
-```text
+```bash
 make dev
 ```
 
-Run only PostgreSQL in Docker:
-
-```text
-make postgres
-```
-
-Swagger:
+Swagger opens at:
 
 ```text
 http://localhost:8008/docs
 ```
 
-Initialize storage:
+Run locally:
 
-```text
-POST /admin/init
+```bash
+make local
 ```
-
-Initialization also upgrades an earlier project table in the Docker volume by
-removing the old worker and queue columns.
-
-Seed from Swagger:
-
-```text
-POST /admin/seed?reset=false&csvPath=data%2Fseed.csv
-```
-
-`reset=false` keeps old data and reuses existing keys. `reset=true` deletes the
-two OpenSearch indexes and clears both PostgreSQL tables before seeding.
-For data that was loaded before `application_match_summary` was added, seed the
-same file with `reset=false`. Existing vectors are reused and the missing
-summary rows are calculated.
-
-Add one sentence:
-
-```json
-POST /sentences
-{
-  "applicationId": "A0003",
-  "tspId": "TSP-3",
-  "sectionName": "Affidavit",
-  "globalId": "SENT-3001",
-  "sentIdLocal": 1,
-  "sentenceContent": "The notice came from the United States government.",
-  "isTracer": false,
-  "isFormLanguage": false,
-  "sentenceKey": null,
-  "sourceType": "document",
-  "createdAt": null,
-  "updatedAt": null,
-  "analysisGroup": "Asylee"
-}
-```
-
-## Delete data
-
-Delete one application:
-
-```text
-DELETE /applications/A0001?confirm=true
-```
-
-Delete one TSP document:
-
-```text
-DELETE /documents/TSP-1?applicationId=A0001&confirm=true
-```
-
-The API deletes occurrence records first. A catalog vector and PostgreSQL key
-row are deleted only when no remaining occurrence uses that key. The deleted
-key is also removed from surviving direct-match lists. Every affected
-application summary is refreshed, and a fully deleted application's summary
-rows are removed.
-
-Delete all project data:
-
-```text
-DELETE /admin/storage?confirm=true
-```
-
-## Helpful endpoints
-
-```text
-GET  /health
-GET  /stats
-GET  /index-documents?index=sentence_occurrences&count=10
-```
-
-Choose the catalog alias in `/index-documents` to include the complete
-512-number `sentenceContentVector` list for each returned catalog record.
 
 Run tests:
 
-```text
+```bash
 make test
 ```
+
+## Reset warning
+
+Sending reset=true to the seed endpoint deletes and recreates both OpenSearch
+indexes before loading the CSV. Sending reset=false keeps existing data and
+creates only missing catalog vectors.
+
+If the occurrence index was created when globalId used the keyword mapping,
+recreate it before loading numeric IDs. OpenSearch cannot change an existing
+field from keyword to long in place.
+
+The admin storage delete endpoint removes both indexes and aliases. It requires
+confirm=true.
