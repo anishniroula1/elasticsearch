@@ -24,6 +24,49 @@ class SentenceKeySearchService:
         Output: every matching sentence outside A1 with exact or similar type.
         """
 
+        sentence_key, search_keys, score_by_key = self.matching_keys(
+            sentence_key,
+            threshold,
+        )
+        occurrences = self.opensearch.matching_occurrences(
+            search_keys,
+            application_id,
+            analysis_group,
+        )
+        matches = self.add_match_details(
+            occurrences,
+            sentence_key,
+            score_by_key,
+        )
+        exact_count = sum(match["matchType"] == "exact" for match in matches)
+        similar_count = len(matches) - exact_count
+
+        return {
+            "applicationId": application_id,
+            "analysisGroup": analysis_group,
+            "sentenceKey": sentence_key,
+            "thresholdPercentage": threshold,
+            "matchingCountScope": "allResults",
+            "directMatchingKeyCount": len(search_keys) - 1,
+            "exactMatchCount": exact_count,
+            "similarMatchCount": similar_count,
+            "totalMatches": len(matches),
+            "returnedMatches": len(matches),
+            "matches": matches,
+            "neuralSearchUsed": False,
+        }
+
+    def matching_keys(
+        self,
+        sentence_key: str,
+        threshold: int,
+    ) -> tuple:
+        """Return the source key, matching keys, and scores.
+
+        Input: a saved sentence key and threshold 90.
+        Output: exact and similar catalog keys with cosine percentages.
+        """
+
         sentence_key = sentence_key.strip().lower()
         if not SENTENCE_KEY_PATTERN.fullmatch(sentence_key):
             raise ValueError("sentenceKey must be a 64-character SHA-256 value")
@@ -49,23 +92,22 @@ class SentenceKeySearchService:
             score_by_key[matching_key] = percentage
 
         search_keys = [sentence_key, *sorted(set(similar_keys))]
-        occurrences = self.opensearch.matching_occurrences(
-            search_keys,
-            application_id,
-            analysis_group,
-        )
+        return sentence_key, search_keys, score_by_key
+
+    @staticmethod
+    def add_match_details(
+        occurrences: list,
+        sentence_key: str,
+        score_by_key: dict,
+    ) -> list:
+        """Add exact or similar type and score to occurrence records."""
 
         matches = []
-        exact_count = 0
-        similar_count = 0
         for occurrence in occurrences:
             occurrence_key = occurrence["sentenceKey"]
-            if occurrence_key == sentence_key:
-                match_type = "exact"
-                exact_count += 1
-            else:
-                match_type = "similar"
-                similar_count += 1
+            match_type = (
+                "exact" if occurrence_key == sentence_key else "similar"
+            )
             matches.append(
                 {
                     **occurrence,
@@ -73,17 +115,4 @@ class SentenceKeySearchService:
                     "matchType": match_type,
                 }
             )
-
-        return {
-            "applicationId": application_id,
-            "analysisGroup": analysis_group,
-            "sentenceKey": sentence_key,
-            "thresholdPercentage": threshold,
-            "directMatchingKeyCount": len(search_keys) - 1,
-            "exactMatchCount": exact_count,
-            "similarMatchCount": similar_count,
-            "totalMatches": len(matches),
-            "returnedMatches": len(matches),
-            "matches": matches,
-            "neuralSearchUsed": False,
-        }
+        return matches

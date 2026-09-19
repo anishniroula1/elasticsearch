@@ -67,6 +67,7 @@ def test_sentence_key_search_runs_live_and_applies_threshold():
     assert result["matches"][1]["matchType"] == "similar"
     assert result["matches"][1]["matchPercentage"] == 92.0
     assert result["thresholdPercentage"] == 90
+    assert result["matchingCountScope"] == "allResults"
     assert result["directMatchingKeyCount"] == 1
     assert "pagination" not in result
     assert result["neuralSearchUsed"] is False

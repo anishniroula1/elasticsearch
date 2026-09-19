@@ -36,7 +36,7 @@ def cosine_percentage(opensearch_score: float) -> float:
 
 
 def encode_page_token(state: dict) -> str:
-    """Put the OpenSearch cursor and first-page totals into one token."""
+    """Put the OpenSearch cursor and request state into one token."""
 
     payload = json.dumps(state, separators=(",", ":"), sort_keys=True)
     return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")

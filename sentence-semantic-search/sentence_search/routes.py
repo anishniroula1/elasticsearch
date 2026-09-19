@@ -9,9 +9,7 @@ from sentence_search.components import (
     deletion_service,
     opensearch_store,
     seed_service,
-    sentence_key_search_service,
     sentence_service,
-    sentence_summary_service,
 )
 from sentence_search.config import config
 from sentence_search.models import SentenceOccurrence
@@ -152,7 +150,6 @@ def seed(
     except (OpenSearchException, RuntimeError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
 
-
 @router.post("/sentences", tags=["Sentences"])
 def add_sentence(sentence: SentenceOccurrence):
     """Add one occurrence and create its catalog vector when needed."""
@@ -204,72 +201,6 @@ def delete_tsp_document(
         raise HTTPException(status_code=400, detail="Set confirm=true to delete.")
     try:
         return deletion_service.delete_tsp(tspId, applicationId)
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    except (OpenSearchException, RuntimeError) as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
-
-
-@router.get(
-    "/applications/{applicationId}/sentences/semantic-summary",
-    tags=["Sentence matches"],
-)
-def application_semantic_summary(
-    applicationId: str,
-    analysisGroup: Annotated[str, Query(min_length=1)] = "Asylee",
-    threshold: Annotated[int, Query(ge=1, le=100)] = config.match_threshold,
-    pageSize: Annotated[int, Query(ge=1, le=100)] = 100,
-    nextToken: str | None = None,
-):
-    """Get 100 application sentences and each sentence's match counts."""
-
-    try:
-        return sentence_summary_service.application_summary(
-            applicationId,
-            analysisGroup,
-            threshold,
-            pageSize,
-            nextToken,
-        )
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    except (OpenSearchException, RuntimeError) as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
-
-
-@router.get(
-    "/applications/{applicationId}/sentences/semantic-search",
-    tags=["Sentence matches"],
-)
-def sentence_key_semantic_search(
-    applicationId: str,
-    sentenceKey: Annotated[
-        str,
-        Query(
-            min_length=64,
-            max_length=64,
-            description="SHA-256 sentenceKey already saved during ingestion.",
-        ),
-    ],
-    analysisGroup: Annotated[str, Query(min_length=1)] = "Asylee",
-    threshold: Annotated[
-        int,
-        Query(
-            ge=1,
-            le=100,
-            description="Minimum cosine percentage for this search.",
-        ),
-    ] = config.match_threshold,
-):
-    """Return every exact and similar sentence for one saved sentence key."""
-
-    try:
-        return sentence_key_search_service.search(
-            applicationId,
-            sentenceKey,
-            analysisGroup,
-            threshold,
-        )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     except (OpenSearchException, RuntimeError) as error:

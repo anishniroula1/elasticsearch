@@ -102,6 +102,25 @@ No Titan call is made during this search because the vector already exists.
 For IVF, the API searches the number of closest buckets configured by
 OPENSEARCH_IVF_NPROBES. A larger value improves recall but adds search work.
 
+Use the paginated endpoint when the UI only needs one small result page:
+
+```text
+GET /applications/A1/sentences/semantic-search-paginated
+    ?sentenceKey=<64-character SHA-256 key>
+    &analysisGroup=Asylee
+    &threshold=90
+    &pageSize=50
+```
+
+This endpoint returns at most pageSize matches. Its totalMatches,
+exactMatchCount, and similarMatchCount values cover only the returned page.
+matchingCountScope is currentPage. It does not count every matching occurrence
+before returning the page. Send nextToken back unchanged to read the next page.
+
+The original semantic-search endpoint still returns every match. Its
+matchingCountScope is allResults. Use that endpoint only when the caller really
+needs all matching rows in one response.
+
 ### Application summary
 
 ```text
@@ -111,14 +130,14 @@ GET /applications/A1/sentences/semantic-summary
     &pageSize=100
 ```
 
-The first request searches every unique eligible sentence key in the
-application. This is needed to return the complete totalMatching and
-sectionMatches values. The response token carries those totals to later pages,
-so later pages only calculate matches for that page.
+The normal summary endpoint only searches the sentences in the requested page.
+For example, pageSize=50 runs matching for no more than 50 source sentences.
+Those source searches are sent to OpenSearch in batched msearch requests.
 
-Because totals are no longer saved in a database, the first summary request can
-take longer for applications with many unique sentences. This is the expected
-tradeoff for faster seeding and no database.
+totalMatching and sectionMatches cover only the current page. summaryScope is
+currentPage. totalSentences is still the number of eligible sentences in the
+application because that is a normal occurrence-index count, not 20,000 vector
+searches.
 
 Use nextToken exactly as returned:
 
@@ -130,6 +149,19 @@ GET /applications/A1/sentences/semantic-summary
     &nextToken=<returned token>
 ```
 
+Use the separate endpoint below only when every sentence and one complete
+application total are required:
+
+```text
+GET /applications/A1/sentences/semantic-summary-all
+    ?analysisGroup=Asylee
+    &threshold=90
+```
+
+This endpoint walks through all summary pages and combines them. Its
+summaryScope is allSentences. It can take much longer for a large application
+because OpenSearch must run vector matching for every eligible source sentence.
+
 ## Other endpoints
 
 ```text
@@ -137,6 +169,10 @@ GET    /health
 GET    /stats
 GET    /index-documents?index=sentence_occurrences&count=10
 GET    /index-documents?index=sentence_semantic_catalog&count=10
+GET    /applications/{applicationId}/sentences/semantic-summary
+GET    /applications/{applicationId}/sentences/semantic-summary-all
+GET    /applications/{applicationId}/sentences/semantic-search
+GET    /applications/{applicationId}/sentences/semantic-search-paginated
 POST   /admin/init
 POST   /admin/seed?reset=false&csvPath=data/seed.csv
 POST   /sentences

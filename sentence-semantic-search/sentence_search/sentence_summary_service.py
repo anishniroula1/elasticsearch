@@ -1,8 +1,19 @@
 from collections import defaultdict
 from math import ceil
 
-from sentence_search.opensearch_store import OpenSearchStore
-from sentence_search.search_utils import decode_page_token, encode_page_token
+from sentence_search.opensearch_store import (
+    CATALOG_PAGE_SIZE,
+    VECTOR_FIELD,
+    OpenSearchStore,
+)
+from sentence_search.search_utils import (
+    cosine_percentage,
+    decode_page_token,
+    encode_page_token,
+    minimum_opensearch_score,
+)
+
+MSEARCH_BATCH_SIZE = 100  # Source sentences sent in one OpenSearch msearch call.
 
 
 class SentenceSummaryService:
@@ -19,16 +30,15 @@ class SentenceSummaryService:
         page_size: int,
         next_token: str | None,
     ) -> dict:
-        """Return one application sentence page with outside match counts.
+        """Return one sentence page and counts for only that page.
 
-        Input: application A1, analysis group Asylee, and page size 100.
-        Output: up to 100 sentences with exact, similar, and total counts.
+        Input: application A1, analysis group Asylee, and page size 50.
+        Output: up to 50 sentences with page-only match counts.
         """
 
         if not 1 <= threshold <= 100:
             raise ValueError("threshold must be between 1 and 100")
 
-        all_similar_keys = None
         if next_token:
             state = decode_page_token(next_token)
             self._validate_token(
@@ -41,28 +51,12 @@ class SentenceSummaryService:
             after_global_id = state["afterGlobalId"]
             total_sentences = int(state["totalSentences"])
             returned_before = int(state["returnedSentences"])
-            summary = {
-                "totalMatching": int(state["totalMatching"]),
-                "sectionMatches": state["sectionMatches"],
-            }
             include_total = False
         else:
             after_global_id = None
             total_sentences = 0
             returned_before = 0
             include_total = True
-            calculated = self._calculate_application_summary(
-                application_id,
-                analysis_group,
-                threshold,
-            )
-            summary = {
-                "totalMatching": calculated["totalMatching"],
-                "sectionMatches": calculated["sectionMatches"],
-            }
-            # The first page already searched every source key. Reuse that work
-            # instead of running the same vector searches for its 100 rows.
-            all_similar_keys = calculated["similarKeysBySource"]
 
         result = self.opensearch.application_occurrence_page(
             application_id,
@@ -76,17 +70,13 @@ class SentenceSummaryService:
 
         sentences = result["sentences"]
         source_keys = sorted({sentence["sentenceKey"] for sentence in sentences})
-        if all_similar_keys is None:
-            similar_keys_by_source = self._similar_keys_at_threshold(
-                source_keys,
-                threshold,
-            )
-        else:
-            similar_keys_by_source = {
-                source_key: all_similar_keys.get(source_key, [])
-                for source_key in source_keys
-            }
+        similar_keys_by_source = self._similar_keys_at_threshold(
+            source_keys,
+            threshold,
+        )
 
+        # Count all exact and similar candidates for this page in one
+        # occurrence aggregation instead of one query per source sentence.
         candidate_keys = set(source_keys)
         for source_key in source_keys:
             candidate_keys.update(similar_keys_by_source[source_key])
@@ -97,20 +87,23 @@ class SentenceSummaryService:
         )
 
         response_sentences = []
+        section_counts = defaultdict(int)
         for sentence in sentences:
             source_key = sentence["sentenceKey"]
             similar_keys = similar_keys_by_source[source_key]
             exact_count = counts.get(source_key, 0)
             similar_count = sum(counts.get(key, 0) for key in similar_keys)
+            total_count = exact_count + similar_count
             response_sentences.append(
                 {
                     **sentence,
                     "exactMatchCount": exact_count,
                     "similarMatchCount": similar_count,
-                    "totalMatchCount": exact_count + similar_count,
+                    "totalMatchCount": total_count,
                     "directMatchingKeyCount": len(similar_keys),
                 }
             )
+            section_counts[sentence.get("sectionName", "")] += total_count
 
         returned_after = returned_before + len(response_sentences)
         new_token = None
@@ -126,25 +119,24 @@ class SentenceSummaryService:
                     "afterGlobalId": next_after,
                     "totalSentences": total_sentences,
                     "returnedSentences": returned_after,
-                    "totalMatching": summary["totalMatching"],
-                    "sectionMatches": summary["sectionMatches"],
                 }
             )
 
         total_pages = ceil(total_sentences / page_size) if total_sentences else 0
+        total_matching = sum(
+            sentence["totalMatchCount"] for sentence in response_sentences
+        )
         return {
             "applicationId": application_id,
             "analysisGroup": analysis_group,
             "thresholdPercentage": threshold,
-            "totalMatching": summary["totalMatching"],
-            "sectionMatches": summary["sectionMatches"],
+            "summaryScope": "currentPage",
+            "totalMatching": total_matching,
+            "sectionMatches": self._section_matches(section_counts),
             "totalSentences": total_sentences,
             "returnedSentences": len(response_sentences),
-            "pageMatchingSentences": sum(
+            "matchingSentences": sum(
                 sentence["totalMatchCount"] > 0 for sentence in response_sentences
-            ),
-            "pageTotalMatches": sum(
-                sentence["totalMatchCount"] for sentence in response_sentences
             ),
             "pagination": {
                 "page": (returned_before // page_size) + 1,
@@ -158,85 +150,145 @@ class SentenceSummaryService:
             "neuralSearchUsed": False,
         }
 
-    def _calculate_application_summary(
-        self,
-        application_id: str,
-        analysis_group: str,
-        threshold: int,
-    ) -> dict:
-        """Calculate complete section totals live from both OpenSearch indexes."""
-
-        source_buckets = self.opensearch.application_key_section_counts(
-            application_id,
-            analysis_group,
-        )
-        source_keys = sorted({bucket["sentenceKey"] for bucket in source_buckets})
-        similar_keys_by_source = self._similar_keys_at_threshold(
-            source_keys,
-            threshold,
-        )
-
-        candidate_keys = set(source_keys)
-        for source_key in source_keys:
-            candidate_keys.update(similar_keys_by_source[source_key])
-        outside_counts = self.opensearch.occurrence_counts_by_key(
-            list(candidate_keys),
-            application_id,
-            analysis_group,
-        )
-
-        section_counts = defaultdict(int)
-        for bucket in source_buckets:
-            source_key = bucket["sentenceKey"]
-            matches_per_sentence = outside_counts.get(source_key, 0)
-            matches_per_sentence += sum(
-                outside_counts.get(key, 0)
-                for key in similar_keys_by_source[source_key]
-            )
-            section_counts[bucket["sectionName"]] += (
-                bucket["occurrenceCount"] * matches_per_sentence
-            )
-
-        saved_counts = dict(sorted(section_counts.items()))
-        return {
-            "sectionMatches": [
-                {
-                    "sectionName": section_name,
-                    "matchingCount": count,
-                }
-                for section_name, count in saved_counts.items()
-            ],
-            "totalMatching": sum(saved_counts.values()),
-            "similarKeysBySource": similar_keys_by_source,
-        }
-
     def _similar_keys_at_threshold(
         self,
         source_keys: list,
         threshold: int,
     ) -> dict:
-        """Run live catalog vector searches for the requested source keys."""
+        """Find catalog matches for all source keys using batched msearch."""
 
         if not source_keys:
             return {}
         vectors = self.opensearch.catalog_vectors(source_keys)
-        qualified = {}
-        for source_key in source_keys:
-            if source_key not in vectors:
-                raise RuntimeError(f"Catalog vector does not exist for {source_key}")
-            matches = self.opensearch.catalog_matches(
-                source_key,
-                vectors[source_key],
-                threshold,
+        missing_keys = [key for key in source_keys if key not in vectors]
+        if missing_keys:
+            raise RuntimeError(
+                f"Catalog vector does not exist for {missing_keys[0]}"
             )
-            qualified[source_key] = sorted(
-                {
-                    match["sentenceKey"]
-                    for match in matches
-                    if match["sentenceKey"] != source_key
+
+        qualified = {key: set() for key in source_keys}
+        pending = [(key, vectors[key], None) for key in source_keys]
+        while pending:
+            next_pending = []
+            for offset in range(0, len(pending), MSEARCH_BATCH_SIZE):
+                batch = pending[offset : offset + MSEARCH_BATCH_SIZE]
+                bodies = []
+                for source_key, vector, after_key in batch:
+                    bodies.append(
+                        self._catalog_search_body(
+                            source_key,
+                            vector,
+                            threshold,
+                            after_key,
+                        )
+                    )
+                responses = self.opensearch.multi_search_catalog(bodies)
+                if len(responses) != len(batch):
+                    raise RuntimeError(
+                        "OpenSearch returned an invalid msearch response"
+                    )
+                for state, response in zip(batch, responses):
+                    source_key, vector, _ = state
+                    result = self._catalog_result(response)
+                    for bucket in result["buckets"]:
+                        hit = bucket["sample"]["hits"]["hits"][0]
+                        candidate_key = hit["_source"]["sentenceKey"]
+                        if candidate_key == source_key:
+                            continue
+                        percentage = cosine_percentage(float(hit["_score"]))
+                        if percentage >= threshold:
+                            qualified[source_key].add(candidate_key)
+
+                    next_after_key = result.get("after_key")
+                    if (
+                        next_after_key
+                        and len(result["buckets"]) == CATALOG_PAGE_SIZE
+                    ):
+                        next_pending.append(
+                            (source_key, vector, next_after_key)
+                        )
+            pending = next_pending
+
+        return {
+            source_key: sorted(qualified[source_key])
+            for source_key in source_keys
+        }
+
+    def _catalog_search_body(
+        self,
+        source_key: str,
+        vector: list,
+        threshold: int,
+        after_key: dict | None,
+    ) -> dict:
+        """Make one catalog query for an msearch request."""
+
+        composite = {
+            "size": CATALOG_PAGE_SIZE,
+            "sources": [{"sentenceKey": {"terms": {"field": "sentenceKey"}}}],
+        }
+        if after_key:
+            composite["after"] = after_key
+        return {
+            "size": 0,
+            "track_total_hits": False,
+            "query": {
+                "bool": {
+                    "should": [
+                        {"term": {"sentenceKey": source_key}},
+                        {
+                            "knn": {
+                                VECTOR_FIELD: {
+                                    "vector": vector,
+                                    "min_score": minimum_opensearch_score(
+                                        threshold
+                                    ),
+                                    "method_parameters": {
+                                        "nprobes": self.opensearch.config.ivf_nprobes,
+                                    },
+                                }
+                            }
+                        },
+                    ],
+                    "minimum_should_match": 1,
                 }
+            },
+            "aggs": {
+                "matches": {
+                    "composite": composite,
+                    "aggs": {
+                        "sample": {
+                            "top_hits": {
+                                "size": 1,
+                                "_source": ["sentenceKey", "sentenceContent"],
+                            }
+                        }
+                    },
+                }
+            },
+        }
+
+    @staticmethod
+    def _catalog_result(response: dict) -> dict:
+        """Read one msearch result or show its OpenSearch error."""
+
+        if "error" in response:
+            raise RuntimeError(
+                f"OpenSearch semantic search failed: {response['error']}"
             )
-        return qualified
+        return response["aggregations"]["matches"]
+
+    @staticmethod
+    def _section_matches(section_counts: dict) -> list:
+        """Return section totals in a stable name order."""
+
+        return [
+            {
+                "sectionName": section_name,
+                "matchingCount": section_counts[section_name],
+            }
+            for section_name in sorted(section_counts)
+        ]
 
     @staticmethod
     def _validate_token(
@@ -258,11 +310,6 @@ class SentenceSummaryService:
         for name, value in expected.items():
             if state.get(name) != value:
                 raise ValueError("nextToken does not belong to this request")
-        required = {
-            "totalSentences",
-            "returnedSentences",
-            "totalMatching",
-            "sectionMatches",
-        }
+        required = {"totalSentences", "returnedSentences"}
         if not required.issubset(state):
             raise ValueError("Invalid nextToken")

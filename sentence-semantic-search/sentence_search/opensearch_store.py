@@ -18,7 +18,6 @@ from sentence_search.search_utils import (
 SEMANTIC_TEXT_FIELD = "sentenceContent"
 VECTOR_FIELD = "sentenceContentVector"
 CATALOG_PAGE_SIZE = 1_000  # Catalog matches read from one aggregation page.
-SUMMARY_BUCKET_PAGE_SIZE = 1_000  # Summary buckets read per composite page.
 TERMS_BATCH_SIZE = 10_000  # Sentence keys sent in one terms filter.
 VECTOR_BATCH_SIZE = 1_000  # Catalog vectors read in one OpenSearch request.
 MATCH_RESULT_BATCH_SIZE = 5_000  # Occurrences read per internal search page.
@@ -534,6 +533,15 @@ class OpenSearchStore:
                 break
         return matches
 
+    def multi_search_catalog(self, bodies: list) -> list:
+        """Send many catalog searches in one OpenSearch request."""
+
+        request = []
+        for body in bodies:
+            request.extend(({"index": self.config.catalog_alias}, body))
+        response = self.client.msearch(body=request)
+        return response["responses"]
+
     def application_occurrence_page(
         self,
         application_id: str,
@@ -589,57 +597,6 @@ class OpenSearchStore:
             "nextAfterGlobalId": next_after,
             "totalSentences": total,
         }
-
-    def application_key_section_counts(
-        self,
-        application_id: str,
-        analysis_group: str,
-    ) -> list:
-        """Count eligible application occurrences by section and sentence key."""
-
-        counts = []
-        after_key = None
-        while True:
-            composite = {
-                "size": SUMMARY_BUCKET_PAGE_SIZE,
-                "sources": [
-                    {"sectionName": {"terms": {"field": "sectionName"}}},
-                    {"sentenceKey": {"terms": {"field": "sentenceKey"}}},
-                ],
-            }
-            if after_key:
-                composite["after"] = after_key
-            response = self.client.search(
-                index=self.config.occurrence_alias,
-                body={
-                    "size": 0,
-                    "track_total_hits": False,
-                    "query": {
-                        "bool": {
-                            "filter": [
-                                {"term": {"applicationId": application_id}},
-                                {"term": {"analysisGroup": analysis_group}},
-                                {"term": {"isTracer": False}},
-                                {"term": {"isFormLanguage": False}},
-                            ]
-                        }
-                    },
-                    "aggs": {"keySections": {"composite": composite}},
-                },
-            )
-            result = response["aggregations"]["keySections"]
-            for bucket in result["buckets"]:
-                counts.append(
-                    {
-                        "sectionName": str(bucket["key"]["sectionName"]),
-                        "sentenceKey": str(bucket["key"]["sentenceKey"]),
-                        "occurrenceCount": int(bucket["doc_count"]),
-                    }
-                )
-            after_key = result.get("after_key")
-            if not after_key or not result["buckets"]:
-                break
-        return counts
 
     def occurrence_counts_by_key(
         self,

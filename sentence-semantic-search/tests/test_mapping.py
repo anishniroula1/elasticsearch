@@ -40,6 +40,15 @@ class CatalogMatchesClient:
         return {"aggregations": {"matches": {"buckets": []}}}
 
 
+class CatalogMultiSearchClient:
+    def __init__(self):
+        self.request = None
+
+    def msearch(self, **request):
+        self.request = request
+        return {"responses": [{"hits": {"hits": []}}]}
+
+
 class AliasIndexClient:
     class Indices:
         def __init__(self):
@@ -90,29 +99,6 @@ class ExistingOccurrenceClient:
                     },
                 }
             ]
-        }
-
-
-class SummaryAggregationClient:
-    def __init__(self):
-        self.requests = []
-
-    def search(self, **request):
-        self.requests.append(request)
-        return {
-            "aggregations": {
-                "keySections": {
-                    "buckets": [
-                        {
-                            "key": {
-                                "sectionName": "Affidavit",
-                                "sentenceKey": "key-1",
-                            },
-                            "doc_count": 3,
-                        }
-                    ]
-                }
-            }
         }
 
 
@@ -209,6 +195,20 @@ def test_catalog_radial_search_uses_configured_ivf_nprobes():
     assert matches == []
     assert vector_query["min_score"] == pytest.approx(0.95)
     assert vector_query["method_parameters"] == {"nprobes": 64}
+
+
+def test_catalog_msearch_adds_the_catalog_alias_before_each_body():
+    client = CatalogMultiSearchClient()
+    store = OpenSearchStore(config, client)
+    body = {"size": 0, "query": {"match_all": {}}}
+
+    responses = store.multi_search_catalog([body])
+
+    assert client.request["body"] == [
+        {"index": config.catalog_alias},
+        body,
+    ]
+    assert responses == [{"hits": {"hits": []}}]
 
 
 def test_reset_deletes_configured_indexes_and_existing_alias_targets():
@@ -324,21 +324,6 @@ def test_sentence_key_search_uses_terms_and_never_knn():
     assert '"terms": {"sentenceKey": ["key-1", "key-2"]}' in query_text
     assert '"knn"' not in query_text
     assert {"term": {"applicationId": "A1"}} in body["query"]["bool"]["must_not"]
-
-
-def test_summary_refresh_groups_source_counts_by_section_and_key():
-    client = SummaryAggregationClient()
-    store = OpenSearchStore(config, client)
-
-    counts = store.application_key_section_counts("A1", "Asylee")
-
-    assert counts == [
-        {
-            "sectionName": "Affidavit",
-            "sentenceKey": "key-1",
-            "occurrenceCount": 3,
-        }
-    ]
 
 
 def test_duplicate_global_id_cannot_have_different_sentence_keys():

@@ -1,7 +1,13 @@
+from types import SimpleNamespace
+
 from sentence_search.sentence_summary_service import SentenceSummaryService
 
 
 class FakeOpenSearchStore:
+    def __init__(self):
+        self.config = SimpleNamespace(ivf_nprobes=16)
+        self.msearch_calls = 0
+
     def application_occurrence_page(
         self,
         application_id,
@@ -19,11 +25,13 @@ class FakeOpenSearchStore:
             "sentences": [
                 {
                     "globalId": 1,
+                    "sectionName": "Affidavit",
                     "sentenceKey": "key-a",
                     "sentenceContent": "First sentence",
                 },
                 {
                     "globalId": 2,
+                    "sectionName": "B1",
                     "sentenceKey": "key-b",
                     "sentenceContent": "Second sentence",
                 },
@@ -46,59 +54,76 @@ class FakeOpenSearchStore:
     def catalog_vectors(self, sentence_keys):
         return {key: [1.0, 0.0] for key in sentence_keys}
 
-    def catalog_matches(self, source_key, vector, threshold):
-        if source_key == "key-a":
-            matches = [
-                {"sentenceKey": "key-a"},
-                {"sentenceKey": "key-c"},
-            ]
-            if threshold <= 83:
-                matches.append({"sentenceKey": "key-d"})
-            return matches
-        return [{"sentenceKey": "key-b"}]
+    def multi_search_catalog(self, bodies):
+        self.msearch_calls += 1
+        responses = []
+        for body in bodies:
+            bool_query = body["query"]["bool"]
+            source_key = bool_query["should"][0]["term"]["sentenceKey"]
+            minimum_score = bool_query["should"][1]["knn"][
+                "sentenceContentVector"
+            ]["min_score"]
+            hits = [self._bucket(source_key, 1.0)]
+            if source_key == "key-a":
+                hits.append(self._bucket("key-c", 0.96))
+                if minimum_score <= 0.915:
+                    hits.append(self._bucket("key-d", 0.915))
+            responses.append(
+                {
+                    "aggregations": {
+                        "matches": {
+                            "buckets": hits,
+                        }
+                    }
+                }
+            )
+        return responses
 
-    def application_key_section_counts(self, application_id, analysis_group):
-        return [
-            {
-                "sectionName": "Affidavit",
-                "sentenceKey": "key-a",
-                "occurrenceCount": 2,
-            },
-            {
-                "sectionName": "B1",
-                "sentenceKey": "key-b",
-                "occurrenceCount": 1,
-            },
-        ]
+    @staticmethod
+    def _bucket(sentence_key, score):
+        return {
+            "sample": {
+                "hits": {
+                    "hits": [
+                        {
+                            "_score": score,
+                            "_source": {"sentenceKey": sentence_key},
+                        }
+                    ]
+                }
+            }
+        }
 
 
-def test_summary_calculates_complete_counts_live_at_default_threshold():
-    service = SentenceSummaryService(FakeOpenSearchStore())
+def test_summary_calculates_counts_for_only_the_requested_page():
+    opensearch = FakeOpenSearchStore()
+    service = SentenceSummaryService(opensearch)
 
     result = service.application_summary("A1", "Asylee", 90, 100, None)
 
+    assert opensearch.msearch_calls == 1
+    assert result["summaryScope"] == "currentPage"
     assert result["totalSentences"] == 2
-    assert result["totalMatching"] == 13
+    assert result["totalMatching"] == 7
     assert result["sectionMatches"] == [
-        {"sectionName": "Affidavit", "matchingCount": 12},
+        {"sectionName": "Affidavit", "matchingCount": 6},
         {"sectionName": "B1", "matchingCount": 1},
     ]
-    assert result["pageTotalMatches"] == 7
     assert result["sentences"][0]["exactMatchCount"] == 2
     assert result["sentences"][0]["similarMatchCount"] == 4
+    assert "pageTotalMatches" not in result
     assert result["neuralSearchUsed"] is False
 
 
-def test_lower_threshold_calculates_more_matches_live():
+def test_lower_threshold_adds_matches_to_the_current_page_count():
     service = SentenceSummaryService(FakeOpenSearchStore())
 
     result = service.application_summary("A1", "Asylee", 70, 100, None)
 
     assert result["thresholdPercentage"] == 70
-    assert result["totalMatching"] == 23
+    assert result["totalMatching"] == 12
     assert result["sectionMatches"] == [
-        {"sectionName": "Affidavit", "matchingCount": 22},
+        {"sectionName": "Affidavit", "matchingCount": 11},
         {"sectionName": "B1", "matchingCount": 1},
     ]
-    assert result["pageTotalMatches"] == 12
     assert result["sentences"][0]["similarMatchCount"] == 9

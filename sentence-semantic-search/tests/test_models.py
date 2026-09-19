@@ -96,3 +96,33 @@ def test_semantic_summary_swagger_accepts_any_threshold_percentage():
     assert parameters["threshold"]["schema"]["default"] == 90
     assert parameters["threshold"]["schema"]["minimum"] == 1
     assert parameters["threshold"]["schema"]["maximum"] == 100
+    assert parameters["pageSize"]["schema"]["maximum"] == 100
+
+
+def test_all_summary_has_no_page_inputs():
+    operation = app.openapi()["paths"][
+        "/applications/{applicationId}/sentences/semantic-summary-all"
+    ]["get"]
+    parameters = {item["name"] for item in operation["parameters"]}
+
+    assert parameters == {
+        "applicationId",
+        "analysisGroup",
+        "threshold",
+    }
+
+
+def test_paginated_sentence_search_has_page_inputs():
+    operation = app.openapi()["paths"][
+        "/applications/{applicationId}/sentences/semantic-search-paginated"
+    ]["get"]
+    parameters = {item["name"] for item in operation["parameters"]}
+
+    assert parameters == {
+        "applicationId",
+        "sentenceKey",
+        "analysisGroup",
+        "threshold",
+        "pageSize",
+        "nextToken",
+    }
