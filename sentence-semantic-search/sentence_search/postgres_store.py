@@ -24,18 +24,22 @@ def _now() -> datetime:
 
 
 def add_direct_key_matches(existing: dict, source_key: str, target_keys: list) -> dict:
-    """Add only direct matches and add the reverse link too.
+    """Replace one key's direct matches and keep every reverse link in sync.
 
-    Input: A already matches B, and A directly matches D.
-    Output: A has B and D, D has A, but B does not automatically get D.
+    Input: A used to match B, but now A directly matches D.
+    Output: A has D, D has A, and B no longer has A.
     """
 
     updated = {key: set(values) for key, values in existing.items()}
     updated.setdefault(source_key, set())
-    for target_key in target_keys:
-        if target_key == source_key:
-            continue
-        updated[source_key].add(target_key)
+    new_targets = {key for key in target_keys if key != source_key}
+    old_targets = set(updated[source_key])
+
+    for removed_key in old_targets - new_targets:
+        if removed_key in updated:
+            updated[removed_key].discard(source_key)
+    updated[source_key] = new_targets
+    for target_key in new_targets:
         updated.setdefault(target_key, set()).add(source_key)
     return {key: sorted(values) for key, values in updated.items()}
 
@@ -175,7 +179,16 @@ class PostgresStore:
             # Two API requests can discover the same pair at once. One lock
             # keeps both array sides from overwriting one another.
             session.execute(select(func.pg_advisory_xact_lock(MATCH_WRITE_LOCK)))
-            requested_keys = {source_key, *direct_targets}
+            source_row = session.execute(
+                select(SentenceKeyMatch)
+                .where(SentenceKeyMatch.sentenceKey == source_key)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if source_row is None:
+                raise RuntimeError(f"Sentence-key row does not exist: {source_key}")
+
+            old_targets = set(source_row.matchingSentenceKeys)
+            requested_keys = {source_key, *old_targets, *direct_targets}
             rows = (
                 session.execute(
                     select(SentenceKeyMatch)
@@ -187,11 +200,8 @@ class PostgresStore:
                 .all()
             )
             rows_by_key = {row.sentenceKey: row for row in rows}
-            if source_key not in rows_by_key:
-                raise RuntimeError(f"Sentence-key row does not exist: {source_key}")
 
-            # A stale catalog document may not have a PostgreSQL key row. Do
-            # not save a one-sided relationship to that missing key.
+            # A stale catalog document may not have a PostgreSQL key row.
             saved_targets = direct_targets & set(rows_by_key)
             current_lists = {
                 key: row.matchingSentenceKeys for key, row in rows_by_key.items()
@@ -214,6 +224,7 @@ class PostgresStore:
         return {
             "directMatchesFound": len(saved_targets),
             "keyListsUpdated": updated_count,
+            "affectedSentenceKeys": sorted({source_key, *old_targets, *saved_targets}),
         }
 
     def matching_keys(self, sentence_keys: list) -> dict:

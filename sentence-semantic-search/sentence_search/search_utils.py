@@ -5,33 +5,33 @@ from math import sqrt
 
 
 def minimum_opensearch_score(threshold: int) -> float:
-    """Convert a cosine percentage into a Faiss OpenSearch score.
+    """Convert a cosine percentage into an OpenSearch score.
 
     Input:
         threshold=90
     Output:
-        0.9090909
+        0.95
     """
 
     if not 1 <= threshold <= 100:
         raise ValueError("threshold must be between 1 and 100")
     cosine_threshold = threshold / 100.0
-    # Faiss returns 1 / (1 + distance), where cosine distance is 1 - cosine.
-    return 1.0 / (2.0 - cosine_threshold)
+    # For cosine distance d = 1 - cosine, OpenSearch uses (2 - d) / 2.
+    return (1.0 + cosine_threshold) / 2.0
 
 
 def cosine_percentage(opensearch_score: float) -> float:
-    """Convert a Faiss OpenSearch cosine score into a percentage.
+    """Convert an OpenSearch cosine score into a percentage.
 
     Input:
-        opensearch_score=0.9090909
+        opensearch_score=0.95
     Output:
         90.0
     """
 
     if opensearch_score <= 0:
         raise ValueError("opensearch_score must be greater than zero")
-    cosine_similarity = 2.0 - (1.0 / opensearch_score)
+    cosine_similarity = (2.0 * opensearch_score) - 1.0
     cosine_similarity = max(-1.0, min(1.0, cosine_similarity))
     return round(max(0.0, cosine_similarity) * 100.0, 2)
 

@@ -4,7 +4,11 @@ from math import ceil
 from sentence_search.config import Config
 from sentence_search.opensearch_store import OpenSearchStore
 from sentence_search.postgres_store import PostgresStore
-from sentence_search.search_utils import decode_page_token, encode_page_token
+from sentence_search.search_utils import (
+    decode_page_token,
+    encode_page_token,
+    vector_cosine_percentage,
+)
 
 
 class SentenceSummaryService:
@@ -69,11 +73,15 @@ class SentenceSummaryService:
         key_rows = self.postgres.matching_keys(
             [sentence["sentenceKey"] for sentence in sentences]
         )
+        similar_keys_by_source = self._similar_keys_at_threshold(
+            key_rows,
+            self.config.match_threshold,
+        )
         candidate_keys = set()
         for sentence in sentences:
             source_key = sentence["sentenceKey"]
             candidate_keys.add(source_key)
-            candidate_keys.update(key_rows[source_key]["matchingSentenceKeys"])
+            candidate_keys.update(similar_keys_by_source[source_key])
         counts = self.opensearch.occurrence_counts_by_key(
             list(candidate_keys),
             application_id,
@@ -83,10 +91,7 @@ class SentenceSummaryService:
         response_sentences = []
         for sentence in sentences:
             source_key = sentence["sentenceKey"]
-            key_row = key_rows[source_key]
-            similar_keys = [
-                key for key in key_row["matchingSentenceKeys"] if key != source_key
-            ]
+            similar_keys = similar_keys_by_source[source_key]
             exact_count = counts.get(source_key, 0)
             similar_count = sum(counts.get(key, 0) for key in similar_keys)
             response_sentences.append(
@@ -192,10 +197,14 @@ class SentenceSummaryService:
         )
         source_keys = sorted({bucket["sentenceKey"] for bucket in source_buckets})
         key_rows = self.postgres.matching_keys(source_keys)
+        similar_keys_by_source = self._similar_keys_at_threshold(
+            key_rows,
+            self.config.match_threshold,
+        )
 
         candidate_keys = set(source_keys)
         for source_key in source_keys:
-            candidate_keys.update(key_rows[source_key]["matchingSentenceKeys"])
+            candidate_keys.update(similar_keys_by_source[source_key])
         outside_counts = self.opensearch.occurrence_counts_by_key(
             list(candidate_keys),
             application_id,
@@ -205,11 +214,7 @@ class SentenceSummaryService:
         section_counts = defaultdict(int)
         for bucket in source_buckets:
             source_key = bucket["sentenceKey"]
-            similar_keys = [
-                key
-                for key in key_rows[source_key]["matchingSentenceKeys"]
-                if key != source_key
-            ]
+            similar_keys = similar_keys_by_source[source_key]
             matches_per_sentence = outside_counts.get(source_key, 0)
             matches_per_sentence += sum(
                 outside_counts.get(key, 0) for key in similar_keys
@@ -232,6 +237,53 @@ class SentenceSummaryService:
             "sectionMatchCounts": saved_counts,
             "totalMatching": total_matching,
         }
+
+    def _similar_keys_at_threshold(
+        self,
+        key_rows: dict,
+        threshold: int,
+    ) -> dict:
+        """Keep only saved relationships that still pass the cosine threshold.
+
+        Input: source keys with their saved direct matching-key lists.
+        Output: matching-key lists with old or low-score relationships removed.
+        """
+
+        candidate_keys = set(key_rows)
+        for source_key, row in key_rows.items():
+            candidate_keys.update(
+                key for key in row["matchingSentenceKeys"] if key != source_key
+            )
+        if not candidate_keys:
+            return {}
+
+        vectors = self.opensearch.catalog_vectors(list(candidate_keys))
+        qualified = {}
+        for source_key, row in key_rows.items():
+            similar_keys = [
+                key for key in row["matchingSentenceKeys"] if key != source_key
+            ]
+            if not similar_keys:
+                qualified[source_key] = []
+                continue
+            if source_key not in vectors:
+                raise RuntimeError(f"Catalog vector does not exist for {source_key}")
+
+            source_vector = vectors[source_key]
+            source_matches = []
+            for similar_key in similar_keys:
+                if similar_key not in vectors:
+                    raise RuntimeError(
+                        f"Catalog vector does not exist for saved key: {similar_key}"
+                    )
+                percentage = vector_cosine_percentage(
+                    source_vector,
+                    vectors[similar_key],
+                )
+                if percentage >= threshold:
+                    source_matches.append(similar_key)
+            qualified[source_key] = source_matches
+        return qualified
 
     @staticmethod
     def _validate_token(

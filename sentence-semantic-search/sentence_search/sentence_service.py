@@ -52,7 +52,9 @@ class SentenceService:
                 key,
                 self.config.match_threshold,
             )
-            summary_result = self.summary_service.refresh_affected_applications([key])
+            summary_result = self.summary_service.refresh_affected_applications(
+                match_result["affectedSentenceKeys"]
+            )
         return {
             "globalId": source["globalId"],
             "sentenceKey": key,

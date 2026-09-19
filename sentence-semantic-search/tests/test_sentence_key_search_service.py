@@ -5,6 +5,7 @@ from sentence_search.sentence_key_search_service import SentenceKeySearchService
 
 SOURCE_KEY = "a" * 64
 SIMILAR_KEY = "b" * 64
+LOW_SCORE_KEY = "c" * 64
 
 
 class FakeOpenSearchStore:
@@ -12,10 +13,11 @@ class FakeOpenSearchStore:
         self.search_keys = None
 
     def catalog_vectors(self, sentence_keys):
-        assert sentence_keys == [SOURCE_KEY, SIMILAR_KEY]
+        assert sentence_keys == [SOURCE_KEY, SIMILAR_KEY, LOW_SCORE_KEY]
         return {
             SOURCE_KEY: [1.0, 0.0],
             SIMILAR_KEY: [0.92, sqrt(1 - (0.92**2))],
+            LOW_SCORE_KEY: [0.83, sqrt(1 - (0.83**2))],
         }
 
     def matching_occurrences(
@@ -27,9 +29,14 @@ class FakeOpenSearchStore:
         self.search_keys = sentence_keys
         assert excluded_application_id == "A1"
         assert analysis_group == "Asylee"
-        return [
+        occurrences = [
             {"globalId": "S10", "sentenceKey": SOURCE_KEY},
             {"globalId": "S11", "sentenceKey": SIMILAR_KEY},
+        ]
+        return [
+            occurrence
+            for occurrence in occurrences
+            if occurrence["sentenceKey"] in sentence_keys
         ]
 
 
@@ -38,7 +45,7 @@ class FakePostgresStore:
         assert sentence_keys == [SOURCE_KEY]
         return {
             SOURCE_KEY: {
-                "matchingSentenceKeys": [SIMILAR_KEY],
+                "matchingSentenceKeys": [SIMILAR_KEY, LOW_SCORE_KEY],
             }
         }
 
@@ -51,7 +58,7 @@ def test_sentence_key_search_uses_saved_keys_and_normal_filters():
         FakePostgresStore(),
     )
 
-    result = service.search("A1", SOURCE_KEY, "Asylee")
+    result = service.search("A1", SOURCE_KEY, "Asylee", 90)
 
     assert opensearch.search_keys == [SOURCE_KEY, SIMILAR_KEY]
     assert result["exactMatchCount"] == 1
@@ -62,6 +69,25 @@ def test_sentence_key_search_uses_saved_keys_and_normal_filters():
     assert result["matches"][0]["matchPercentage"] == 100.0
     assert result["matches"][1]["matchType"] == "similar"
     assert result["matches"][1]["matchPercentage"] == 92.0
+    assert result["thresholdPercentage"] == 90
+    assert result["directMatchingKeyCount"] == 1
     assert "pagination" not in result
     assert "nextToken" not in result
     assert result["neuralSearchUsed"] is False
+
+
+def test_higher_query_threshold_removes_saved_lower_score_matches():
+    opensearch = FakeOpenSearchStore()
+    service = SentenceKeySearchService(
+        SimpleNamespace(match_threshold=90),
+        opensearch,
+        FakePostgresStore(),
+    )
+
+    result = service.search("A1", SOURCE_KEY, "Asylee", 95)
+
+    assert opensearch.search_keys == [SOURCE_KEY]
+    assert result["thresholdPercentage"] == 95
+    assert result["directMatchingKeyCount"] == 0
+    assert result["exactMatchCount"] == 1
+    assert result["similarMatchCount"] == 0

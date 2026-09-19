@@ -118,6 +118,7 @@ class FakeParallelMatchService:
             self._first_wave.wait(timeout=2)
         with self._lock:
             self._active_calls -= 1
+        return {"affectedSentenceKeys": [sentence_key]}
 
 
 class FakeSummaryService:

@@ -162,11 +162,13 @@ class SeedService:
                     self.config.match_threshold,
                 )
             )
+        affected_keys = set()
         for match_future in match_futures:
-            match_future.result()
+            match_result = match_future.result()
+            affected_keys.update(match_result["affectedSentenceKeys"])
 
         summary_result = self.summary_service.refresh_affected_applications(
-            list(matchable_keys)
+            list(affected_keys)
         )
         return {
             "occurrencesIndexed": occurrence_count,

@@ -1,3 +1,4 @@
+from math import sqrt
 from types import SimpleNamespace
 
 from sentence_search.sentence_summary_service import SentenceSummaryService
@@ -48,6 +49,15 @@ class FakeOpenSearchStore:
         assert analysis_group == "Asylee"
         return {"key-a": 2, "key-b": 1, "key-c": 4}
 
+    def catalog_vectors(self, sentence_keys):
+        assert set(sentence_keys) == {"key-a", "key-b", "key-c", "key-d"}
+        return {
+            "key-a": [1.0, 0.0],
+            "key-b": [0.0, 1.0],
+            "key-c": [0.92, sqrt(1 - (0.92**2))],
+            "key-d": [0.83, sqrt(1 - (0.83**2))],
+        }
+
     def application_key_section_counts(self, application_id, analysis_group):
         return [
             {
@@ -81,7 +91,7 @@ class FakePostgresStore:
     def matching_keys(self, sentence_keys):
         all_rows = {
             "key-a": {
-                "matchingSentenceKeys": ["key-c"],
+                "matchingSentenceKeys": ["key-c", "key-d"],
             },
             "key-b": {
                 "matchingSentenceKeys": [],
@@ -154,7 +164,7 @@ def test_key_change_refreshes_every_affected_application():
 
     result = service.refresh_affected_applications(["key-a"])
 
-    assert opensearch.affected_keys == {"key-a", "key-c"}
+    assert opensearch.affected_keys == {"key-a", "key-c", "key-d"}
     assert postgres.saved_summary == (
         "A1",
         "Asylee",

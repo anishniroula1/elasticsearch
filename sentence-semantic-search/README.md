@@ -181,7 +181,8 @@ directMatchingKeyCount
 `exactMatchCount` means the same `sentenceKey` exists outside the supplied
 application. `similarMatchCount` means an occurrence uses one of the saved
 direct matching keys. Both counts use the same analysis group and ignore tracer
-and form-language records.
+and form-language records. The summary reads the saved vectors again and drops
+any old relationship below `MATCH_THRESHOLD` before counting it.
 
 The top of the response comes directly from `application_match_summary`:
 
@@ -251,7 +252,7 @@ GET /applications/A0001/sentences/semantic-summary?analysisGroup=Asylee&pageSize
 Request:
 
 ```text
-GET /applications/A0001/sentences/semantic-search?sentenceKey=SHA256_KEY&analysisGroup=Asylee
+GET /applications/A0001/sentences/semantic-search?sentenceKey=SHA256_KEY&analysisGroup=Asylee&threshold=90
 ```
 
 This endpoint does not turn text into a vector. The caller sends a
@@ -303,7 +304,18 @@ large result does not have to be loaded from OpenSearch in one request.
 
 An exact match always has `matchPercentage` 100. A similar match gets its
 percentage by comparing the two vectors already saved in the catalog. This
-does not call Titan and does not run a new KNN search.
+does not call Titan and does not run a new KNN search. A result is returned only
+when `matchPercentage` is at least the requested `threshold`.
+
+The smallest query threshold is the configured `MATCH_THRESHOLD`. The default
+is 90. A higher value such as 95 is allowed. A lower value is not allowed
+because relationships below the ingestion threshold were never saved.
+
+Older versions converted the OpenSearch cosine score incorrectly. A 90 query
+could save results around 82 or 83. After updating the code, run the same seed
+file once with `reset=false`. Existing vectors are reused. The old low-score
+relationships are removed from both sides, and application summaries are
+calculated again.
 
 ## Titan pipeline
 

@@ -259,6 +259,17 @@ def sentence_key_semantic_search(
         ),
     ],
     analysisGroup: Annotated[str, Query(min_length=1)] = "Asylee",
+    threshold: Annotated[
+        int,
+        Query(
+            ge=config.match_threshold,
+            le=100,
+            description=(
+                "Minimum cosine percentage. It cannot be lower than the "
+                "configured ingestion threshold."
+            ),
+        ),
+    ] = config.match_threshold,
 ):
     """Return every exact and similar sentence for one saved sentence key."""
 
@@ -267,6 +278,7 @@ def sentence_key_semantic_search(
             applicationId,
             sentenceKey,
             analysisGroup,
+            threshold,
         )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error

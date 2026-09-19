@@ -56,4 +56,14 @@ def test_sentence_key_search_swagger_has_no_public_pagination():
     ]["get"]
     parameters = {item["name"] for item in operation["parameters"]}
 
-    assert parameters == {"applicationId", "sentenceKey", "analysisGroup"}
+    assert parameters == {
+        "applicationId",
+        "sentenceKey",
+        "analysisGroup",
+        "threshold",
+    }
+    threshold = next(
+        item for item in operation["parameters"] if item["name"] == "threshold"
+    )
+    assert threshold["schema"]["default"] == 90
+    assert threshold["schema"]["minimum"] == 90

@@ -9,10 +9,10 @@ from sentence_search.search_utils import (
 )
 
 
-def test_ninety_percent_uses_faiss_cosine_score():
+def test_ninety_percent_uses_opensearch_cosine_score():
     score = minimum_opensearch_score(90)
 
-    assert score == pytest.approx(1 / 1.1)
+    assert score == pytest.approx(0.95)
     assert cosine_percentage(score) == 90.0
 
 
