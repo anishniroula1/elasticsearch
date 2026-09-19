@@ -27,6 +27,8 @@ class Config:
     opensearch_port: int
     opensearch_service: str
     semantic_model_id: str
+    ivf_model_id: str
+    ivf_nprobes: int
     ingest_pipeline: str
     occurrence_index: str
     occurrence_alias: str
@@ -56,6 +58,11 @@ class Config:
                 "OPENSEARCH_SEMANTIC_MODEL_ID",
                 "",
             ).strip(),
+            ivf_model_id=os.getenv(
+                "OPENSEARCH_IVF_MODEL_ID",
+                "",
+            ).strip(),
+            ivf_nprobes=_integer("OPENSEARCH_IVF_NPROBES", 64),
             ingest_pipeline=os.getenv(
                 "OPENSEARCH_INGEST_PIPELINE",
                 "sentence_bedrock_embedding_pipeline",
@@ -70,7 +77,7 @@ class Config:
             ).strip(),
             catalog_index=os.getenv(
                 "OPENSEARCH_CATALOG_INDEX",
-                "sentence_semantic_catalog-v1",
+                "sentence_semantic_catalog-ivf-v1",
             ).strip(),
             catalog_alias=os.getenv(
                 "OPENSEARCH_CATALOG_ALIAS",
@@ -93,6 +100,8 @@ class Config:
             raise ValueError("OPENSEARCH_HOST is required")
         if not self.semantic_model_id:
             raise ValueError("OPENSEARCH_SEMANTIC_MODEL_ID is required")
+        if not self.ivf_model_id:
+            raise ValueError("OPENSEARCH_IVF_MODEL_ID is required")
         if not self.ingest_pipeline:
             raise ValueError("OPENSEARCH_INGEST_PIPELINE is required")
         if self.occurrence_index == self.catalog_index:

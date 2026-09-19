@@ -34,12 +34,17 @@ sentence text always gets the same key.
 
 ### Semantic catalog
 
-Index: sentence_semantic_catalog-v1  
+Index: sentence_semantic_catalog-ivf-v1
 Alias: sentence_semantic_catalog
 
 This index stores one record for each unique sentenceKey. It contains the
 sentence text and its 512-dimension Titan vector. The vector uses FAISS with
-cosine similarity.
+cosine similarity and the trained IVF model configured by
+OPENSEARCH_IVF_MODEL_ID.
+
+Titan creates the embedding. The IVF model does not create embeddings; it
+organizes existing embeddings into buckets. The search uses radial min_score
+with OPENSEARCH_IVF_NPROBES, so no fixed top-K limit is used.
 
 If the same sentence appears in many documents, its vector is created only
 once. All occurrence records use the same sentenceKey.
@@ -94,6 +99,8 @@ The API:
 5. Returns every result with matchType exact or similar and matchPercentage.
 
 No Titan call is made during this search because the vector already exists.
+For IVF, the API searches the number of closest buckets configured by
+OPENSEARCH_IVF_NPROBES. A larger value improves recall but adds search work.
 
 ### Application summary
 
@@ -151,15 +158,22 @@ Important values:
 ```text
 OPENSEARCH_HOST=search-your-domain.us-east-1.es.amazonaws.com
 OPENSEARCH_SEMANTIC_MODEL_ID=<deployed OpenSearch model ID>
+OPENSEARCH_IVF_MODEL_ID=<created OpenSearch k-NN IVF model ID>
+OPENSEARCH_IVF_NPROBES=64
 OPENSEARCH_INGEST_PIPELINE=sentence_bedrock_embedding_pipeline
+OPENSEARCH_CATALOG_INDEX=sentence_semantic_catalog-ivf-v1
 VECTOR_DIMENSION=512
 SEED_BATCH_SIZE=100
 SEED_WORKERS=4
 MATCH_THRESHOLD=90
 ```
 
-The deployed model, ingest pipeline, and catalog mapping must all use dimension
-512. A different dimension causes indexing to fail.
+The deployed Titan model, ingest pipeline, trained IVF model, and catalog must
+all use dimension 512. A different dimension causes index creation or indexing
+to fail.
+
+For the complete training, reindexing, validation, alias switch, and rollback
+steps, read [IVF_CATALOG_MIGRATION.md](IVF_CATALOG_MIGRATION.md).
 
 ## Run the API
 
@@ -189,9 +203,10 @@ make test
 
 ## Reset warning
 
-Sending reset=true to the seed endpoint deletes and recreates both OpenSearch
-indexes before loading the CSV. Sending reset=false keeps existing data and
-creates only missing catalog vectors.
+Sending reset=true to the seed endpoint deletes and recreates the project
+indexes before loading the CSV. It also removes an old catalog currently behind
+the project alias. Sending reset=false keeps existing data and creates only
+missing catalog vectors.
 
 If the occurrence index was created when globalId used the keyword mapping,
 recreate it before loading numeric IDs. OpenSearch cannot change an existing

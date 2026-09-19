@@ -31,6 +31,41 @@ class EmptySearchClient:
         return {"hits": {"total": {"value": 0}, "hits": []}}
 
 
+class CatalogMatchesClient:
+    def __init__(self):
+        self.request = None
+
+    def search(self, **request):
+        self.request = request
+        return {"aggregations": {"matches": {"buckets": []}}}
+
+
+class AliasIndexClient:
+    class Indices:
+        def __init__(self):
+            self.deleted = []
+
+        def exists_alias(self, name):
+            return name in {
+                config.occurrence_alias,
+                config.catalog_alias,
+            }
+
+        def get_alias(self, name):
+            if name == config.occurrence_alias:
+                return {"sentence_occurrences-old-v1": {}}
+            return {"sentence_semantic_catalog-hnsw-v1": {}}
+
+        def exists(self, index):
+            return True
+
+        def delete(self, index):
+            self.deleted.append(index)
+
+    def __init__(self):
+        self.indices = self.Indices()
+
+
 class ClientThatMustNotRun:
     def mget(self, **request):
         raise AssertionError("Duplicate input should fail before OpenSearch")
@@ -151,13 +186,46 @@ def test_occurrence_mapping_has_requested_sentence_fields():
     assert properties["globalId"] == {"type": "long"}
 
 
-def test_catalog_mapping_uses_512_dimension_faiss_cosine():
+def test_catalog_mapping_uses_trained_ivf_model():
     definition = catalog_index_definition(config)
     vector = definition["mappings"]["properties"]["sentenceContentVector"]
-    assert vector["dimension"] == 512
-    assert vector["method"]["engine"] == "faiss"
-    assert vector["method"]["space_type"] == "cosinesimil"
-    assert "parameters" not in vector["method"]
+    assert vector == {
+        "type": "knn_vector",
+        "model_id": "test-ivf-model",
+    }
+    assert definition["settings"]["index.default_pipeline"] == (
+        "sentence_bedrock_embedding_pipeline"
+    )
+
+
+def test_catalog_radial_search_uses_configured_ivf_nprobes():
+    client = CatalogMatchesClient()
+    store = OpenSearchStore(config, client)
+
+    matches = store.catalog_matches("key-1", [0.0] * 512, 90)
+
+    knn = client.request["body"]["query"]["bool"]["should"][1]["knn"]
+    vector_query = knn["sentenceContentVector"]
+    assert matches == []
+    assert vector_query["min_score"] == pytest.approx(0.95)
+    assert vector_query["method_parameters"] == {"nprobes": 64}
+
+
+def test_reset_deletes_configured_indexes_and_existing_alias_targets():
+    client = AliasIndexClient()
+    store = OpenSearchStore(config, client)
+
+    result = store.delete_indices()
+
+    assert result["deletedIndexes"] == sorted(
+        {
+            config.occurrence_index,
+            config.catalog_index,
+            "sentence_occurrences-old-v1",
+            "sentence_semantic_catalog-hnsw-v1",
+        }
+    )
+    assert client.indices.deleted == result["deletedIndexes"]
 
 
 def test_catalog_retry_keeps_only_temporary_failed_documents():

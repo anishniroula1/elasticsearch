@@ -17,6 +17,9 @@ vector search for every sentence each time the UI loaded.
 
 The current occurrence mapping stores globalId as an OpenSearch long. The
 document _id is its string form. Keep this behavior if PostgreSQL is restored.
+The current catalog uses a trained Faiss IVF model while Titan still creates
+the 512-dimension embeddings. Keep both model IDs separate when restoring the
+database flow.
 
 ## Table 1: sentence_key_matches
 

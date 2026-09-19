@@ -41,6 +41,8 @@ def health():
         "catalogIndex": config.catalog_index,
         "catalogAlias": config.catalog_alias,
         "semanticModelId": config.semantic_model_id,
+        "ivfModelId": config.ivf_model_id,
+        "ivfNprobes": config.ivf_nprobes,
         "ingestPipeline": config.ingest_pipeline,
         "modelInvoked": False,
     }
@@ -77,7 +79,7 @@ def index_documents(
 
 @router.post("/admin/init", tags=["Admin"])
 def initialize_storage():
-    """Create the two OpenSearch indexes and aliases."""
+    """Create the occurrence index and trained-model IVF catalog."""
 
     try:
         opensearch_store.ensure_indices()
@@ -87,6 +89,8 @@ def initialize_storage():
         "message": "Sentence semantic-search storage is ready",
         "occurrenceIndex": config.occurrence_index,
         "catalogIndex": config.catalog_index,
+        "ivfModelId": config.ivf_model_id,
+        "ivfNprobes": config.ivf_nprobes,
     }
 
 

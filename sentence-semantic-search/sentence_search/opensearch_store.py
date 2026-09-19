@@ -59,7 +59,7 @@ def occurrence_index_definition(config: Config) -> dict:
 
 
 def catalog_index_definition(config: Config) -> dict:
-    """Make the Titan-backed vector catalog mapping."""
+    """Make the Titan-backed catalog using the trained Faiss IVF model."""
 
     return {
         "settings": {
@@ -74,12 +74,7 @@ def catalog_index_definition(config: Config) -> dict:
                 "sentenceContent": {"type": "text"},
                 "sentenceContentVector": {
                     "type": "knn_vector",
-                    "dimension": config.vector_dimension,
-                    "method": {
-                        "name": "hnsw",
-                        "space_type": "cosinesimil",
-                        "engine": "faiss",
-                    },
+                    "model_id": config.ivf_model_id,
                 },
                 "sentenceKey": {"type": "keyword"},
                 "createdAt": {"type": "date"},
@@ -146,13 +141,21 @@ class OpenSearchStore:
         self.ensure_indices()
 
     def delete_indices(self) -> dict:
-        """Delete the two physical indexes and their attached aliases."""
+        """Delete configured indexes and any indexes behind project aliases."""
 
-        deleted = []
-        for index in (
+        indexes = {
             self.config.occurrence_index,
             self.config.catalog_index,
+        }
+        for alias in (
+            self.config.occurrence_alias,
+            self.config.catalog_alias,
         ):
+            if self.client.indices.exists_alias(name=alias):
+                indexes.update(self.client.indices.get_alias(name=alias))
+
+        deleted = []
+        for index in sorted(indexes):
             if self.client.indices.exists(index=index):
                 self.client.indices.delete(index=index)
                 deleted.append(index)
@@ -477,6 +480,9 @@ class OpenSearchStore:
                                             "min_score": minimum_opensearch_score(
                                                 threshold
                                             ),
+                                            "method_parameters": {
+                                                "nprobes": self.config.ivf_nprobes,
+                                            },
                                         }
                                     }
                                 },
