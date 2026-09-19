@@ -175,6 +175,10 @@ to fail.
 For the complete training, reindexing, validation, alias switch, and rollback
 steps, read [IVF_CATALOG_MIGRATION.md](IVF_CATALOG_MIGRATION.md).
 
+After creating an IVF-SQ16 test index, use
+[IVF_SQ16_STORAGE_CHECK.md](IVF_SQ16_STORAGE_CHECK.md) to compare its disk
+storage and loaded native memory with the IVF Flat index.
+
 ## Run the API
 
 Run in Docker:
