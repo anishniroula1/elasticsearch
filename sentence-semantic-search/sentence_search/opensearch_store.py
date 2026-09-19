@@ -20,6 +20,8 @@ VECTOR_FIELD = "sentenceContentVector"
 CATALOG_PAGE_SIZE = 1_000  # Catalog matches read from one aggregation page.
 SUMMARY_BUCKET_PAGE_SIZE = 1_000  # Summary buckets read per composite page.
 TERMS_BATCH_SIZE = 10_000  # Sentence keys sent in one terms filter.
+VECTOR_BATCH_SIZE = 1_000  # Catalog vectors read in one OpenSearch request.
+MATCH_RESULT_BATCH_SIZE = 5_000  # Occurrences read per internal search page.
 CATALOG_RETRY_ATTEMPTS = 10  # Remote embedding failures allowed per batch.
 CATALOG_RETRY_SECONDS = 5  # Pause before retrying a failed Titan batch.
 RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
@@ -283,28 +285,20 @@ class OpenSearchStore:
                     pending_actions,
                 )
                 if retry_actions is None:
-                    logger.exception(
-                        "Catalog batch stopped because the failure is not retryable"
-                    )
                     raise RuntimeError(
                         f"Non-retryable OpenSearch {label} bulk failure: {error}"
                     ) from error
 
                 if attempt == CATALOG_RETRY_ATTEMPTS:
-                    logger.exception(
-                        "Catalog batch stopped after %s attempts",
-                        CATALOG_RETRY_ATTEMPTS,
-                    )
                     break
                 pending_actions = retry_actions
                 logger.warning(
                     "Catalog batch attempt %s/%s failed; retrying %s "
-                    "document(s) after %s seconds. Error: %s",
+                    "document(s) after %s seconds",
                     attempt,
                     CATALOG_RETRY_ATTEMPTS,
                     len(pending_actions),
                     CATALOG_RETRY_SECONDS,
-                    error,
                 )
                 self._start_catalog_cooldown()
 
@@ -381,29 +375,43 @@ class OpenSearchStore:
     def catalog_vector(self, key: str) -> list:
         """Read one saved vector using fast binary doc values."""
 
-        response = self.client.search(
-            index=self.config.catalog_alias,
-            body={
-                "size": 1,
-                "track_total_hits": False,
-                "_source": False,
-                "stored_fields": "_none_",
-                "docvalue_fields": [
-                    {
-                        "field": VECTOR_FIELD,
-                        "format": "binary",
-                    }
-                ],
-                "query": {"ids": {"values": [key]}},
-            },
-        )
-        hits = response["hits"]["hits"]
-        if not hits:
+        vectors = self.catalog_vectors([key])
+        if key not in vectors:
             raise RuntimeError(f"Catalog vector does not exist for {key}")
-        values = hits[0].get("fields", {}).get(VECTOR_FIELD)
-        if not values:
-            raise RuntimeError(f"Catalog vector is missing for {key}")
-        return self._decode_binary_vector(values[0])
+        return vectors[key]
+
+    def catalog_vectors(self, sentence_keys: list) -> dict:
+        """Read saved vectors for sentence keys without loading `_source`.
+
+        Input: two sentence keys already present in the catalog.
+        Output: each sentence key mapped to its 512-number vector.
+        """
+
+        vectors = {}
+        unique_keys = sorted(set(sentence_keys))
+        for offset in range(0, len(unique_keys), VECTOR_BATCH_SIZE):
+            batch = unique_keys[offset : offset + VECTOR_BATCH_SIZE]
+            response = self.client.search(
+                index=self.config.catalog_alias,
+                body={
+                    "size": len(batch),
+                    "track_total_hits": False,
+                    "_source": False,
+                    "stored_fields": "_none_",
+                    "docvalue_fields": [
+                        {
+                            "field": VECTOR_FIELD,
+                            "format": "binary",
+                        }
+                    ],
+                    "query": {"ids": {"values": batch}},
+                },
+            )
+            for hit in response["hits"]["hits"]:
+                values = hit.get("fields", {}).get(VECTOR_FIELD)
+                if values:
+                    vectors[str(hit["_id"])] = self._decode_binary_vector(values[0])
+        return vectors
 
     def _decode_binary_vector(self, encoded_vector: str) -> list:
         """Convert an OpenSearch binary vector into float values."""
@@ -497,7 +505,7 @@ class OpenSearchStore:
                     match_type = "exact"
                 else:
                     percentage = cosine_percentage(float(hit["_score"]))
-                    match_type = "semantic"
+                    match_type = "similar"
                 if percentage >= threshold:
                     matches.append(
                         {
@@ -810,6 +818,30 @@ class OpenSearchStore:
             "nextAfterGlobalId": next_after,
             "totalMatches": total,
         }
+
+    def matching_occurrences(
+        self,
+        sentence_keys: list,
+        excluded_application_id: str,
+        analysis_group: str,
+    ) -> list:
+        """Return every matching occurrence using internal search-after pages."""
+
+        matches = []
+        after_global_id = None
+        while True:
+            page = self.matching_occurrence_page(
+                sentence_keys,
+                excluded_application_id,
+                analysis_group,
+                MATCH_RESULT_BATCH_SIZE,
+                after_global_id,
+                False,
+            )
+            matches.extend(page["matches"])
+            after_global_id = page["nextAfterGlobalId"]
+            if after_global_id is None:
+                return matches
 
     def stats(self) -> dict:
         """Return both OpenSearch document counts and cluster health."""

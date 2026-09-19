@@ -1,4 +1,3 @@
-import logging
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
@@ -21,7 +20,6 @@ from sentence_search.models import SentenceOccurrence
 
 router = APIRouter()
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-logger = logging.getLogger(__name__)
 
 
 class IndexSelection(StrEnum):
@@ -159,10 +157,8 @@ def seed(
             reset,
         )
     except ValueError as error:
-        logger.warning("Sentence seed rejected: %s", error)
         raise HTTPException(status_code=400, detail=str(error)) from error
     except (OpenSearchException, SQLAlchemyError, RuntimeError) as error:
-        logger.exception("Sentence seed failed")
         raise HTTPException(status_code=503, detail=str(error)) from error
 
 
@@ -263,18 +259,14 @@ def sentence_key_semantic_search(
         ),
     ],
     analysisGroup: Annotated[str, Query(min_length=1)] = "Asylee",
-    pageSize: Annotated[int, Query(ge=1, le=100)] = 100,
-    nextToken: str | None = None,
 ):
-    """Find exact and similar sentences by key without running neural search."""
+    """Return every exact and similar sentence for one saved sentence key."""
 
     try:
         return sentence_key_search_service.search(
             applicationId,
             sentenceKey,
             analysisGroup,
-            pageSize,
-            nextToken,
         )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error

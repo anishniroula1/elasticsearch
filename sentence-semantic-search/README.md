@@ -145,9 +145,9 @@ summaries.
 If Titan or the Lasso proxy returns a temporary 408, 429, or 5xx error, every
 catalog worker pauses for five seconds. Only failed catalog records are sent
 again, up to ten attempts. A permanent 400 error stops the seed immediately.
-Every retry is printed as a warning with its attempt number, failed document
-count, wait time, and error. A permanent or final failure prints its full error
-before the seed endpoint returns the failure response.
+Every retry prints one short warning with its attempt number, failed document
+count, and wait time. It does not print the full bulk error or stack trace. The
+seed endpoint response still contains the final error.
 
 The API returns only after matching and summary updates finish. If ingestion
 fails, send that sentence or seed request again. The relationship writes are
@@ -251,15 +251,16 @@ GET /applications/A0001/sentences/semantic-summary?analysisGroup=Asylee&pageSize
 Request:
 
 ```text
-GET /applications/A0001/sentences/semantic-search?sentenceKey=SHA256_KEY&analysisGroup=Asylee&pageSize=100
+GET /applications/A0001/sentences/semantic-search?sentenceKey=SHA256_KEY&analysisGroup=Asylee
 ```
 
 This endpoint does not turn text into a vector. The caller sends a
 `sentenceKey` that already exists.
 
-The API reads that key's direct matching keys from PostgreSQL. It then sends a
-normal OpenSearch `terms` query for the source key plus those direct keys. The
-current application is left out.
+The API reads that key's direct matching keys from PostgreSQL. It reads the
+saved catalog vectors and calculates a percentage for each matching key. It
+then sends a normal OpenSearch `terms` query for the source key plus those
+direct keys. The current application is left out.
 
 Example response:
 
@@ -274,31 +275,35 @@ Example response:
   "similarMatchCount": 4,
   "totalMatches": 6,
   "returnedMatches": 6,
-  "pagination": {
-    "page": 1,
-    "pageSize": 100,
-    "totalPages": 1,
-    "hasPreviousPage": false,
-    "hasNextPage": false
-  },
-  "nextToken": null,
   "matches": [
     {
       "applicationId": "A0002",
       "globalId": "SENT-99",
       "sentenceKey": "SHA256_KEY",
       "sentenceContent": "The government issued the notice.",
+      "matchPercentage": 100.0,
       "matchType": "exact"
+    },
+    {
+      "applicationId": "A0003",
+      "globalId": "SENT-100",
+      "sentenceKey": "ANOTHER_SHA256_KEY",
+      "sentenceContent": "A notice was issued by the government.",
+      "matchPercentage": 92.35,
+      "matchType": "similar"
     }
   ],
   "neuralSearchUsed": false
 }
 ```
 
-The first request calculates the complete exact and similar count. Those
-counts are carried in `nextToken`, so later pages do not count again. The token
-also checks that the saved direct-key list did not change between pages. If a
-new ingestion changes the relationship list, start again from the first page.
+The endpoint returns every result in one API response. It does not return a
+pagination token. OpenSearch is still read in internal batches, so one very
+large result does not have to be loaded from OpenSearch in one request.
+
+An exact match always has `matchPercentage` 100. A similar match gets its
+percentage by comparing the two vectors already saved in the catalog. This
+does not call Titan and does not run a new KNN search.
 
 ## Titan pipeline
 

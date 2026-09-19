@@ -48,3 +48,12 @@ def test_seed_swagger_uses_query_inputs_instead_of_a_json_body():
     assert parameters["reset"]["in"] == "query"
     assert parameters["reset"]["required"] is True
     assert parameters["csvPath"]["schema"]["default"] == "data/seed.csv"
+
+
+def test_sentence_key_search_swagger_has_no_public_pagination():
+    operation = app.openapi()["paths"][
+        "/applications/{applicationId}/sentences/semantic-search"
+    ]["get"]
+    parameters = {item["name"] for item in operation["parameters"]}
+
+    assert parameters == {"applicationId", "sentenceKey", "analysisGroup"}
