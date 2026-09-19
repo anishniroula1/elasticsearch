@@ -226,6 +226,7 @@ def delete_tsp_document(
 def application_semantic_summary(
     applicationId: str,
     analysisGroup: Annotated[str, Query(min_length=1)] = "Asylee",
+    threshold: Annotated[int, Query(ge=1, le=100)] = config.match_threshold,
     pageSize: Annotated[int, Query(ge=1, le=100)] = 100,
     nextToken: str | None = None,
 ):
@@ -235,6 +236,7 @@ def application_semantic_summary(
         return sentence_summary_service.application_summary(
             applicationId,
             analysisGroup,
+            threshold,
             pageSize,
             nextToken,
         )
@@ -262,12 +264,9 @@ def sentence_key_semantic_search(
     threshold: Annotated[
         int,
         Query(
-            ge=config.match_threshold,
+            ge=1,
             le=100,
-            description=(
-                "Minimum cosine percentage. It cannot be lower than the "
-                "configured ingestion threshold."
-            ),
+            description="Minimum cosine percentage for this search.",
         ),
     ] = config.match_threshold,
 ):

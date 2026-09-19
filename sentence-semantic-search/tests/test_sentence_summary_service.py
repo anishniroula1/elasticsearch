@@ -44,19 +44,29 @@ class FakeOpenSearchStore:
         excluded_application_id,
         analysis_group,
     ):
-        assert set(sentence_keys) == {"key-a", "key-b", "key-c"}
         assert excluded_application_id == "A1"
         assert analysis_group == "Asylee"
-        return {"key-a": 2, "key-b": 1, "key-c": 4}
+        all_counts = {"key-a": 2, "key-b": 1, "key-c": 4, "key-d": 5}
+        return {key: all_counts[key] for key in sentence_keys}
 
     def catalog_vectors(self, sentence_keys):
-        assert set(sentence_keys) == {"key-a", "key-b", "key-c", "key-d"}
-        return {
+        all_vectors = {
             "key-a": [1.0, 0.0],
             "key-b": [0.0, 1.0],
             "key-c": [0.92, sqrt(1 - (0.92**2))],
             "key-d": [0.83, sqrt(1 - (0.83**2))],
         }
+        return {key: all_vectors[key] for key in sentence_keys}
+
+    def catalog_matches(self, source_key, vector, threshold):
+        assert threshold == 70
+        if source_key == "key-a":
+            return [
+                {"sentenceKey": "key-a"},
+                {"sentenceKey": "key-c"},
+                {"sentenceKey": "key-d"},
+            ]
+        return [{"sentenceKey": "key-b"}]
 
     def application_key_section_counts(self, application_id, analysis_group):
         return [
@@ -121,7 +131,7 @@ def test_summary_returns_exact_and_similar_counts_per_sentence():
         FakePostgresStore(),
     )
 
-    result = service.application_summary("A1", "Asylee", 100, None)
+    result = service.application_summary("A1", "Asylee", 90, 100, None)
 
     assert result["totalSentences"] == 2
     assert result["totalMatching"] == 40
@@ -132,6 +142,26 @@ def test_summary_returns_exact_and_similar_counts_per_sentence():
     assert result["sentences"][0]["totalMatchCount"] == 6
     assert result["sentences"][1]["totalMatchCount"] == 1
     assert result["neuralSearchUsed"] is False
+
+
+def test_custom_lower_threshold_calculates_complete_summary_live():
+    service = SentenceSummaryService(
+        SimpleNamespace(match_threshold=90),
+        FakeOpenSearchStore(),
+        FakePostgresStore(),
+    )
+
+    result = service.application_summary("A1", "Asylee", 70, 100, None)
+
+    assert result["thresholdPercentage"] == 70
+    assert result["totalMatching"] == 23
+    assert result["sectionMatches"] == [
+        {"sectionName": "Affidavit", "matchingCount": 22},
+        {"sectionName": "B1", "matchingCount": 1},
+    ]
+    assert result["pageTotalMatches"] == 12
+    assert result["sentences"][0]["similarMatchCount"] == 9
+    assert result["summaryUpdatedAt"] is None
 
 
 def test_summary_refresh_saves_all_section_totals():

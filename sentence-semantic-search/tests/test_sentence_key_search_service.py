@@ -13,12 +13,26 @@ class FakeOpenSearchStore:
         self.search_keys = None
 
     def catalog_vectors(self, sentence_keys):
-        assert sentence_keys == [SOURCE_KEY, SIMILAR_KEY, LOW_SCORE_KEY]
-        return {
+        all_vectors = {
             SOURCE_KEY: [1.0, 0.0],
             SIMILAR_KEY: [0.92, sqrt(1 - (0.92**2))],
             LOW_SCORE_KEY: [0.83, sqrt(1 - (0.83**2))],
         }
+        return {key: all_vectors[key] for key in sentence_keys}
+
+    def catalog_vector(self, sentence_key):
+        assert sentence_key == SOURCE_KEY
+        return [1.0, 0.0]
+
+    def catalog_matches(self, sentence_key, vector, threshold):
+        assert sentence_key == SOURCE_KEY
+        assert vector == [1.0, 0.0]
+        assert threshold == 70
+        return [
+            {"sentenceKey": SOURCE_KEY},
+            {"sentenceKey": SIMILAR_KEY},
+            {"sentenceKey": LOW_SCORE_KEY},
+        ]
 
     def matching_occurrences(
         self,
@@ -32,6 +46,7 @@ class FakeOpenSearchStore:
         occurrences = [
             {"globalId": "S10", "sentenceKey": SOURCE_KEY},
             {"globalId": "S11", "sentenceKey": SIMILAR_KEY},
+            {"globalId": "S12", "sentenceKey": LOW_SCORE_KEY},
         ]
         return [
             occurrence
@@ -91,3 +106,24 @@ def test_higher_query_threshold_removes_saved_lower_score_matches():
     assert result["directMatchingKeyCount"] == 0
     assert result["exactMatchCount"] == 1
     assert result["similarMatchCount"] == 0
+
+
+def test_lower_query_threshold_runs_live_catalog_search():
+    opensearch = FakeOpenSearchStore()
+    service = SentenceKeySearchService(
+        SimpleNamespace(match_threshold=90),
+        opensearch,
+        FakePostgresStore(),
+    )
+
+    result = service.search("A1", SOURCE_KEY, "Asylee", 70)
+
+    assert opensearch.search_keys == [SOURCE_KEY, SIMILAR_KEY, LOW_SCORE_KEY]
+    assert result["thresholdPercentage"] == 70
+    assert result["directMatchingKeyCount"] == 2
+    assert result["similarMatchCount"] == 2
+    assert {match["matchPercentage"] for match in result["matches"]} == {
+        100.0,
+        92.0,
+        83.0,
+    }

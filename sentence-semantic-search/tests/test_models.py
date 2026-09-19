@@ -66,4 +66,15 @@ def test_sentence_key_search_swagger_has_no_public_pagination():
         item for item in operation["parameters"] if item["name"] == "threshold"
     )
     assert threshold["schema"]["default"] == 90
-    assert threshold["schema"]["minimum"] == 90
+    assert threshold["schema"]["minimum"] == 1
+
+
+def test_semantic_summary_swagger_accepts_any_threshold_percentage():
+    operation = app.openapi()["paths"][
+        "/applications/{applicationId}/sentences/semantic-summary"
+    ]["get"]
+    parameters = {item["name"]: item for item in operation["parameters"]}
+
+    assert parameters["threshold"]["schema"]["default"] == 90
+    assert parameters["threshold"]["schema"]["minimum"] == 1
+    assert parameters["threshold"]["schema"]["maximum"] == 100

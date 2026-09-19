@@ -37,22 +37,35 @@ class SentenceKeySearchService:
         sentence_key = sentence_key.strip().lower()
         if not SENTENCE_KEY_PATTERN.fullmatch(sentence_key):
             raise ValueError("sentenceKey must be a 64-character SHA-256 value")
-        if not self.config.match_threshold <= threshold <= 100:
-            raise ValueError(
-                "threshold must be between "
-                f"{self.config.match_threshold} and 100 because matches below "
-                "the configured ingestion threshold are not saved"
-            )
+        if not 1 <= threshold <= 100:
+            raise ValueError("threshold must be between 1 and 100")
 
-        key_row = self.postgres.matching_keys([sentence_key])[sentence_key]
-        similar_keys = [
-            key for key in key_row["matchingSentenceKeys"] if key != sentence_key
-        ]
-        candidate_keys = [sentence_key, *similar_keys]
-        vectors = self.opensearch.catalog_vectors(candidate_keys)
-        if sentence_key not in vectors:
-            raise ValueError(f"sentenceKey does not exist: {sentence_key}")
-        source_vector = vectors[sentence_key]
+        if threshold < self.config.match_threshold:
+            source_vector = self.opensearch.catalog_vector(sentence_key)
+            catalog_matches = self.opensearch.catalog_matches(
+                sentence_key,
+                source_vector,
+                threshold,
+            )
+            similar_keys = sorted(
+                {
+                    match["sentenceKey"]
+                    for match in catalog_matches
+                    if match["sentenceKey"] != sentence_key
+                }
+            )
+            vectors = {sentence_key: source_vector}
+            vectors.update(self.opensearch.catalog_vectors(similar_keys))
+        else:
+            key_row = self.postgres.matching_keys([sentence_key])[sentence_key]
+            similar_keys = [
+                key for key in key_row["matchingSentenceKeys"] if key != sentence_key
+            ]
+            candidate_keys = [sentence_key, *similar_keys]
+            vectors = self.opensearch.catalog_vectors(candidate_keys)
+            if sentence_key not in vectors:
+                raise ValueError(f"sentenceKey does not exist: {sentence_key}")
+            source_vector = vectors[sentence_key]
         score_by_key = {sentence_key: 100.0}
         qualified_similar_keys = []
         for similar_key in similar_keys:

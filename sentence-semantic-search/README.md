@@ -166,7 +166,7 @@ filters occurrences to the requested `analysisGroup`, which defaults to
 Request:
 
 ```text
-GET /applications/A0001/sentences/semantic-summary?analysisGroup=Asylee&pageSize=100
+GET /applications/A0001/sentences/semantic-summary?analysisGroup=Asylee&threshold=90&pageSize=100
 ```
 
 This returns up to 100 eligible application sentences. Each sentence has:
@@ -184,7 +184,8 @@ direct matching keys. Both counts use the same analysis group and ignore tracer
 and form-language records. The summary reads the saved vectors again and drops
 any old relationship below `MATCH_THRESHOLD` before counting it.
 
-The top of the response comes directly from `application_match_summary`:
+At the configured threshold, the top of the response comes directly from
+`application_match_summary`:
 
 ```text
 totalMatching
@@ -236,15 +237,22 @@ Example response:
 all exact and direct semantic occurrence matches outside the application.
 `sectionMatches` splits the same number by section.
 
+`threshold` can be any whole number from 1 through 100. At the configured
+`MATCH_THRESHOLD`, the API uses the fast summary already saved in PostgreSQL.
+At a different threshold, the first page calculates the complete application
+summary live. The next-page token carries those totals so later pages do not
+calculate the complete summary again. A lower threshold can take longer
+because it may find many more sentence keys and occurrences.
+
 The first page gets `totalSentences` from OpenSearch. Later pages carry that
 number inside `nextToken`, so OpenSearch does not recount it. Per-sentence
 counts are calculated only for the 100 sentences on the current page.
 
-Use the returned token without changing `applicationId`, `analysisGroup`, or
-`pageSize`:
+Use the returned token without changing `applicationId`, `analysisGroup`,
+`threshold`, or `pageSize`:
 
 ```text
-GET /applications/A0001/sentences/semantic-summary?analysisGroup=Asylee&pageSize=100&nextToken=TOKEN_FROM_THE_API
+GET /applications/A0001/sentences/semantic-summary?analysisGroup=Asylee&threshold=90&pageSize=100&nextToken=TOKEN_FROM_THE_API
 ```
 
 ## Search by sentence key
@@ -304,12 +312,15 @@ large result does not have to be loaded from OpenSearch in one request.
 
 An exact match always has `matchPercentage` 100. A similar match gets its
 percentage by comparing the two vectors already saved in the catalog. This
-does not call Titan and does not run a new KNN search. A result is returned only
-when `matchPercentage` is at least the requested `threshold`.
+does not call Titan. A result is returned only when `matchPercentage` is at
+least the requested `threshold`.
 
-The smallest query threshold is the configured `MATCH_THRESHOLD`. The default
-is 90. A higher value such as 95 is allowed. A lower value is not allowed
-because relationships below the ingestion threshold were never saved.
+The query threshold can be any whole number from 1 through 100. The default is
+the configured `MATCH_THRESHOLD`, normally 90. When the requested value is
+lower than that setting, the API performs a live catalog vector search because
+those lower-score relationships were not saved in PostgreSQL during ingestion.
+At the configured threshold or higher, it uses the saved relationship list and
+does not need a new KNN search.
 
 Older versions converted the OpenSearch cosine score incorrectly. A 90 query
 could save results around 82 or 83. After updating the code, run the same seed

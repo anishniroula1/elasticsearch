@@ -28,6 +28,7 @@ class SentenceSummaryService:
         self,
         application_id: str,
         analysis_group: str,
+        threshold: int,
         page_size: int,
         next_token: str | None,
     ) -> dict:
@@ -37,27 +38,54 @@ class SentenceSummaryService:
         Output: up to 100 sentences with exact, similar, and total counts.
         """
 
-        saved_summary = self.postgres.application_summary(
-            application_id,
-            analysis_group,
-        )
+        if not 1 <= threshold <= 100:
+            raise ValueError("threshold must be between 1 and 100")
+
+        all_similar_keys = None
         if next_token:
             state = decode_page_token(next_token)
             self._validate_token(
                 state,
                 application_id,
                 analysis_group,
+                threshold,
                 page_size,
             )
             after_global_id = state["afterGlobalId"]
             total_sentences = int(state["totalSentences"])
             returned_before = int(state["returnedSentences"])
+            summary = {
+                "totalMatching": int(state["totalMatching"]),
+                "sectionMatches": state["sectionMatches"],
+                "updatedAt": state["summaryUpdatedAt"],
+            }
             include_total = False
         else:
             after_global_id = None
             total_sentences = 0
             returned_before = 0
             include_total = True
+            if threshold == self.config.match_threshold:
+                summary = self.postgres.application_summary(
+                    application_id,
+                    analysis_group,
+                )
+            else:
+                calculated = self._calculate_application_summary(
+                    application_id,
+                    analysis_group,
+                    threshold,
+                )
+                summary = {
+                    "totalMatching": calculated["totalMatching"],
+                    "sectionMatches": calculated["sectionMatches"],
+                    "updatedAt": None,
+                }
+                all_similar_keys = calculated["similarKeysBySource"]
+
+        summary_updated_at = summary["updatedAt"]
+        if hasattr(summary_updated_at, "isoformat"):
+            summary_updated_at = summary_updated_at.isoformat()
 
         result = self.opensearch.application_occurrence_page(
             application_id,
@@ -73,10 +101,16 @@ class SentenceSummaryService:
         key_rows = self.postgres.matching_keys(
             [sentence["sentenceKey"] for sentence in sentences]
         )
-        similar_keys_by_source = self._similar_keys_at_threshold(
-            key_rows,
-            self.config.match_threshold,
-        )
+        if all_similar_keys is None:
+            similar_keys_by_source = self._similar_keys_at_threshold(
+                key_rows,
+                threshold,
+            )
+        else:
+            similar_keys_by_source = {
+                source_key: all_similar_keys.get(source_key, [])
+                for source_key in key_rows
+            }
         candidate_keys = set()
         for sentence in sentences:
             source_key = sentence["sentenceKey"]
@@ -113,10 +147,14 @@ class SentenceSummaryService:
                     "type": "applicationSentenceSummary",
                     "applicationId": application_id,
                     "analysisGroup": analysis_group,
+                    "threshold": threshold,
                     "pageSize": page_size,
                     "afterGlobalId": next_after,
                     "totalSentences": total_sentences,
                     "returnedSentences": returned_after,
+                    "totalMatching": summary["totalMatching"],
+                    "sectionMatches": summary["sectionMatches"],
+                    "summaryUpdatedAt": summary_updated_at,
                 }
             )
 
@@ -124,10 +162,10 @@ class SentenceSummaryService:
         return {
             "applicationId": application_id,
             "analysisGroup": analysis_group,
-            "thresholdPercentage": self.config.match_threshold,
-            "totalMatching": saved_summary["totalMatching"],
-            "sectionMatches": saved_summary["sectionMatches"],
-            "summaryUpdatedAt": saved_summary["updatedAt"],
+            "thresholdPercentage": threshold,
+            "totalMatching": summary["totalMatching"],
+            "sectionMatches": summary["sectionMatches"],
+            "summaryUpdatedAt": summary_updated_at,
             "totalSentences": total_sentences,
             "returnedSentences": len(response_sentences),
             "pageMatchingSentences": sum(
@@ -191,6 +229,34 @@ class SentenceSummaryService:
     ) -> dict:
         """Calculate and save one complete application summary."""
 
+        calculated = self._calculate_application_summary(
+            application_id,
+            analysis_group,
+            self.config.match_threshold,
+        )
+        saved_counts = calculated["sectionMatchCounts"]
+        total_matching = calculated["totalMatching"]
+        self.postgres.save_application_summary(
+            application_id,
+            analysis_group,
+            saved_counts,
+            total_matching,
+        )
+        return {
+            "applicationId": application_id,
+            "analysisGroup": analysis_group,
+            "sectionMatchCounts": saved_counts,
+            "totalMatching": total_matching,
+        }
+
+    def _calculate_application_summary(
+        self,
+        application_id: str,
+        analysis_group: str,
+        threshold: int,
+    ) -> dict:
+        """Calculate complete counts for one application and threshold."""
+
         source_buckets = self.opensearch.application_key_section_counts(
             application_id,
             analysis_group,
@@ -199,7 +265,7 @@ class SentenceSummaryService:
         key_rows = self.postgres.matching_keys(source_keys)
         similar_keys_by_source = self._similar_keys_at_threshold(
             key_rows,
-            self.config.match_threshold,
+            threshold,
         )
 
         candidate_keys = set(source_keys)
@@ -225,17 +291,17 @@ class SentenceSummaryService:
 
         saved_counts = dict(sorted(section_counts.items()))
         total_matching = sum(saved_counts.values())
-        self.postgres.save_application_summary(
-            application_id,
-            analysis_group,
-            saved_counts,
-            total_matching,
-        )
         return {
-            "applicationId": application_id,
-            "analysisGroup": analysis_group,
             "sectionMatchCounts": saved_counts,
+            "sectionMatches": [
+                {
+                    "sectionName": section_name,
+                    "matchingCount": count,
+                }
+                for section_name, count in saved_counts.items()
+            ],
             "totalMatching": total_matching,
+            "similarKeysBySource": similar_keys_by_source,
         }
 
     def _similar_keys_at_threshold(
@@ -256,6 +322,28 @@ class SentenceSummaryService:
             )
         if not candidate_keys:
             return {}
+
+        if threshold < self.config.match_threshold:
+            vectors = self.opensearch.catalog_vectors(list(key_rows))
+            qualified = {}
+            for source_key in key_rows:
+                if source_key not in vectors:
+                    raise RuntimeError(
+                        f"Catalog vector does not exist for {source_key}"
+                    )
+                matches = self.opensearch.catalog_matches(
+                    source_key,
+                    vectors[source_key],
+                    threshold,
+                )
+                qualified[source_key] = sorted(
+                    {
+                        match["sentenceKey"]
+                        for match in matches
+                        if match["sentenceKey"] != source_key
+                    }
+                )
+            return qualified
 
         vectors = self.opensearch.catalog_vectors(list(candidate_keys))
         qualified = {}
@@ -290,6 +378,7 @@ class SentenceSummaryService:
         state: dict,
         application_id: str,
         analysis_group: str,
+        threshold: int,
         page_size: int,
     ):
         """Stop a token from being reused for a different summary request."""
@@ -298,10 +387,18 @@ class SentenceSummaryService:
             "type": "applicationSentenceSummary",
             "applicationId": application_id,
             "analysisGroup": analysis_group,
+            "threshold": threshold,
             "pageSize": page_size,
         }
         for name, value in expected.items():
             if state.get(name) != value:
                 raise ValueError("nextToken does not belong to this request")
-        if "totalSentences" not in state or "returnedSentences" not in state:
+        required = {
+            "totalSentences",
+            "returnedSentences",
+            "totalMatching",
+            "sectionMatches",
+            "summaryUpdatedAt",
+        }
+        if not required.issubset(state):
             raise ValueError("Invalid nextToken")
