@@ -103,6 +103,29 @@ class CatalogPreviewClient:
         }
 
 
+class CatalogVectorsWithoutDocumentIdClient:
+    def __init__(self):
+        self.request = None
+
+    def search(self, **request):
+        self.request = request
+        vector_bytes = struct.pack("<512f", *([0.5] * 512))
+        return {
+            "hits": {
+                "hits": [
+                    {
+                        "fields": {
+                            "sentenceKey": ["key-1"],
+                            "sentenceContentVector": [
+                                base64.b64encode(vector_bytes).decode("ascii")
+                            ],
+                        }
+                    }
+                ]
+            }
+        }
+
+
 def test_occurrence_mapping_has_requested_sentence_fields():
     properties = occurrence_index_definition(config)["mappings"]["properties"]
     assert set(properties) == {
@@ -159,6 +182,20 @@ def test_catalog_preview_returns_the_decoded_embedding_list():
     ]
     assert len(document["sentenceContentVector"]) == 512
     assert document["sentenceContentVector"][0] == pytest.approx(0.25)
+
+
+def test_catalog_vectors_use_sentence_key_when_search_hit_has_no_id():
+    client = CatalogVectorsWithoutDocumentIdClient()
+    store = OpenSearchStore(config, client)
+
+    vectors = store.catalog_vectors(["key-1"])
+
+    assert client.request["body"]["docvalue_fields"] == [
+        "sentenceKey",
+        {"field": "sentenceContentVector", "format": "binary"},
+    ]
+    assert len(vectors["key-1"]) == 512
+    assert vectors["key-1"][0] == pytest.approx(0.5)
 
 
 def test_tsp_deletion_uses_camel_case_opensearch_fields():

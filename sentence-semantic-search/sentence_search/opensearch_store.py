@@ -399,18 +399,23 @@ class OpenSearchStore:
                     "_source": False,
                     "stored_fields": "_none_",
                     "docvalue_fields": [
+                        "sentenceKey",
                         {
                             "field": VECTOR_FIELD,
                             "format": "binary",
-                        }
+                        },
                     ],
                     "query": {"ids": {"values": batch}},
                 },
             )
             for hit in response["hits"]["hits"]:
-                values = hit.get("fields", {}).get(VECTOR_FIELD)
-                if values:
-                    vectors[str(hit["_id"])] = self._decode_binary_vector(values[0])
+                fields = hit.get("fields", {})
+                key_values = fields.get("sentenceKey")
+                vector_values = fields.get(VECTOR_FIELD)
+                if key_values and vector_values:
+                    vectors[str(key_values[0])] = self._decode_binary_vector(
+                        vector_values[0]
+                    )
         return vectors
 
     def _decode_binary_vector(self, encoded_vector: str) -> list:
